@@ -1,0 +1,292 @@
+# ansible-vault.nvim
+
+> **警告**：这个插件仍处于早期开发阶段。加密、解密操作前请先备份重要文件。
+
+`ansible-vault.nvim` 是一个 Neovim 插件，用来在编辑器里更方便地处理
+Ansible Vault 文件和 YAML inline vault 字符串。
+
+English documentation: [README.md](README.md)
+
+## 功能
+
+- 加密/解密当前 buffer
+- 在只读浮窗中查看加密内容
+- 将选中文本加密为 YAML inline vault 字符串
+- 在加密/解密状态之间切换
+- 自动识别 Ansible Vault 文件
+- 支持 password file、vault ID 和交互式密码输入
+- 支持通过 `conda run` 调用 Conda 环境中的 `ansible-vault`
+- 可用于 statusline 显示 vault 状态
+
+## 依赖
+
+- Neovim >= 0.9.0
+- `ansible-vault` 可执行文件在 `PATH` 中，或通过配置指定路径/Conda 环境
+
+## 安装
+
+### lazy.nvim
+
+```lua
+{
+  "eyebrowkang/ansible-vault.nvim",
+  config = function()
+    require("ansible-vault").setup({
+      password_file = "~/.ansible/vault-pass",
+    })
+  end,
+}
+```
+
+### packer.nvim
+
+```lua
+use {
+  "eyebrowkang/ansible-vault.nvim",
+  config = function()
+    require("ansible-vault").setup()
+  end,
+}
+```
+
+## 配置
+
+```lua
+require("ansible-vault").setup({
+  -- ansible-vault password file 路径
+  password_file = nil,
+
+  -- vault ID，例如 "prod@~/.ansible/prod-pass"
+  vault_id = nil,
+
+  -- 加密时使用的 vault ID label。
+  -- 保持 nil 时，由 ansible-vault 根据已配置的 vault IDs 自行选择。
+  encrypt_vault_id = nil,
+
+  -- 读取文件后自动识别 Ansible Vault 文件
+  auto_detect = true,
+
+  -- ansible-vault 所在的 Conda 环境名
+  -- 插件会执行：conda run -n <env> ansible-vault ...
+  conda_env = nil,
+
+  -- 自定义 ansible-vault 可执行文件路径
+  ansible_vault_path = nil,
+
+  -- 开启调试日志
+  debug = false,
+})
+```
+
+### 密码来源
+
+插件按以下顺序选择凭据：
+
+1. `password_file`
+2. `vault_id`
+3. 交互式密码输入
+
+单密码文件场景：
+
+```lua
+require("ansible-vault").setup({
+  password_file = "~/.ansible/vault-pass",
+})
+```
+
+多 vault ID 场景：
+
+```lua
+require("ansible-vault").setup({
+  vault_id = "prod@~/.ansible/prod-pass",
+  encrypt_vault_id = "prod",
+})
+```
+
+如果不希望插件显式传入 `--encrypt-vault-id`，保持
+`encrypt_vault_id = nil`。
+
+如果 `ansible-vault` 不在 `PATH` 中：
+
+```lua
+require("ansible-vault").setup({
+  ansible_vault_path = "/opt/homebrew/bin/ansible-vault",
+  password_file = "~/.ansible/vault-pass",
+})
+```
+
+如果 `ansible-vault` 安装在 Conda 环境中：
+
+```lua
+require("ansible-vault").setup({
+  conda_env = "ansible-dev",
+  password_file = "~/.ansible/vault-pass",
+})
+```
+
+## 命令
+
+| 命令 | 说明 |
+|------|------|
+| `:VaultEncrypt` | 加密当前 buffer |
+| `:VaultDecrypt` | 解密当前 buffer |
+| `:VaultView` | 在只读浮窗中查看解密内容 |
+| `:VaultEdit` | 在 scratch buffer 中编辑解密内容，`:write` 时重新加密保存 |
+| `:VaultToggle` | 在加密/解密状态之间切换 |
+| `:VaultEncryptString` | 加密视觉选择的文本 |
+| `:VaultViewString` | 查看视觉选择中的 inline vault 字符串 |
+
+## 使用方式
+
+### 加密普通文件
+
+1. 打开普通 YAML 或文本文件。
+2. 执行 `:VaultEncrypt`。
+3. 确认结果后执行 `:write` 保存。
+
+`:VaultEncrypt` 会把当前 buffer 内容替换为 Ansible Vault 密文，但不会自动
+写入磁盘，这样你可以在保存前先检查结果。
+
+### 原地解密加密文件
+
+1. 打开以 `$ANSIBLE_VAULT` 开头的文件。
+2. 执行 `:VaultDecrypt`。
+3. 编辑解密后的内容。
+4. 如果文件需要继续保持加密状态，保存前再次执行 `:VaultEncrypt`。
+
+这个流程很直接，但明文会出现在原始 buffer 中。更安全的编辑方式是
+`:VaultEdit`。
+
+### 只读查看加密文件
+
+在加密 buffer 中执行 `:VaultView`。插件会把解密内容放到只读浮窗中。
+按 `q` 或 `<Esc>` 关闭浮窗。
+
+### 安全编辑加密文件
+
+在文件型加密 buffer 中执行 `:VaultEdit`。
+
+插件会打开一个 scratch buffer 显示解密内容，并关闭 swapfile 和持久 undo。
+在这个 scratch buffer 中执行 `:write` 时，插件会重新加密内容并写回原文件，
+然后关闭 scratch buffer 并重新载入原始加密文件。
+
+如果 scratch buffer 打开期间原文件在磁盘上发生了变化，插件会拒绝保存，
+避免覆盖外部修改。
+
+### 切换当前 buffer 状态
+
+执行 `:VaultToggle` 可以在普通内容和 vault 密文之间切换。这个命令适合快速
+查看，但要小心不要把解密后的 secret 误保存到磁盘。
+
+### 加密 YAML inline 字符串
+
+在视觉模式中选中文本后执行：
+
+```vim
+:VaultEncryptString
+```
+
+如果选中的是完整 YAML 行：
+
+```yaml
+password: secret
+```
+
+插件会保留原来的 key，只加密 value：
+
+```yaml
+password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          ...
+```
+
+你也可以只选中 `password: secret` 里的 `secret`，插件同样会把加密结果插入
+到 `password` 这个 key 下。
+
+### 查看 YAML inline vault 字符串
+
+选中 YAML vault block 后执行：
+
+```vim
+:VaultViewString
+```
+
+解密后的值会显示在只读浮窗中。按 `q` 或 `<Esc>` 关闭。
+
+## 快捷键
+
+插件不会默认设置快捷键。你可以自行添加：
+
+```lua
+vim.keymap.set("n", "<leader>ve", "<cmd>VaultEncrypt<cr>", { desc = "Vault Encrypt" })
+vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decrypt" })
+vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
+vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
+vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>", { desc = "Vault Toggle" })
+vim.keymap.set("v", "<leader>vs", "<cmd>VaultEncryptString<cr>", { desc = "Vault Encrypt String" })
+vim.keymap.set("v", "<leader>vv", "<cmd>VaultViewString<cr>", { desc = "Vault View String" })
+```
+
+## Statusline 集成
+
+```lua
+require("lualine").setup({
+  sections = {
+    lualine_x = {
+      { require("ansible-vault").status },
+    },
+  },
+})
+```
+
+也可以手动判断：
+
+```lua
+if require("ansible-vault").is_buffer_encrypted() then
+  -- 当前 buffer 是 Ansible Vault 密文
+end
+```
+
+## API
+
+```lua
+local vault = require("ansible-vault")
+
+vault.is_encrypted(content)
+vault.is_buffer_encrypted()
+vault.encrypt()
+vault.decrypt()
+vault.view()
+vault.edit()
+vault.toggle()
+vault.encrypt_string()
+vault.view_string()
+vault.status()
+```
+
+## 安全说明
+
+- 插件使用 argv list 执行命令，不通过 shell 字符串拼接，因此支持带空格的
+  路径，也不会把配置值交给 shell 求值。
+- 交互式密码通过 `inputsecret()` 获取，并在 vault 操作期间写入临时的 `0600`
+  password file。
+- `VaultEdit` 使用 scratch `acwrite` buffer，并设置 `swapfile=false`、
+  `undofile=false`、`bufhidden=wipe`。
+- `VaultEdit` 会先写入同目录临时文件，再原子替换原文件。
+- `VaultEdit` 会在检测到原文件被外部修改时拒绝覆盖。
+- 查看或编辑时，解密内容仍然会存在于 Neovim 进程内存中。如果处理高敏感
+  secret，请同时检查你的插件、剪贴板、backup、shada、终端录屏和会话记录。
+
+## 开发
+
+运行 headless 测试：
+
+```sh
+make test
+```
+
+测试使用 fake `ansible-vault` 可执行文件，因此不要求本机安装 Ansible。
+
+## License
+
+MIT

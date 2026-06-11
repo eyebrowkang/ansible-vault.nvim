@@ -1,7 +1,7 @@
 ---@class AnsibleVaultConfig
 ---@field password_file? string Path to ansible-vault password file
----@field vault_id? string Vault ID to use for decryption
----@field encrypt_vault_id? string Vault ID to use for encryption (default: "default")
+---@field vault_id? string Vault ID to use, for example "prod@~/.vault_pass"
+---@field encrypt_vault_id? string Vault ID label to use for encryption
 ---@field auto_detect? boolean Auto detect vault encrypted files (default: true)
 ---@field conda_env? string Conda environment name where ansible-vault is installed
 ---@field ansible_vault_path? string Custom path to ansible-vault executable
@@ -9,16 +9,24 @@
 
 local M = {}
 
+local uv = vim.uv or vim.loop
+local VAULT_HEADER = "^%$ANSIBLE_VAULT;[%d%.]+;AES256"
+local AUGROUP = "AnsibleVault"
+local PASSWORD_FILE_MODE = 384 -- 0600
+
 ---@type AnsibleVaultConfig
-M.config = {
+local DEFAULT_CONFIG = {
   password_file = nil,
   vault_id = nil,
-  encrypt_vault_id = "default",
+  encrypt_vault_id = nil,
   auto_detect = true,
   conda_env = nil,
   ansible_vault_path = nil,
   debug = false,
 }
+
+---@type AnsibleVaultConfig
+M.config = vim.deepcopy(DEFAULT_CONFIG)
 
 ---Debug log helper
 ---@param msg string
@@ -31,129 +39,192 @@ local function debug_log(msg, ...)
   end
 end
 
--- Vault file header pattern
-local VAULT_HEADER = "^$ANSIBLE_VAULT;[%d%.]+;AES256"
+---@param value any
+---@return boolean
+local function is_nonempty_string(value)
+  return type(value) == "string" and value ~= ""
+end
 
----Build the ansible-vault command with conda activation if needed
+---@param path string
 ---@return string
-local function get_vault_cmd()
-  if M.config.ansible_vault_path then
-    return M.config.ansible_vault_path
-  end
-
-  if M.config.conda_env then
-    return string.format(
-      'eval "$(conda shell.bash hook)" && conda activate %s && ansible-vault',
-      M.config.conda_env
-    )
-  end
-
-  return "ansible-vault"
+local function expand_path(path)
+  return vim.fn.expand(path)
 end
 
----Check if content is vault encrypted
----@param content string|string[]
----@return boolean
-function M.is_encrypted(content)
-  local first_line
-  if type(content) == "table" then
-    first_line = content[1] or ""
-  else
-    first_line = content:match("^[^\n]*")
+---@param vault_id string
+---@return string
+local function expand_vault_id(vault_id)
+  local label, source = vault_id:match("^([^@]+)@(.+)$")
+  if not label or not source or source == "prompt" then
+    return vault_id
   end
-  return first_line:match(VAULT_HEADER) ~= nil
+
+  return label .. "@" .. expand_path(source)
 end
 
----Check if current buffer is vault encrypted
----@return boolean
-function M.is_buffer_encrypted()
-  local lines = vim.api.nvim_buf_get_lines(0, 0, 1, false)
-  return M.is_encrypted(lines)
+---@return string[]
+local function get_vault_argv()
+  local executable = "ansible-vault"
+  if is_nonempty_string(M.config.ansible_vault_path) then
+    executable = expand_path(M.config.ansible_vault_path)
+  end
+
+  if is_nonempty_string(M.config.conda_env) then
+    return { "conda", "run", "-n", M.config.conda_env, executable }
+  end
+
+  return { executable }
 end
 
----Get password arguments for ansible-vault
----@param callback fun(args: string[]|nil, cleanup: fun()?): nil
+---@param action string
+---@param args string[]
+---@return string[]
+local function build_vault_argv(action, args)
+  local argv = get_vault_argv()
+  table.insert(argv, action)
+  for _, arg in ipairs(args or {}) do
+    table.insert(argv, tostring(arg))
+  end
+  table.insert(argv, "-")
+  return argv
+end
+
+---@param data string[]
+---@param chunk string[]|nil
+local function collect_job_data(data, chunk)
+  if not chunk then
+    return
+  end
+
+  for _, item in ipairs(chunk) do
+    if item ~= nil then
+      table.insert(data, item)
+    end
+  end
+end
+
+---@param data string[]
+---@return string
+local function join_job_data(data)
+  local lines = vim.deepcopy(data)
+  if lines[#lines] == "" then
+    table.remove(lines, #lines)
+  end
+  return table.concat(lines, "\n")
+end
+
+---@param output string
+---@return string[]
+local function output_to_lines(output)
+  if output == "" then
+    return { "" }
+  end
+  return vim.split(output, "\n", { plain = true })
+end
+
+---@param contents string
+---@return string|nil path
+---@return string|nil err
+local function write_secure_tempfile(contents)
+  local path = vim.fn.tempname()
+  local fd, open_err = uv.fs_open(path, "wx", PASSWORD_FILE_MODE)
+  if not fd then
+    return nil, open_err or "failed to create temp file"
+  end
+
+  local written, write_err = uv.fs_write(fd, contents)
+  uv.fs_close(fd)
+
+  if type(written) ~= "number" or written < #contents then
+    os.remove(path)
+    return nil, write_err or "failed to write temp file"
+  end
+
+  return path, nil
+end
+
+---@param callback fun(args: string[]|nil, cleanup?: fun())
 local function get_password_args(callback)
-  -- Priority: password_file > vault_id > prompt
-  if M.config.password_file then
-    callback({ "--vault-password-file", M.config.password_file })
+  if is_nonempty_string(M.config.password_file) then
+    callback({ "--vault-password-file", expand_path(M.config.password_file) })
     return
   end
 
-  if M.config.vault_id then
-    callback({ "--vault-id", M.config.vault_id })
+  if is_nonempty_string(M.config.vault_id) then
+    callback({ "--vault-id", expand_vault_id(M.config.vault_id) })
     return
   end
 
-  -- Prompt for password
-  vim.ui.input({ prompt = "Ansible Vault Password: ", default = "" }, function(password)
-    if not password or password == "" then
-      vim.notify("Password is required", vim.log.levels.ERROR)
-      callback(nil)
+  local ok, password = pcall(vim.fn.inputsecret, "Ansible Vault Password: ")
+  vim.cmd("redraw")
+
+  if not ok or not password or password == "" then
+    vim.notify("Password is required", vim.log.levels.ERROR)
+    callback(nil)
+    return
+  end
+
+  local tmpfile, err = write_secure_tempfile(password .. "\n")
+  if not tmpfile then
+    vim.notify("Failed to create temp password file: " .. err, vim.log.levels.ERROR)
+    callback(nil)
+    return
+  end
+
+  local cleaned = false
+  callback({ "--vault-password-file", tmpfile }, function()
+    if cleaned then
       return
     end
-
-    -- Create temporary password file
-    local tmpfile = os.tmpname()
-    local f = io.open(tmpfile, "w")
-    if not f then
-      vim.notify("Failed to create temp file", vim.log.levels.ERROR)
-      callback(nil)
-      return
-    end
-    f:write(password)
-    f:close()
-    os.execute("chmod 600 " .. tmpfile)
-
-    callback({ "--vault-password-file", tmpfile }, function()
-      os.remove(tmpfile)
-    end)
+    cleaned = true
+    os.remove(tmpfile)
   end)
 end
 
----Run ansible-vault command
----@param action string The vault action (encrypt, decrypt, view, encrypt_string)
+---@param args string[]
+---@return string[]
+local function with_encrypt_vault_id(args)
+  local result = vim.deepcopy(args or {})
+  if is_nonempty_string(M.config.encrypt_vault_id) then
+    table.insert(result, "--encrypt-vault-id")
+    table.insert(result, M.config.encrypt_vault_id)
+  end
+  return result
+end
+
+---Run ansible-vault command.
+---@param action string The vault action (encrypt, decrypt, encrypt_string)
 ---@param input string Input content
 ---@param args string[] Additional arguments
 ---@param callback fun(success: boolean, output: string): nil
 local function run_vault(action, input, args, callback)
-  local cmd = get_vault_cmd()
-  local full_args = { action }
-  vim.list_extend(full_args, args)
-  table.insert(full_args, "-")
-
-  -- Build the full command string for shell execution
-  local arg_str = table.concat(full_args, " ")
-  local shell_cmd = string.format("%s %s", cmd, arg_str)
-
+  local argv = build_vault_argv(action, args or {})
   local stdout_data = {}
   local stderr_data = {}
 
-  local job_id = vim.fn.jobstart({ "bash", "-c", shell_cmd }, {
+  debug_log("running: %s", table.concat(argv, " "))
+
+  local job_id = vim.fn.jobstart(argv, {
     stdin = "pipe",
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)
-      if data then
-        vim.list_extend(stdout_data, data)
-      end
+      collect_job_data(stdout_data, data)
     end,
     on_stderr = function(_, data)
-      if data then
-        vim.list_extend(stderr_data, data)
-      end
+      collect_job_data(stderr_data, data)
     end,
     on_exit = function(_, exit_code)
       vim.schedule(function()
+        local stdout = join_job_data(stdout_data)
+        local stderr = join_job_data(stderr_data)
+
         if exit_code == 0 then
-          local output = table.concat(stdout_data, "\n")
-          -- Remove trailing newline
-          output = output:gsub("\n$", "")
-          callback(true, output)
-        else
-          local err = table.concat(stderr_data, "\n")
-          callback(false, err)
+          callback(true, stdout)
+          return
         end
+
+        callback(false, stderr ~= "" and stderr or stdout)
       end)
     end,
   })
@@ -167,9 +238,168 @@ local function run_vault(action, input, args, callback)
   vim.fn.chanclose(job_id, "stdin")
 end
 
----Encrypt current buffer
-function M.encrypt()
-  if M.is_buffer_encrypted() then
+---@param buf? integer
+---@return integer
+local function normalize_buf(buf)
+  return buf or vim.api.nvim_get_current_buf()
+end
+
+---@param buf integer
+---@return boolean
+local function is_valid_buf(buf)
+  return vim.api.nvim_buf_is_valid(buf)
+end
+
+---@param buf integer
+---@return integer
+local function changedtick(buf)
+  return vim.b[buf].changedtick or 0
+end
+
+---@param buf integer
+---@return string
+local function buffer_content(buf)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  return table.concat(lines, "\n")
+end
+
+---@param cleanup? fun()
+local function run_cleanup(cleanup)
+  if cleanup then
+    cleanup()
+  end
+end
+
+---@param buf integer
+---@param operation string
+---@return boolean
+local function start_buffer_operation(buf, operation)
+  if vim.b[buf].ansible_vault_pending then
+    vim.notify(
+      string.format("Vault operation already running: %s", vim.b[buf].ansible_vault_pending),
+      vim.log.levels.WARN
+    )
+    return false
+  end
+
+  vim.b[buf].ansible_vault_pending = operation
+  return true
+end
+
+---@param buf integer
+---@param operation string
+local function finish_buffer_operation(buf, operation)
+  if is_valid_buf(buf) and vim.b[buf].ansible_vault_pending == operation then
+    vim.b[buf].ansible_vault_pending = nil
+  end
+end
+
+---@param buf integer
+---@param expected_changedtick integer
+---@param output string
+---@param success_message string
+---@return boolean
+local function replace_buffer_lines(buf, expected_changedtick, output, success_message)
+  if not is_valid_buf(buf) then
+    vim.notify("Vault operation finished, but the target buffer no longer exists", vim.log.levels.WARN)
+    return false
+  end
+
+  if changedtick(buf) ~= expected_changedtick then
+    vim.notify("Vault operation finished, but the buffer changed; result was not applied", vim.log.levels.ERROR)
+    return false
+  end
+
+  local lines = output_to_lines(output)
+  local ok, err = pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines)
+  if not ok then
+    vim.notify("Failed to update buffer: " .. err, vim.log.levels.ERROR)
+    return false
+  end
+
+  vim.b[buf].ansible_vault_encrypted = M.is_encrypted(lines)
+  vim.notify(success_message, vim.log.levels.INFO)
+  return true
+end
+
+---@param output string
+---@param title string
+---@param filetype? string
+local function open_output_window(output, title, filetype)
+  local buf = vim.api.nvim_create_buf(false, true)
+  local lines = output_to_lines(output)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].filetype = filetype or ""
+  vim.bo[buf].modifiable = false
+
+  local max_line_width = 0
+  for _, line in ipairs(lines) do
+    max_line_width = math.max(max_line_width, vim.api.nvim_strwidth(line))
+  end
+
+  local available_width = math.max(1, vim.o.columns - 4)
+  local available_height = math.max(1, vim.o.lines - 4)
+  local width = math.min(math.max(max_line_width + 2, 40), available_width)
+  local height = math.min(math.max(#lines, 1), available_height)
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+    row = math.max(0, math.floor((vim.o.lines - height) / 2)),
+    style = "minimal",
+    border = "rounded",
+    title = title,
+    title_pos = "center",
+  })
+
+  local close_window = function()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end
+
+  vim.keymap.set("n", "q", close_window, { buffer = buf, desc = "Close vault view" })
+  vim.keymap.set("n", "<Esc>", close_window, { buffer = buf, desc = "Close vault view" })
+end
+
+---Check if content is vault encrypted.
+---@param content string|string[]
+---@return boolean
+function M.is_encrypted(content)
+  local first_line
+  if type(content) == "table" then
+    first_line = content[1] or ""
+  else
+    first_line = content:match("^[^\n]*") or ""
+  end
+  return first_line:match(VAULT_HEADER) ~= nil
+end
+
+---Check if buffer is vault encrypted.
+---@param buf? integer
+---@return boolean
+function M.is_buffer_encrypted(buf)
+  local target = normalize_buf(buf)
+  if not is_valid_buf(target) then
+    return false
+  end
+  local lines = vim.api.nvim_buf_get_lines(target, 0, 1, false)
+  return M.is_encrypted(lines)
+end
+
+---Encrypt current buffer.
+---@param buf? integer
+function M.encrypt(buf)
+  local target = normalize_buf(buf)
+  if not is_valid_buf(target) then
+    vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
+    return
+  end
+
+  if M.is_buffer_encrypted(target) then
     vim.notify("Buffer is already encrypted", vim.log.levels.WARN)
     return
   end
@@ -179,25 +409,26 @@ function M.encrypt()
       return
     end
 
-    -- Add encrypt-vault-id for encryption
-    local encrypt_args = vim.deepcopy(args)
-    if M.config.encrypt_vault_id then
-      table.insert(encrypt_args, "--encrypt-vault-id")
-      table.insert(encrypt_args, M.config.encrypt_vault_id)
+    if not is_valid_buf(target) then
+      run_cleanup(cleanup)
+      vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
+      return
     end
 
-    local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-    local content = table.concat(lines, "\n")
+    if not start_buffer_operation(target, "encrypt") then
+      run_cleanup(cleanup)
+      return
+    end
 
-    run_vault("encrypt", content, encrypt_args, function(success, output)
-      if cleanup then
-        cleanup()
-      end
+    local tick = changedtick(target)
+    local content = buffer_content(target)
+
+    run_vault("encrypt", content, with_encrypt_vault_id(args), function(success, output)
+      run_cleanup(cleanup)
+      finish_buffer_operation(target, "encrypt")
 
       if success then
-        local new_lines = vim.split(output, "\n", { plain = true })
-        vim.api.nvim_buf_set_lines(0, 0, -1, false, new_lines)
-        vim.notify("Buffer encrypted successfully", vim.log.levels.INFO)
+        replace_buffer_lines(target, tick, output, "Buffer encrypted successfully")
       else
         vim.notify("Encryption failed: " .. output, vim.log.levels.ERROR)
       end
@@ -205,9 +436,16 @@ function M.encrypt()
   end)
 end
 
----Decrypt current buffer
-function M.decrypt()
-  if not M.is_buffer_encrypted() then
+---Decrypt current buffer.
+---@param buf? integer
+function M.decrypt(buf)
+  local target = normalize_buf(buf)
+  if not is_valid_buf(target) then
+    vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
+    return
+  end
+
+  if not M.is_buffer_encrypted(target) then
     vim.notify("Buffer is not encrypted", vim.log.levels.WARN)
     return
   end
@@ -217,18 +455,26 @@ function M.decrypt()
       return
     end
 
-    local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-    local content = table.concat(lines, "\n")
+    if not is_valid_buf(target) then
+      run_cleanup(cleanup)
+      vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
+      return
+    end
+
+    if not start_buffer_operation(target, "decrypt") then
+      run_cleanup(cleanup)
+      return
+    end
+
+    local tick = changedtick(target)
+    local content = buffer_content(target)
 
     run_vault("decrypt", content, args, function(success, output)
-      if cleanup then
-        cleanup()
-      end
+      run_cleanup(cleanup)
+      finish_buffer_operation(target, "decrypt")
 
       if success then
-        local new_lines = vim.split(output, "\n", { plain = true })
-        vim.api.nvim_buf_set_lines(0, 0, -1, false, new_lines)
-        vim.notify("Buffer decrypted successfully", vim.log.levels.INFO)
+        replace_buffer_lines(target, tick, output, "Buffer decrypted successfully")
       else
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
       end
@@ -236,61 +482,38 @@ function M.decrypt()
   end)
 end
 
----View encrypted buffer in a floating window
-function M.view()
-  if not M.is_buffer_encrypted() then
+---View encrypted buffer in a floating window.
+---@param buf? integer
+function M.view(buf)
+  local target = normalize_buf(buf)
+  if not is_valid_buf(target) then
+    vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
+    return
+  end
+
+  if not M.is_buffer_encrypted(target) then
     vim.notify("Buffer is not encrypted", vim.log.levels.WARN)
     return
   end
+
+  local filetype = vim.bo[target].filetype
 
   get_password_args(function(args, cleanup)
     if not args then
       return
     end
 
-    local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-    local content = table.concat(lines, "\n")
+    if not is_valid_buf(target) then
+      run_cleanup(cleanup)
+      vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
+      return
+    end
 
-    run_vault("decrypt", content, args, function(success, output)
-      if cleanup then
-        cleanup()
-      end
+    run_vault("decrypt", buffer_content(target), args, function(success, output)
+      run_cleanup(cleanup)
 
       if success then
-        -- Create floating window
-        local buf = vim.api.nvim_create_buf(false, true)
-        local new_lines = vim.split(output, "\n", { plain = true })
-        vim.api.nvim_buf_set_lines(buf, 0, -1, false, new_lines)
-
-        -- Calculate window size
-        local width = math.min(80, vim.o.columns - 4)
-        local height = math.min(#new_lines + 2, vim.o.lines - 4)
-
-        local win = vim.api.nvim_open_win(buf, true, {
-          relative = "editor",
-          width = width,
-          height = height,
-          col = (vim.o.columns - width) / 2,
-          row = (vim.o.lines - height) / 2,
-          style = "minimal",
-          border = "rounded",
-          title = " Vault View (read-only) ",
-          title_pos = "center",
-        })
-
-        -- Set buffer options
-        vim.bo[buf].modifiable = false
-        vim.bo[buf].bufhidden = "wipe"
-        vim.bo[buf].filetype = vim.bo.filetype
-
-        -- Add keymaps to close
-        vim.keymap.set("n", "q", function()
-          vim.api.nvim_win_close(win, true)
-        end, { buffer = buf, desc = "Close vault view" })
-
-        vim.keymap.set("n", "<Esc>", function()
-          vim.api.nvim_win_close(win, true)
-        end, { buffer = buf, desc = "Close vault view" })
+        open_output_window(output, " Vault View (read-only) ", filetype)
       else
         vim.notify("View failed: " .. output, vim.log.levels.ERROR)
       end
@@ -298,86 +521,385 @@ function M.view()
   end)
 end
 
----Encrypt selected text (visual mode)
-function M.encrypt_string()
-  -- Get visual selection
+---@class AnsibleVaultSelection
+---@field start_row integer
+---@field start_col integer
+---@field end_row integer
+---@field end_col integer
+---@field lines string[]
+---@field linewise boolean
+
+---@param buf integer
+---@param range_opts? table
+---@return AnsibleVaultSelection|nil
+local function get_selection(buf, range_opts)
   local start_pos = vim.fn.getpos("'<")
   local end_pos = vim.fn.getpos("'>")
-  local lines = vim.fn.getline(start_pos[2], end_pos[2])
+  local start_row = start_pos[2]
+  local start_col = start_pos[3]
+  local end_row = end_pos[2]
+  local end_col = end_pos[3]
+  local range_linewise = false
 
+  local has_range = range_opts and range_opts.range and range_opts.range > 0
+  local marks_match_range = has_range and start_row == range_opts.line1 and end_row == range_opts.line2
+  if has_range and not marks_match_range then
+    start_row = range_opts.line1
+    end_row = range_opts.line2
+    start_col = 1
+    local last_line = vim.api.nvim_buf_get_lines(buf, end_row - 1, end_row, false)[1] or ""
+    end_col = #last_line
+    range_linewise = true
+  elseif start_row == 0 or end_row == 0 then
+    if not range_opts or not range_opts.line1 or not range_opts.line2 then
+      return nil
+    end
+    start_row = range_opts.line1
+    end_row = range_opts.line2
+    start_col = 1
+    local last_line = vim.api.nvim_buf_get_lines(buf, end_row - 1, end_row, false)[1] or ""
+    end_col = #last_line
+    range_linewise = true
+  end
+
+  if start_row > end_row or (start_row == end_row and start_col > end_col) then
+    start_row, end_row = end_row, start_row
+    start_col, end_col = end_col, start_col
+  end
+
+  local line_count = vim.api.nvim_buf_line_count(buf)
+  start_row = math.max(1, math.min(start_row, line_count))
+  end_row = math.max(1, math.min(end_row, line_count))
+
+  local lines = vim.api.nvim_buf_get_lines(buf, start_row - 1, end_row, false)
   if #lines == 0 then
+    return nil
+  end
+
+  local visual_mode = vim.fn.visualmode()
+  local linewise = range_linewise or visual_mode == "V"
+
+  if linewise then
+    start_col = 1
+    end_col = #lines[#lines]
+  else
+    if #lines == 1 then
+      lines[1] = lines[1]:sub(start_col, end_col)
+    else
+      lines[1] = lines[1]:sub(start_col)
+      lines[#lines] = lines[#lines]:sub(1, end_col)
+    end
+  end
+
+  return {
+    start_row = start_row - 1,
+    start_col = start_col - 1,
+    end_row = end_row - 1,
+    end_col = end_col,
+    lines = lines,
+    linewise = linewise,
+  }
+end
+
+---@param text string
+---@return string
+local function escape_pattern(text)
+  return text:gsub("([^%w])", "%%%1")
+end
+
+---@param buf integer
+---@param selection AnsibleVaultSelection
+---@return table
+local function build_encrypt_string_plan(buf, selection)
+  local plan = {
+    content = table.concat(selection.lines, "\n"),
+    name = "encrypted_string",
+    mode = "full_output",
+    indent = "",
+    start_row = selection.start_row,
+    start_col = selection.start_col,
+    end_row = selection.end_row,
+    end_col = selection.end_col,
+  }
+
+  if selection.start_row ~= selection.end_row then
+    return plan
+  end
+
+  local full_line = vim.api.nvim_buf_get_lines(buf, selection.start_row, selection.start_row + 1, false)[1] or ""
+  local is_full_line = selection.start_col == 0 and selection.end_col >= #full_line
+
+  if is_full_line then
+    local indent, key, value = full_line:match("^(%s*)([%w_.%-]+):%s*(.-)%s*$")
+    if key and value ~= "" and not value:match("^!vault") then
+      plan.content = value
+      plan.name = key
+      plan.mode = "full_line"
+      plan.indent = indent
+    end
+    return plan
+  end
+
+  local prefix = full_line:sub(1, selection.start_col)
+  local indent, key = prefix:match("^(%s*)([%w_.%-]+):%s*$")
+  if key then
+    plan.name = key
+    plan.mode = "value_only"
+    plan.indent = indent
+  end
+
+  return plan
+end
+
+---@param output string
+---@param plan table
+---@return string[]
+local function format_encrypt_string_output(output, plan)
+  local lines = output_to_lines(output)
+
+  if plan.mode == "value_only" then
+    local key_pattern = "^%s*" .. escape_pattern(plan.name) .. ":%s*(.*)$"
+    local first_value = lines[1] and lines[1]:match(key_pattern)
+    if first_value then
+      lines[1] = first_value
+    end
+  elseif plan.mode == "full_line" and plan.indent ~= "" then
+    for i, line in ipairs(lines) do
+      lines[i] = plan.indent .. line
+    end
+  end
+
+  return lines
+end
+
+---Encrypt selected text.
+---@param range_opts? table
+function M.encrypt_string(range_opts)
+  local target = vim.api.nvim_get_current_buf()
+  local selection = get_selection(target, range_opts)
+
+  if not selection or #selection.lines == 0 then
     vim.notify("No text selected", vim.log.levels.WARN)
     return
   end
 
-  -- Adjust for partial line selection
-  if #lines == 1 then
-    lines[1] = lines[1]:sub(start_pos[3], end_pos[3])
-  else
-    lines[1] = lines[1]:sub(start_pos[3])
-    lines[#lines] = lines[#lines]:sub(1, end_pos[3])
-  end
-
-  local content = table.concat(lines, "\n")
+  local plan = build_encrypt_string_plan(target, selection)
+  local planned_tick = changedtick(target)
 
   get_password_args(function(args, cleanup)
     if not args then
       return
     end
 
-    -- Add encrypt_string specific args
-    local full_args = vim.deepcopy(args)
-    if M.config.encrypt_vault_id then
-      table.insert(full_args, "--encrypt-vault-id")
-      table.insert(full_args, M.config.encrypt_vault_id)
+    if not is_valid_buf(target) then
+      run_cleanup(cleanup)
+      vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
+      return
     end
-    table.insert(full_args, "--stdin-name")
-    table.insert(full_args, "encrypted_string")
 
-    run_vault("encrypt_string", content, full_args, function(success, output)
-      if cleanup then
-        cleanup()
+    if changedtick(target) ~= planned_tick then
+      run_cleanup(cleanup)
+      vim.notify("Buffer changed before encryption started; result was not applied", vim.log.levels.ERROR)
+      return
+    end
+
+    if not start_buffer_operation(target, "encrypt_string") then
+      run_cleanup(cleanup)
+      return
+    end
+
+    local full_args = with_encrypt_vault_id(args)
+    table.insert(full_args, "--stdin-name")
+    table.insert(full_args, plan.name)
+
+    run_vault("encrypt_string", plan.content, full_args, function(success, output)
+      run_cleanup(cleanup)
+      finish_buffer_operation(target, "encrypt_string")
+
+      if not success then
+        vim.notify("Encryption failed: " .. output, vim.log.levels.ERROR)
+        return
       end
 
-      if success then
-        -- Replace selection with encrypted content
-        local new_lines = vim.split(output, "\n", { plain = true })
+      if not is_valid_buf(target) then
+        vim.notify("Vault operation finished, but the target buffer no longer exists", vim.log.levels.WARN)
+        return
+      end
 
-        vim.api.nvim_buf_set_text(
-          0,
-          start_pos[2] - 1,
-          start_pos[3] - 1,
-          end_pos[2] - 1,
-          end_pos[3],
-          new_lines
-        )
+      if changedtick(target) ~= planned_tick then
+        vim.notify("Vault operation finished, but the buffer changed; result was not applied", vim.log.levels.ERROR)
+        return
+      end
+
+      local ok, err = pcall(
+        vim.api.nvim_buf_set_text,
+        target,
+        plan.start_row,
+        plan.start_col,
+        plan.end_row,
+        plan.end_col,
+        format_encrypt_string_output(output, plan)
+      )
+
+      if ok then
         vim.notify("String encrypted successfully", vim.log.levels.INFO)
       else
-        vim.notify("Encryption failed: " .. output, vim.log.levels.ERROR)
+        vim.notify("Failed to update selection: " .. err, vim.log.levels.ERROR)
       end
     end)
   end)
 end
 
----Toggle between encrypted and decrypted state
-function M.toggle()
-  if M.is_buffer_encrypted() then
-    M.decrypt()
+---Toggle between encrypted and decrypted state.
+---@param buf? integer
+function M.toggle(buf)
+  local target = normalize_buf(buf)
+  if M.is_buffer_encrypted(target) then
+    M.decrypt(target)
   else
-    M.encrypt()
+    M.encrypt(target)
   end
 end
 
----Edit encrypted buffer using scratch buffer (no temp file on disk)
-function M.edit()
-  if not M.is_buffer_encrypted() then
+---@param path string
+---@param data string
+---@return boolean
+---@return string|nil
+local function atomic_write_file(path, data)
+  local dir = vim.fn.fnamemodify(path, ":h")
+  local tail = vim.fn.fnamemodify(path, ":t")
+  local tmp = string.format("%s/.%s.ansible-vault.nvim.%d.%d", dir, tail, uv.getpid(), math.random(100000, 999999))
+
+  local mode = PASSWORD_FILE_MODE
+  local stat = uv.fs_stat(path)
+  if stat and stat.mode then
+    mode = stat.mode % 512
+  end
+
+  local fd, open_err = uv.fs_open(tmp, "wx", mode)
+  if not fd then
+    return false, open_err or "failed to create temporary output file"
+  end
+
+  local written, write_err = uv.fs_write(fd, data)
+  uv.fs_close(fd)
+
+  if type(written) ~= "number" or written < #data then
+    os.remove(tmp)
+    return false, write_err or "failed to write encrypted output"
+  end
+
+  local ok, rename_err = uv.fs_rename(tmp, path)
+  if not ok then
+    os.remove(tmp)
+    return false, rename_err or "failed to replace original file"
+  end
+
+  return true, nil
+end
+
+---@param path string
+---@return table|nil
+local function file_signature(path)
+  local stat = uv.fs_stat(path)
+  if not stat then
+    return nil
+  end
+
+  return {
+    size = stat.size,
+    mtime_sec = stat.mtime and stat.mtime.sec or 0,
+    mtime_nsec = stat.mtime and stat.mtime.nsec or 0,
+    ctime_sec = stat.ctime and stat.ctime.sec or 0,
+    ctime_nsec = stat.ctime and stat.ctime.nsec or 0,
+  }
+end
+
+---@param left table|nil
+---@param right table|nil
+---@return boolean
+local function same_file_signature(left, right)
+  if not left or not right then
+    return left == right
+  end
+
+  return left.size == right.size
+    and left.mtime_sec == right.mtime_sec
+    and left.mtime_nsec == right.mtime_nsec
+    and left.ctime_sec == right.ctime_sec
+    and left.ctime_nsec == right.ctime_nsec
+end
+
+---@param edit_buf integer
+local function cleanup_edit_buffer(edit_buf)
+  if not is_valid_buf(edit_buf) then
+    return
+  end
+
+  local cleanup = vim.b[edit_buf].vault_cleanup
+  if cleanup then
+    cleanup()
+    vim.b[edit_buf].vault_cleanup = nil
+  end
+end
+
+---@param edit_buf integer
+---@param original_buf integer
+---@param original_file string
+---@param preferred_win integer
+local function close_edit_buffer(edit_buf, original_buf, original_file, preferred_win)
+  if is_valid_buf(original_buf) then
+    pcall(vim.api.nvim_buf_call, original_buf, function()
+      vim.cmd("silent! edit!")
+    end)
+  end
+
+  if is_valid_buf(edit_buf) then
+    vim.bo[edit_buf].modified = false
+  end
+
+  local win = vim.api.nvim_win_is_valid(preferred_win) and preferred_win or vim.api.nvim_get_current_win()
+  if is_valid_buf(original_buf) and vim.api.nvim_win_is_valid(win) then
+    vim.api.nvim_win_set_buf(win, original_buf)
+  elseif vim.api.nvim_win_is_valid(win) then
+    vim.api.nvim_set_current_win(win)
+    vim.cmd("edit " .. vim.fn.fnameescape(original_file))
+  end
+
+  if is_valid_buf(edit_buf) then
+    vim.api.nvim_buf_delete(edit_buf, { force = true })
+  end
+end
+
+---Edit encrypted buffer using a scratch buffer.
+---@param buf? integer
+function M.edit(buf)
+  local original_buf = normalize_buf(buf)
+  if not is_valid_buf(original_buf) then
+    vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
+    return
+  end
+
+  if not M.is_buffer_encrypted(original_buf) then
     vim.notify("Buffer is not encrypted", vim.log.levels.WARN)
     return
   end
 
-  local original_buf = vim.api.nvim_get_current_buf()
+  if vim.bo[original_buf].modified then
+    vim.notify("Write or discard changes before VaultEdit", vim.log.levels.ERROR)
+    return
+  end
+
   local original_file = vim.api.nvim_buf_get_name(original_buf)
+  if original_file == "" then
+    vim.notify("VaultEdit requires a file-backed buffer", vim.log.levels.ERROR)
+    return
+  end
+
+  local original_win = vim.api.nvim_get_current_win()
   local filetype = vim.bo[original_buf].filetype
+  local original_tick = changedtick(original_buf)
+  local original_signature = file_signature(original_file)
 
   debug_log("VaultEdit: original_file=%s, original_buf=%d", original_file, original_buf)
 
@@ -386,132 +908,131 @@ function M.edit()
       return
     end
 
-    local lines = vim.api.nvim_buf_get_lines(original_buf, 0, -1, false)
-    local content = table.concat(lines, "\n")
+    if not is_valid_buf(original_buf) then
+      run_cleanup(cleanup)
+      vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
+      return
+    end
 
-    run_vault("decrypt", content, args, function(success, output)
+    run_vault("decrypt", buffer_content(original_buf), args, function(success, output)
       if not success then
-        if cleanup then cleanup() end
+        run_cleanup(cleanup)
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
         return
       end
 
-      -- Close original buffer first
-      vim.api.nvim_buf_delete(original_buf, { force = true })
-      debug_log("VaultEdit: closed original buffer %d", original_buf)
+      if not is_valid_buf(original_buf) then
+        run_cleanup(cleanup)
+        vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
+        return
+      end
 
-      -- Create scratch buffer (no file on disk)
+      if changedtick(original_buf) ~= original_tick then
+        run_cleanup(cleanup)
+        vim.notify("Original buffer changed before VaultEdit opened; edit was cancelled", vim.log.levels.ERROR)
+        return
+      end
+
       local edit_buf = vim.api.nvim_create_buf(true, false)
-      vim.api.nvim_set_current_buf(edit_buf)
-
-      -- Set buffer content
-      local decrypted_lines = vim.split(output, "\n", { plain = true })
+      local decrypted_lines = output_to_lines(output)
       vim.api.nvim_buf_set_lines(edit_buf, 0, -1, false, decrypted_lines)
 
-      -- Set buffer options
+      vim.bo[edit_buf].buftype = "acwrite"
+      vim.bo[edit_buf].bufhidden = "wipe"
       vim.bo[edit_buf].filetype = filetype
-      vim.bo[edit_buf].buftype = "acwrite" -- Allow :w but use custom write
+      vim.bo[edit_buf].swapfile = false
+      vim.bo[edit_buf].undofile = false
       vim.bo[edit_buf].modified = false
+      vim.api.nvim_buf_set_name(edit_buf, "ansible-vault://" .. original_file)
 
-      -- Set a virtual name for display (not a real file)
-      local display_name = original_file .. " [vault-edit]"
-      vim.api.nvim_buf_set_name(edit_buf, display_name)
-
-      debug_log("VaultEdit: created scratch buffer %d, display_name=%s", edit_buf, display_name)
-
-      -- Store metadata
+      vim.b[edit_buf].vault_original_buf = original_buf
       vim.b[edit_buf].vault_original_file = original_file
+      vim.b[edit_buf].vault_original_signature = original_signature
       vim.b[edit_buf].vault_password_args = args
       vim.b[edit_buf].vault_cleanup = cleanup
+      vim.b[edit_buf].vault_write_pending = false
 
-      -- Use BufWriteCmd to intercept :w (no disk write for scratch buffer)
+      if vim.api.nvim_win_is_valid(original_win) then
+        vim.api.nvim_win_set_buf(original_win, edit_buf)
+      else
+        vim.api.nvim_set_current_buf(edit_buf)
+      end
+
       vim.api.nvim_create_autocmd("BufWriteCmd", {
         buffer = edit_buf,
-        callback = function()
-          local cur_buf = vim.api.nvim_get_current_buf()
-          local edit_lines = vim.api.nvim_buf_get_lines(cur_buf, 0, -1, false)
-          local edit_content = table.concat(edit_lines, "\n")
-          local orig_file = vim.b[cur_buf].vault_original_file
-          local clnup = vim.b[cur_buf].vault_cleanup
-
-          debug_log("VaultEdit: BufWriteCmd triggered, encrypting to %s", orig_file)
-
-          local encrypt_args = vim.deepcopy(vim.b[cur_buf].vault_password_args)
-          if M.config.encrypt_vault_id then
-            table.insert(encrypt_args, "--encrypt-vault-id")
-            table.insert(encrypt_args, M.config.encrypt_vault_id)
+        callback = function(event)
+          local cur_buf = event.buf
+          if vim.b[cur_buf].vault_write_pending then
+            vim.notify("VaultEdit save already in progress", vim.log.levels.WARN)
+            return
           end
 
+          vim.b[cur_buf].vault_write_pending = true
+          local edit_content = table.concat(vim.api.nvim_buf_get_lines(cur_buf, 0, -1, false), "\n")
+          local orig_file = vim.b[cur_buf].vault_original_file
+          local orig_buf = vim.b[cur_buf].vault_original_buf
+          local orig_signature = vim.b[cur_buf].vault_original_signature
+          local encrypt_args = with_encrypt_vault_id(vim.b[cur_buf].vault_password_args)
+
+          debug_log("VaultEdit: encrypting to %s", orig_file)
+
           run_vault("encrypt", edit_content, encrypt_args, function(enc_success, enc_output)
-            if enc_success then
-              -- Write encrypted content to original file
-              local orig_f = io.open(orig_file, "w")
-              if orig_f then
-                orig_f:write(enc_output .. "\n")
-                orig_f:close()
-                debug_log("VaultEdit: encrypted content written to %s", orig_file)
-
-                if clnup then
-                  clnup()
-                  vim.b[cur_buf].vault_cleanup = nil
-                end
-
-                -- Mark buffer as not modified and close
-                vim.bo[cur_buf].modified = false
-
-                vim.schedule(function()
-                  vim.api.nvim_buf_delete(cur_buf, { force = true })
-                  vim.cmd("edit " .. vim.fn.fnameescape(orig_file))
-                  vim.notify("Encrypted and saved: " .. orig_file, vim.log.levels.INFO)
-                end)
-              else
-                vim.notify("Failed to write to original file", vim.log.levels.ERROR)
-              end
-            else
-              vim.notify("Encryption failed: " .. enc_output, vim.log.levels.ERROR)
+            if not is_valid_buf(cur_buf) then
+              return
             end
+
+            vim.b[cur_buf].vault_write_pending = false
+
+            if not enc_success then
+              vim.notify("Encryption failed: " .. enc_output, vim.log.levels.ERROR)
+              return
+            end
+
+            if not same_file_signature(orig_signature, file_signature(orig_file)) then
+              vim.notify("Original file changed on disk; encrypted output was not written", vim.log.levels.ERROR)
+              return
+            end
+
+            local write_ok, write_err = atomic_write_file(orig_file, enc_output .. "\n")
+            if not write_ok then
+              vim.notify("Failed to write encrypted file: " .. write_err, vim.log.levels.ERROR)
+              return
+            end
+
+            cleanup_edit_buffer(cur_buf)
+            close_edit_buffer(cur_buf, orig_buf, orig_file, original_win)
+            vim.notify("Encrypted and saved: " .. orig_file, vim.log.levels.INFO)
           end)
         end,
       })
 
-      -- Cleanup on buffer close without save
-      vim.api.nvim_create_autocmd("BufDelete", {
+      vim.api.nvim_create_autocmd({ "BufDelete", "BufWipeout" }, {
         buffer = edit_buf,
-        callback = function()
-          local clnup = vim.b[edit_buf].vault_cleanup
-          if clnup then
-            clnup()
-          end
+        callback = function(event)
+          cleanup_edit_buffer(event.buf)
           debug_log("VaultEdit: buffer closed")
         end,
       })
 
-      vim.notify("Editing decrypted content (in memory). :w to encrypt and save.", vim.log.levels.INFO)
+      vim.notify("Editing decrypted content. :w encrypts and saves.", vim.log.levels.INFO)
     end)
   end)
 end
 
----Extract vault content from YAML format, removing indentation
+---Extract vault content from YAML format, removing indentation.
 ---@param content string
 ---@return string|nil vault_content
 ---@return string|nil var_name
 local function extract_vault_from_yaml(content)
   debug_log("VaultViewString: raw content:\n%s", content)
 
-  -- Pattern: var_name: !vault |
-  --            $ANSIBLE_VAULT;...
-  --            encrypted_data...
-  local var_name, after_vault = content:match("^%s*([%w_]+):%s*!vault%s*|%s*\n(.+)")
+  local var_name, after_vault = content:match("^%s*([%w_.%-]+):%s*!vault%s*|%s*\n(.+)")
   if not var_name then
-    -- Try without variable name: !vault |
     after_vault = content:match("!vault%s*|%s*\n(.+)")
   end
 
   if after_vault then
-    -- Split into lines and remove common indentation
     local vault_lines = vim.split(after_vault, "\n", { plain = true })
-
-    -- Find minimum indentation (only from non-empty lines)
     local min_indent = math.huge
     for _, line in ipairs(vault_lines) do
       if line:match("%S") then
@@ -520,9 +1041,6 @@ local function extract_vault_from_yaml(content)
       end
     end
 
-    debug_log("VaultViewString: min_indent=%d", min_indent == math.huge and -1 or min_indent)
-
-    -- Remove the common indentation
     if min_indent < math.huge and min_indent > 0 then
       for i, line in ipairs(vault_lines) do
         if #line >= min_indent then
@@ -531,15 +1049,11 @@ local function extract_vault_from_yaml(content)
       end
     end
 
-    -- Join and trim
     local result = table.concat(vault_lines, "\n"):gsub("^%s+", ""):gsub("%s+$", "")
-    debug_log("VaultViewString: extracted vault content:\n%s", result)
     return result, var_name
   end
 
-  -- Fallback: content starts directly with $ANSIBLE_VAULT
   if content:match("%$ANSIBLE_VAULT") then
-    -- Still need to handle indentation
     local lines = vim.split(content, "\n", { plain = true })
     local min_indent = math.huge
     for _, line in ipairs(lines) do
@@ -558,31 +1072,24 @@ local function extract_vault_from_yaml(content)
     end
 
     local result = table.concat(lines, "\n"):gsub("^%s+", ""):gsub("%s+$", "")
-    debug_log("VaultViewString: direct vault content:\n%s", result)
     return result, nil
   end
 
   return nil, nil
 end
 
----View selected encrypted string in floating window (visual mode)
-function M.view_string()
-  -- Get visual selection
-  local start_pos = vim.fn.getpos("'<")
-  local end_pos = vim.fn.getpos("'>")
-  local lines = vim.fn.getline(start_pos[2], end_pos[2])
+---View selected encrypted string in floating window.
+---@param range_opts? table
+function M.view_string(range_opts)
+  local target = vim.api.nvim_get_current_buf()
+  local selection = get_selection(target, range_opts)
 
-  if #lines == 0 then
+  if not selection or #selection.lines == 0 then
     vim.notify("No text selected", vim.log.levels.WARN)
     return
   end
 
-  -- For line-wise visual selection, use full lines
-  local content = table.concat(lines, "\n")
-
-  debug_log("VaultViewString: selection from line %d to %d", start_pos[2], end_pos[2])
-
-  -- Extract vault content from YAML
+  local content = table.concat(selection.lines, "\n")
   local vault_content, var_name = extract_vault_from_yaml(content)
 
   if not vault_content or not vault_content:match("%$ANSIBLE_VAULT") then
@@ -590,56 +1097,19 @@ function M.view_string()
     return
   end
 
+  local filetype = vim.bo[target].filetype
+
   get_password_args(function(args, cleanup)
     if not args then
       return
     end
 
     run_vault("decrypt", vault_content, args, function(success, output)
-      if cleanup then
-        cleanup()
-      end
+      run_cleanup(cleanup)
 
       if success then
-        -- Create floating window
-        local buf = vim.api.nvim_create_buf(false, true)
-        local new_lines = vim.split(output, "\n", { plain = true })
-        vim.api.nvim_buf_set_lines(buf, 0, -1, false, new_lines)
-
-        -- Calculate window size
-        local max_line_len = 0
-        for _, line in ipairs(new_lines) do
-          max_line_len = math.max(max_line_len, #line)
-        end
-        local width = math.min(math.max(max_line_len + 2, 40), vim.o.columns - 4)
-        local height = math.min(#new_lines + 1, vim.o.lines - 4)
-
         local title = var_name and string.format(" %s (read-only) ", var_name) or " Vault String (read-only) "
-
-        local win = vim.api.nvim_open_win(buf, true, {
-          relative = "editor",
-          width = width,
-          height = height,
-          col = (vim.o.columns - width) / 2,
-          row = (vim.o.lines - height) / 2,
-          style = "minimal",
-          border = "rounded",
-          title = title,
-          title_pos = "center",
-        })
-
-        -- Set buffer options
-        vim.bo[buf].modifiable = false
-        vim.bo[buf].bufhidden = "wipe"
-
-        -- Add keymaps to close
-        vim.keymap.set("n", "q", function()
-          vim.api.nvim_win_close(win, true)
-        end, { buffer = buf, desc = "Close vault view" })
-
-        vim.keymap.set("n", "<Esc>", function()
-          vim.api.nvim_win_close(win, true)
-        end, { buffer = buf, desc = "Close vault view" })
+        open_output_window(output, title, filetype)
       else
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
       end
@@ -647,61 +1117,66 @@ function M.view_string()
   end)
 end
 
----Get status string for statusline
+---Get status string for statusline.
+---@param buf? integer
 ---@return string
-function M.status()
-  if M.is_buffer_encrypted() then
+function M.status(buf)
+  if M.is_buffer_encrypted(buf) then
     return "[VAULT]"
   end
   return ""
 end
 
----Setup the plugin
+---Setup the plugin.
 ---@param opts? AnsibleVaultConfig
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 
-  -- Create user commands
   vim.api.nvim_create_user_command("VaultEncrypt", function()
     M.encrypt()
-  end, { desc = "Encrypt current buffer with ansible-vault" })
+  end, { desc = "Encrypt current buffer with ansible-vault", force = true })
 
   vim.api.nvim_create_user_command("VaultDecrypt", function()
     M.decrypt()
-  end, { desc = "Decrypt current buffer with ansible-vault" })
+  end, { desc = "Decrypt current buffer with ansible-vault", force = true })
 
   vim.api.nvim_create_user_command("VaultView", function()
     M.view()
-  end, { desc = "View encrypted buffer in floating window" })
+  end, { desc = "View encrypted buffer in floating window", force = true })
 
   vim.api.nvim_create_user_command("VaultToggle", function()
     M.toggle()
-  end, { desc = "Toggle vault encryption state" })
+  end, { desc = "Toggle vault encryption state", force = true })
 
   vim.api.nvim_create_user_command("VaultEdit", function()
     M.edit()
-  end, { desc = "Edit encrypted buffer in temp file" })
+  end, { desc = "Edit encrypted buffer in a secure scratch buffer", force = true })
 
-  vim.api.nvim_create_user_command("VaultEncryptString", function()
-    M.encrypt_string()
-  end, { range = true, desc = "Encrypt selected string" })
+  vim.api.nvim_create_user_command("VaultEncryptString", function(command_opts)
+    M.encrypt_string(command_opts)
+  end, { range = true, desc = "Encrypt selected string", force = true })
 
-  vim.api.nvim_create_user_command("VaultViewString", function()
-    M.view_string()
-  end, { range = true, desc = "View selected encrypted string" })
+  vim.api.nvim_create_user_command("VaultViewString", function(command_opts)
+    M.view_string(command_opts)
+  end, { range = true, desc = "View selected encrypted string", force = true })
 
-  -- Auto-detection
+  local group = vim.api.nvim_create_augroup(AUGROUP, { clear = true })
   if M.config.auto_detect then
     vim.api.nvim_create_autocmd("BufReadPost", {
-      group = vim.api.nvim_create_augroup("AnsibleVault", { clear = true }),
+      group = group,
       pattern = "*",
-      callback = function()
-        if M.is_buffer_encrypted() then
-          vim.b.ansible_vault_encrypted = true
-        end
+      callback = function(event)
+        vim.b[event.buf].ansible_vault_encrypted = M.is_buffer_encrypted(event.buf)
       end,
     })
   end
 end
+
+M._private = {
+  build_vault_argv = build_vault_argv,
+  expand_vault_id = expand_vault_id,
+  extract_vault_from_yaml = extract_vault_from_yaml,
+  output_to_lines = output_to_lines,
+}
 
 return M
