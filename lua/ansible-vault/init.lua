@@ -6,6 +6,9 @@
 ---@field rekey_password_file? string New vault password file for VaultRekey
 ---@field rekey_vault_id? string New vault ID for VaultRekey, for example "prod@~/.ansible/new-pass"
 ---@field auto_detect? boolean Auto detect vault encrypted files (default: true)
+---@field auto_edit? boolean Automatically open encrypted files with VaultEdit (default: false)
+---@field password_cache_ttl? number Cache interactive passwords in memory for N seconds (default: 0)
+---@field picker? "auto"|"telescope"|"builtin" Picker backend for VaultFiles (default: "auto")
 ---@field conda_env? string Conda environment name where ansible-vault is installed
 ---@field ansible_vault_path? string Custom path to ansible-vault executable
 ---@field debug? boolean Enable debug logging (default: false)
@@ -29,6 +32,9 @@ local DEFAULT_CONFIG = {
   rekey_password_file = nil,
   rekey_vault_id = nil,
   auto_detect = true,
+  auto_edit = false,
+  password_cache_ttl = 0,
+  picker = "auto",
   conda_env = nil,
   ansible_vault_path = nil,
   debug = false,
@@ -36,6 +42,13 @@ local DEFAULT_CONFIG = {
 
 ---@type AnsibleVaultConfig
 M.config = vim.deepcopy(DEFAULT_CONFIG)
+
+local password_cache = {
+  password = nil,
+  expires_at = 0,
+}
+
+local suppress_auto_edit_path = nil
 
 ---Debug log helper
 ---@param msg string
@@ -52,6 +65,29 @@ end
 ---@return boolean
 local function is_nonempty_string(value)
   return type(value) == "string" and value ~= ""
+end
+
+---@param opts? table
+---@return table
+local function effective_config(opts)
+  local overrides = opts and (opts.overrides or opts) or {}
+  return vim.tbl_deep_extend("force", M.config, overrides)
+end
+
+---@param ttl any
+---@return boolean
+local function should_cache_password(ttl)
+  return type(ttl) == "number" and ttl > 0
+end
+
+---@return integer
+local function now_seconds()
+  return os.time()
+end
+
+local function clear_password_cache()
+  password_cache.password = nil
+  password_cache.expires_at = 0
 end
 
 ---@param path string
@@ -71,15 +107,17 @@ local function expand_vault_id(vault_id)
   return label .. "@" .. expand_path(source)
 end
 
+---@param opts? table
 ---@return string[]
-local function get_vault_argv()
+local function get_vault_argv(opts)
+  local config = effective_config(opts)
   local executable = "ansible-vault"
-  if is_nonempty_string(M.config.ansible_vault_path) then
-    executable = expand_path(M.config.ansible_vault_path)
+  if is_nonempty_string(config.ansible_vault_path) then
+    executable = expand_path(config.ansible_vault_path)
   end
 
-  if is_nonempty_string(M.config.conda_env) then
-    return { "conda", "run", "-n", M.config.conda_env, executable }
+  if is_nonempty_string(config.conda_env) then
+    return { "conda", "run", "-n", config.conda_env, executable }
   end
 
   return { executable }
@@ -88,9 +126,10 @@ end
 ---@param action string
 ---@param args string[]
 ---@param target? string|false
+---@param opts? table
 ---@return string[]
-local function build_vault_argv(action, args, target)
-  local argv = get_vault_argv()
+local function build_vault_argv(action, args, target, opts)
+  local argv = get_vault_argv(opts)
   table.insert(argv, action)
   for _, arg in ipairs(args or {}) do
     table.insert(argv, tostring(arg))
@@ -159,21 +198,24 @@ local function write_secure_tempfile(contents)
 end
 
 ---@param callback fun(args: string[]|nil, cleanup?: fun())
-local function get_password_args(callback)
-  if is_nonempty_string(M.config.password_file) then
-    callback({ "--vault-password-file", expand_path(M.config.password_file) })
+---@param opts? table
+local function get_password_args(callback, opts)
+  local config = effective_config(opts)
+
+  if is_nonempty_string(config.password_file) then
+    callback({ "--vault-password-file", expand_path(config.password_file) })
     return
   end
 
   local vault_ids = {}
-  if type(M.config.vault_ids) == "table" and #M.config.vault_ids > 0 then
-    for _, vault_id in ipairs(M.config.vault_ids) do
+  if type(config.vault_ids) == "table" and #config.vault_ids > 0 then
+    for _, vault_id in ipairs(config.vault_ids) do
       if is_nonempty_string(vault_id) then
         table.insert(vault_ids, expand_vault_id(vault_id))
       end
     end
-  elseif is_nonempty_string(M.config.vault_id) then
-    table.insert(vault_ids, expand_vault_id(M.config.vault_id))
+  elseif is_nonempty_string(config.vault_id) then
+    table.insert(vault_ids, expand_vault_id(config.vault_id))
   end
 
   if #vault_ids > 0 then
@@ -186,6 +228,27 @@ local function get_password_args(callback)
     return
   end
 
+  if should_cache_password(config.password_cache_ttl)
+      and password_cache.password
+      and password_cache.expires_at > now_seconds() then
+    local tmpfile, err = write_secure_tempfile(password_cache.password .. "\n")
+    if not tmpfile then
+      vim.notify("Failed to create temp password file: " .. err, vim.log.levels.ERROR)
+      callback(nil)
+      return
+    end
+
+    local cleaned = false
+    callback({ "--vault-password-file", tmpfile }, function()
+      if cleaned then
+        return
+      end
+      cleaned = true
+      os.remove(tmpfile)
+    end)
+    return
+  end
+
   local ok, password = pcall(vim.fn.inputsecret, "Ansible Vault Password: ")
   vim.cmd("redraw")
 
@@ -193,6 +256,13 @@ local function get_password_args(callback)
     vim.notify("Password is required", vim.log.levels.ERROR)
     callback(nil)
     return
+  end
+
+  if should_cache_password(config.password_cache_ttl) then
+    password_cache.password = password
+    password_cache.expires_at = now_seconds() + config.password_cache_ttl
+  else
+    clear_password_cache()
   end
 
   local tmpfile, err = write_secure_tempfile(password .. "\n")
@@ -213,30 +283,34 @@ local function get_password_args(callback)
 end
 
 ---@param args string[]
+---@param opts? table
 ---@return string[]
-local function with_encrypt_vault_id(args)
+local function with_encrypt_vault_id(args, opts)
+  local config = effective_config(opts)
   local result = vim.deepcopy(args or {})
-  if is_nonempty_string(M.config.encrypt_vault_id) then
+  if is_nonempty_string(config.encrypt_vault_id) then
     table.insert(result, "--encrypt-vault-id")
-    table.insert(result, M.config.encrypt_vault_id)
+    table.insert(result, config.encrypt_vault_id)
   end
   return result
 end
 
 ---@param extra_args string[]|nil
+---@param opts? table
 ---@return string[]
-local function with_rekey_target_args(extra_args)
+local function with_rekey_target_args(extra_args, opts)
+  local config = effective_config(opts)
   local args = vim.deepcopy(extra_args or {})
   if has_rekey_target(args) then
     return args
   end
 
-  if is_nonempty_string(M.config.rekey_password_file) then
+  if is_nonempty_string(config.rekey_password_file) then
     table.insert(args, "--new-vault-password-file")
-    table.insert(args, expand_path(M.config.rekey_password_file))
-  elseif is_nonempty_string(M.config.rekey_vault_id) then
+    table.insert(args, expand_path(config.rekey_password_file))
+  elseif is_nonempty_string(config.rekey_vault_id) then
     table.insert(args, "--new-vault-id")
-    table.insert(args, expand_vault_id(M.config.rekey_vault_id))
+    table.insert(args, expand_vault_id(config.rekey_vault_id))
   end
 
   return args
@@ -258,8 +332,9 @@ end
 ---@param input string Input content
 ---@param args string[] Additional arguments
 ---@param callback fun(success: boolean, output: string): nil
-local function run_vault(action, input, args, callback)
-  local argv = build_vault_argv(action, args or {}, "-")
+---@param opts? table
+local function run_vault(action, input, args, callback, opts)
+  local argv = build_vault_argv(action, args or {}, "-", opts)
   local stdout_data = {}
   local stderr_data = {}
 
@@ -308,13 +383,137 @@ local function parse_command_args(args)
   return vim.fn.split(args)
 end
 
+---@param args string[]|nil
+---@param opts? table
+---@return table
+local function parse_operation_options(args, opts)
+  local result = {
+    overrides = {},
+    positionals = {},
+    rekey_args = {},
+    git_ref = nil,
+  }
+
+  local index = 1
+  while index <= #(args or {}) do
+    local arg = args[index]
+    local next_arg = args[index + 1]
+
+    if (arg == "--vault-password-file" or arg == "--vault-pass-file" or arg == "--password-file") and next_arg then
+      result.overrides.password_file = next_arg
+      result.overrides.vault_id = false
+      result.overrides.vault_ids = false
+      index = index + 2
+    elseif arg == "--vault-id" and next_arg then
+      result.overrides.password_file = false
+      result.overrides.vault_ids = result.overrides.vault_ids or {}
+      table.insert(result.overrides.vault_ids, next_arg)
+      index = index + 2
+    elseif arg == "--encrypt-vault-id" and next_arg then
+      result.overrides.encrypt_vault_id = next_arg
+      index = index + 2
+    elseif arg == "--new-vault-password-file" and next_arg then
+      result.overrides.rekey_password_file = next_arg
+      vim.list_extend(result.rekey_args, { arg, next_arg })
+      index = index + 2
+    elseif arg == "--new-vault-id" and next_arg then
+      result.overrides.rekey_vault_id = next_arg
+      vim.list_extend(result.rekey_args, { arg, next_arg })
+      index = index + 2
+    elseif arg == "--git" then
+      if next_arg and not next_arg:match("^%-") then
+        result.git_ref = next_arg
+        index = index + 2
+      else
+        result.git_ref = "HEAD"
+        index = index + 1
+      end
+    elseif opts and opts.label_shortcut and not arg:match("^%-") and not result.overrides.encrypt_vault_id then
+      result.overrides.encrypt_vault_id = arg
+      index = index + 1
+    else
+      table.insert(result.positionals, arg)
+      index = index + 1
+    end
+  end
+
+  return result
+end
+
+---@param arg_lead string
+---@param include_rekey? boolean
+---@param include_labels? boolean
+---@return string[]
+local function complete_operation_args(arg_lead, include_rekey, include_labels)
+  local candidates = {
+    "--vault-id",
+    "--vault-password-file",
+    "--password-file",
+    "--encrypt-vault-id",
+  }
+
+  if include_rekey then
+    table.insert(candidates, "--new-vault-password-file")
+    table.insert(candidates, "--new-vault-id")
+  end
+
+  local labels = {}
+  if is_nonempty_string(M.config.vault_id) then
+    local label = M.config.vault_id:match("^([^@]+)@")
+    if label then
+      table.insert(labels, label)
+    end
+  end
+  if type(M.config.vault_ids) == "table" then
+    for _, vault_id in ipairs(M.config.vault_ids) do
+      local label = type(vault_id) == "string" and vault_id:match("^([^@]+)@")
+      if label then
+        table.insert(labels, label)
+      end
+    end
+  end
+  if include_labels then
+    vim.list_extend(candidates, labels)
+  end
+
+  return vim.tbl_filter(function(candidate)
+    return vim.startswith(candidate, arg_lead)
+  end, candidates)
+end
+
+---@param arg_lead string
+---@return string[]
+local function complete_diff_args(arg_lead)
+  local candidates = complete_operation_args(arg_lead)
+  table.insert(candidates, "--git")
+
+  if not arg_lead:match("^%-") then
+    vim.list_extend(candidates, vim.fn.getcompletion(arg_lead, "file"))
+  end
+
+  return vim.tbl_filter(function(candidate)
+    return vim.startswith(candidate, arg_lead)
+  end, candidates)
+end
+
+---@param arg_lead string
+---@return string[]
+local function complete_files_args(arg_lead)
+  local candidates = { "view", "edit", "rekey" }
+  vim.list_extend(candidates, complete_operation_args(arg_lead, true))
+  return vim.tbl_filter(function(candidate)
+    return vim.startswith(candidate, arg_lead)
+  end, candidates)
+end
+
 ---Run ansible-vault against a file path.
 ---@param action string
 ---@param file_path string
 ---@param args string[]
 ---@param callback fun(success: boolean, output: string): nil
-local function run_vault_file(action, file_path, args, callback)
-  local argv = build_vault_argv(action, args or {}, file_path)
+---@param opts? table
+local function run_vault_file(action, file_path, args, callback, opts)
+  local argv = build_vault_argv(action, args or {}, file_path, opts)
   local stdout_data = {}
   local stderr_data = {}
 
@@ -503,7 +702,8 @@ end
 
 ---Encrypt current buffer.
 ---@param buf? integer
-function M.encrypt(buf)
+---@param opts? table
+function M.encrypt(buf, opts)
   local target = normalize_buf(buf)
   if not is_valid_buf(target) then
     vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
@@ -534,7 +734,7 @@ function M.encrypt(buf)
     local tick = changedtick(target)
     local content = buffer_content(target)
 
-    run_vault("encrypt", content, with_encrypt_vault_id(args), function(success, output)
+    run_vault("encrypt", content, with_encrypt_vault_id(args, opts), function(success, output)
       run_cleanup(cleanup)
       finish_buffer_operation(target, "encrypt")
 
@@ -543,13 +743,14 @@ function M.encrypt(buf)
       else
         vim.notify("Encryption failed: " .. output, vim.log.levels.ERROR)
       end
-    end)
-  end)
+    end, opts)
+  end, opts)
 end
 
 ---Decrypt current buffer.
 ---@param buf? integer
-function M.decrypt(buf)
+---@param opts? table
+function M.decrypt(buf, opts)
   local target = normalize_buf(buf)
   if not is_valid_buf(target) then
     vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
@@ -589,13 +790,14 @@ function M.decrypt(buf)
       else
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
       end
-    end)
-  end)
+    end, opts)
+  end, opts)
 end
 
 ---View encrypted buffer in a floating window.
 ---@param buf? integer
-function M.view(buf)
+---@param opts? table
+function M.view(buf, opts)
   local target = normalize_buf(buf)
   if not is_valid_buf(target) then
     vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
@@ -628,8 +830,8 @@ function M.view(buf)
       else
         vim.notify("View failed: " .. output, vim.log.levels.ERROR)
       end
-    end)
-  end)
+    end, opts)
+  end, opts)
 end
 
 ---@class AnsibleVaultSelection
@@ -890,7 +1092,8 @@ end
 
 ---@param buf integer
 ---@param selection AnsibleVaultSelection
-local function encrypt_string_selection(buf, selection)
+---@param opts? table
+local function encrypt_string_selection(buf, selection, opts)
   if not selection or #selection.lines == 0 then
     vim.notify("No text selected", vim.log.levels.WARN)
     return
@@ -921,7 +1124,7 @@ local function encrypt_string_selection(buf, selection)
       return
     end
 
-    local full_args = with_encrypt_vault_id(args)
+    local full_args = with_encrypt_vault_id(args, opts)
     table.insert(full_args, "--stdin-name")
     table.insert(full_args, plan.name)
 
@@ -959,21 +1162,23 @@ local function encrypt_string_selection(buf, selection)
       else
         vim.notify("Failed to update selection: " .. err, vim.log.levels.ERROR)
       end
-    end)
-  end)
+    end, opts)
+  end, opts)
 end
 
 ---Encrypt selected text.
 ---@param range_opts? table
-function M.encrypt_string(range_opts)
+---@param opts? table
+function M.encrypt_string(range_opts, opts)
   local target = vim.api.nvim_get_current_buf()
   local selection = get_selection(target, range_opts)
 
-  encrypt_string_selection(target, selection)
+  encrypt_string_selection(target, selection, opts)
 end
 
 ---Encrypt the plain YAML value under the cursor.
-function M.encrypt_string_under_cursor()
+---@param opts? table
+function M.encrypt_string_under_cursor(opts)
   local target = vim.api.nvim_get_current_buf()
   local selection = get_plain_yaml_value_under_cursor(target)
 
@@ -982,17 +1187,18 @@ function M.encrypt_string_under_cursor()
     return
   end
 
-  encrypt_string_selection(target, selection)
+  encrypt_string_selection(target, selection, opts)
 end
 
 ---Toggle between encrypted and decrypted state.
 ---@param buf? integer
-function M.toggle(buf)
+---@param opts? table
+function M.toggle(buf, opts)
   local target = normalize_buf(buf)
   if M.is_buffer_encrypted(target) then
-    M.decrypt(target)
+    M.decrypt(target, opts)
   else
-    M.encrypt(target)
+    M.encrypt(target, opts)
   end
 end
 
@@ -1084,6 +1290,7 @@ end
 ---@param preferred_win integer
 local function close_edit_buffer(edit_buf, original_buf, original_file, preferred_win)
   if is_valid_buf(original_buf) then
+    vim.b[original_buf].ansible_vault_skip_auto_edit_once = true
     pcall(vim.api.nvim_buf_call, original_buf, function()
       vim.cmd("silent! edit!")
     end)
@@ -1108,7 +1315,8 @@ end
 
 ---Edit encrypted buffer using a scratch buffer.
 ---@param buf? integer
-function M.edit(buf)
+---@param opts? table
+function M.edit(buf, opts)
   local original_buf = normalize_buf(buf)
   if not is_valid_buf(original_buf) then
     vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
@@ -1187,10 +1395,23 @@ function M.edit(buf)
       vim.b[edit_buf].vault_cleanup = cleanup
       vim.b[edit_buf].vault_write_pending = false
 
-      if vim.api.nvim_win_is_valid(original_win) then
-        vim.api.nvim_win_set_buf(original_win, edit_buf)
-      else
-        vim.api.nvim_set_current_buf(edit_buf)
+      local placed = false
+      if vim.api.nvim_win_is_valid(original_win) and vim.api.nvim_win_get_buf(original_win) == original_buf then
+        placed = pcall(vim.api.nvim_win_set_buf, original_win, edit_buf)
+      end
+
+      if not placed then
+        local split_ok = pcall(vim.cmd, "botright split")
+        if split_ok then
+          placed = pcall(vim.api.nvim_win_set_buf, 0, edit_buf)
+        end
+      end
+
+      if not placed then
+        cleanup_edit_buffer(edit_buf)
+        pcall(vim.api.nvim_buf_delete, edit_buf, { force = true })
+        vim.notify("Failed to open VaultEdit scratch buffer", vim.log.levels.ERROR)
+        return
       end
 
       vim.api.nvim_create_autocmd("BufWriteCmd", {
@@ -1207,7 +1428,7 @@ function M.edit(buf)
           local orig_file = vim.b[cur_buf].vault_original_file
           local orig_buf = vim.b[cur_buf].vault_original_buf
           local orig_signature = vim.b[cur_buf].vault_original_signature
-          local encrypt_args = with_encrypt_vault_id(vim.b[cur_buf].vault_password_args)
+          local encrypt_args = with_encrypt_vault_id(vim.b[cur_buf].vault_password_args, opts)
 
           debug_log("VaultEdit: encrypting to %s", orig_file)
 
@@ -1237,7 +1458,7 @@ function M.edit(buf)
             cleanup_edit_buffer(cur_buf)
             close_edit_buffer(cur_buf, orig_buf, orig_file, original_win)
             vim.notify("Encrypted and saved: " .. orig_file, vim.log.levels.INFO)
-          end)
+          end, opts)
         end,
       })
 
@@ -1250,12 +1471,12 @@ function M.edit(buf)
       })
 
       vim.notify("Editing decrypted content. :w encrypts and saves.", vim.log.levels.INFO)
-    end)
-  end)
+    end, opts)
+  end, opts)
 end
 
 ---Rekey the current encrypted file.
----@param opts? { args?: string[] }
+---@param opts? { args?: string[], overrides?: table, rekey_args?: string[] }
 function M.rekey(opts)
   local target = vim.api.nvim_get_current_buf()
   if not is_valid_buf(target) then
@@ -1284,8 +1505,8 @@ function M.rekey(opts)
       return
     end
 
-    local rekey_args = with_encrypt_vault_id(password_args)
-    vim.list_extend(rekey_args, with_rekey_target_args(opts and opts.args or {}))
+    local rekey_args = with_encrypt_vault_id(password_args, opts)
+    vim.list_extend(rekey_args, with_rekey_target_args(opts and (opts.rekey_args or opts.args) or {}, opts))
 
     if not has_rekey_target(rekey_args) then
       run_cleanup(cleanup)
@@ -1318,8 +1539,8 @@ function M.rekey(opts)
       end
 
       vim.notify("Vault file rekeyed successfully", vim.log.levels.INFO)
-    end)
-  end)
+    end, opts)
+  end, opts)
 end
 
 ---Parse vault content from YAML format, removing indentation.
@@ -1443,7 +1664,8 @@ end
 ---@param target integer
 ---@param selection AnsibleVaultSelection|nil
 ---@param mode "view"|"replace"
-local function decrypt_string_selection(target, selection, mode)
+---@param opts? table
+local function decrypt_string_selection(target, selection, mode, opts)
   local parsed = parse_vault_selection(selection)
   if not parsed then
     return
@@ -1511,38 +1733,309 @@ local function decrypt_string_selection(target, selection, mode)
       else
         vim.notify("Failed to update selection: " .. err, vim.log.levels.ERROR)
       end
-    end)
-  end)
+    end, opts)
+  end, opts)
 end
 
 ---View selected encrypted string in floating window.
 ---@param range_opts? table
-function M.view_string(range_opts)
+---@param opts? table
+function M.view_string(range_opts, opts)
   local target = vim.api.nvim_get_current_buf()
   local selection = get_selection(target, range_opts)
-  decrypt_string_selection(target, selection, "view")
+  decrypt_string_selection(target, selection, "view", opts)
 end
 
 ---Decrypt selected encrypted string in place.
 ---@param range_opts? table
-function M.decrypt_string(range_opts)
+---@param opts? table
+function M.decrypt_string(range_opts, opts)
   local target = vim.api.nvim_get_current_buf()
   local selection = get_selection(target, range_opts)
-  decrypt_string_selection(target, selection, "replace")
+  decrypt_string_selection(target, selection, "replace", opts)
 end
 
 ---View encrypted string under cursor in a floating window.
-function M.view_string_under_cursor()
+---@param opts? table
+function M.view_string_under_cursor(opts)
   local target = vim.api.nvim_get_current_buf()
   local selection = find_vault_block_under_cursor(target)
-  decrypt_string_selection(target, selection, "view")
+  decrypt_string_selection(target, selection, "view", opts)
 end
 
 ---Decrypt encrypted string under cursor in place.
-function M.decrypt_string_under_cursor()
+---@param opts? table
+function M.decrypt_string_under_cursor(opts)
   local target = vim.api.nvim_get_current_buf()
   local selection = find_vault_block_under_cursor(target)
-  decrypt_string_selection(target, selection, "replace")
+  decrypt_string_selection(target, selection, "replace", opts)
+end
+
+---@param path string
+---@return string|nil
+---@return string|nil
+local function read_text_file(path)
+  local file, err = io.open(path, "r")
+  if not file then
+    return nil, err
+  end
+
+  local content = file:read("*a")
+  file:close()
+  return content, nil
+end
+
+---@param file_path string
+---@param ref string
+---@return string|nil
+---@return string|nil
+local function read_git_file(file_path, ref)
+  local dir = vim.fn.fnamemodify(file_path, ":h")
+  local rel = vim.fn.systemlist({ "git", "-C", dir, "ls-files", "--full-name", file_path })
+  if vim.v.shell_error ~= 0 or not rel[1] or rel[1] == "" then
+    return nil, "file is not tracked by git"
+  end
+
+  local lines = vim.fn.systemlist({ "git", "-C", dir, "show", ref .. ":" .. rel[1] })
+  if vim.v.shell_error ~= 0 then
+    return nil, table.concat(lines, "\n")
+  end
+
+  return table.concat(lines, "\n"), nil
+end
+
+---@param content string
+---@param args string[]|nil
+---@param opts? table
+---@param callback fun(success: boolean, output: string): nil
+local function decrypt_content_if_needed(content, args, opts, callback)
+  if not M.is_encrypted(content) then
+    callback(true, content)
+    return
+  end
+
+  run_vault("decrypt", content, args or {}, callback, opts)
+end
+
+---@param name string
+---@param content string
+---@param filetype string
+---@return integer
+local function create_diff_buffer(name, content, filetype)
+  local buf = vim.api.nvim_create_buf(true, false)
+  pcall(vim.api.nvim_buf_set_name, buf, string.format("%s#%d", name, buf))
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, output_to_lines(content:gsub("\n$", "")))
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = filetype
+  vim.bo[buf].modifiable = false
+  return buf
+end
+
+---@param left_name string
+---@param left_content string
+---@param right_name string
+---@param right_content string
+---@param filetype string
+local function open_diff_tab(left_name, left_content, right_name, right_content, filetype)
+  local left = create_diff_buffer(left_name, left_content, filetype)
+  local right = create_diff_buffer(right_name, right_content, filetype)
+
+  vim.cmd("tabnew")
+  vim.api.nvim_win_set_buf(0, left)
+  vim.cmd("diffthis")
+  vim.cmd("vsplit")
+  vim.api.nvim_win_set_buf(0, right)
+  vim.cmd("diffthis")
+end
+
+---Diff the decrypted current buffer against a file or git revision.
+---@param opts? table
+function M.diff(opts)
+  local target = vim.api.nvim_get_current_buf()
+  if not is_valid_buf(target) then
+    vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
+    return
+  end
+
+  local current_name = vim.api.nvim_buf_get_name(target)
+  local target_name
+  local target_content
+  local err
+
+  if opts and opts.git_ref then
+    if current_name == "" then
+      vim.notify("VaultDiff --git requires a file-backed buffer", vim.log.levels.ERROR)
+      return
+    end
+    target_name = string.format("git:%s:%s", opts.git_ref, vim.fn.fnamemodify(current_name, ":t"))
+    target_content, err = read_git_file(current_name, opts.git_ref)
+  elseif opts and opts.positionals and opts.positionals[1] then
+    local path = expand_path(opts.positionals[1])
+    target_name = path
+    target_content, err = read_text_file(path)
+  else
+    vim.notify("VaultDiff requires a file path or --git [ref]", vim.log.levels.ERROR)
+    return
+  end
+
+  if not target_content then
+    vim.notify("VaultDiff failed to read target: " .. (err or "unknown error"), vim.log.levels.ERROR)
+    return
+  end
+
+  local current_content = buffer_content(target)
+  local needs_password = M.is_encrypted(current_content) or M.is_encrypted(target_content)
+  local filetype = vim.bo[target].filetype
+  local current_title = current_name ~= "" and current_name or "[current buffer]"
+
+  local function open_with_args(args, cleanup)
+    decrypt_content_if_needed(current_content, args, opts, function(current_ok, current_plain)
+      if not current_ok then
+        run_cleanup(cleanup)
+        vim.notify("VaultDiff failed to decrypt current buffer: " .. current_plain, vim.log.levels.ERROR)
+        return
+      end
+
+      decrypt_content_if_needed(target_content, args, opts, function(target_ok, target_plain)
+        run_cleanup(cleanup)
+        if not target_ok then
+          vim.notify("VaultDiff failed to decrypt target: " .. target_plain, vim.log.levels.ERROR)
+          return
+        end
+
+        open_diff_tab(
+          "ansible-vault-diff://current/" .. vim.fn.fnamemodify(current_title, ":t"),
+          current_plain,
+          "ansible-vault-diff://target/" .. vim.fn.fnamemodify(target_name, ":t"),
+          target_plain,
+          filetype
+        )
+      end)
+    end)
+  end
+
+  if needs_password then
+    get_password_args(function(args, cleanup)
+      if not args then
+        return
+      end
+      open_with_args(args, cleanup)
+    end, opts)
+  else
+    open_with_args({}, nil)
+  end
+end
+
+---@return string[]
+local function discover_vault_files()
+  local files
+  if vim.fn.executable("rg") == 1 then
+    files = vim.fn.systemlist({ "rg", "--files" })
+  else
+    files = vim.fn.glob("**/*", false, true)
+  end
+
+  local result = {}
+  for _, file in ipairs(files or {}) do
+    if vim.fn.filereadable(file) == 1 then
+      local first = vim.fn.readfile(file, "", 1)[1] or ""
+      if M.is_encrypted({ first }) then
+        table.insert(result, file)
+      end
+    end
+  end
+
+  table.sort(result)
+  return result
+end
+
+---@param file string
+---@param action string
+---@param opts? table
+local function open_vault_file_action(file, action, opts)
+  suppress_auto_edit_path = vim.fn.fnamemodify(file, ":p")
+  local ok, err = pcall(vim.cmd, "edit " .. vim.fn.fnameescape(file))
+  suppress_auto_edit_path = nil
+  if not ok then
+    vim.notify("Failed to open vault file: " .. err, vim.log.levels.ERROR)
+    return
+  end
+
+  local buf = vim.api.nvim_get_current_buf()
+
+  if action == "edit" then
+    M.edit(buf, opts)
+  elseif action == "rekey" then
+    M.rekey(opts)
+  else
+    M.view(buf, opts)
+  end
+end
+
+---@param files string[]
+---@param action string
+---@param opts? table
+---@return boolean
+local function telescope_pick(files, action, opts)
+  local config = effective_config(opts)
+  if config.picker == "builtin" then
+    return false
+  end
+
+  local ok_pickers, pickers = pcall(require, "telescope.pickers")
+  local ok_finders, finders = pcall(require, "telescope.finders")
+  local ok_conf, conf = pcall(require, "telescope.config")
+  local ok_actions, actions = pcall(require, "telescope.actions")
+  local ok_state, action_state = pcall(require, "telescope.actions.state")
+  if not (ok_pickers and ok_finders and ok_conf and ok_actions and ok_state) then
+    return false
+  end
+
+  local picker = pickers.new({}, {
+    prompt_title = "Ansible Vault Files",
+    finder = finders.new_table(files),
+    sorter = conf.values.generic_sorter({}),
+    attach_mappings = function(prompt_bufnr)
+      actions.select_default:replace(function()
+        local selection = action_state.get_selected_entry()
+        actions.close(prompt_bufnr)
+        if selection and selection.value then
+          open_vault_file_action(selection.value, action, opts)
+        end
+      end)
+      return true
+    end,
+  })
+  picker:find()
+
+  return true
+end
+
+---Pick a vault file and view/edit/rekey it.
+---@param opts? table
+function M.files(opts)
+  local action = "view"
+  if opts and opts.positionals and vim.tbl_contains({ "view", "edit", "rekey" }, opts.positionals[1]) then
+    action = opts.positionals[1]
+  end
+
+  local files = discover_vault_files()
+  if #files == 0 then
+    vim.notify("No Ansible Vault files found", vim.log.levels.WARN)
+    return
+  end
+
+  if telescope_pick(files, action, opts) then
+    return
+  end
+
+  vim.ui.select(files, { prompt = "Ansible Vault files" }, function(choice)
+    if choice then
+      open_vault_file_action(choice, action, opts)
+    end
+  end)
 end
 
 ---Get status string for statusline.
@@ -1555,66 +2048,212 @@ function M.status(buf)
   return ""
 end
 
+---Clear the in-memory interactive password cache.
+function M.clear_password_cache()
+  clear_password_cache()
+  vim.notify("Ansible Vault password cache cleared", vim.log.levels.INFO)
+end
+
 ---Setup the plugin.
 ---@param opts? AnsibleVaultConfig
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 
-  vim.api.nvim_create_user_command("VaultEncrypt", function()
-    M.encrypt()
-  end, { desc = "Encrypt current buffer with ansible-vault", force = true })
+  vim.api.nvim_create_user_command("VaultEncrypt", function(command_opts)
+    M.encrypt(nil, parse_operation_options(parse_command_args(command_opts.args)))
+  end, {
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead)
+    end,
+    desc = "Encrypt current buffer with ansible-vault",
+    force = true,
+  })
 
-  vim.api.nvim_create_user_command("VaultDecrypt", function()
-    M.decrypt()
-  end, { desc = "Decrypt current buffer with ansible-vault", force = true })
+  vim.api.nvim_create_user_command("VaultDecrypt", function(command_opts)
+    M.decrypt(nil, parse_operation_options(parse_command_args(command_opts.args)))
+  end, {
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead)
+    end,
+    desc = "Decrypt current buffer with ansible-vault",
+    force = true,
+  })
 
-  vim.api.nvim_create_user_command("VaultView", function()
-    M.view()
-  end, { desc = "View encrypted buffer in floating window", force = true })
+  vim.api.nvim_create_user_command("VaultView", function(command_opts)
+    M.view(nil, parse_operation_options(parse_command_args(command_opts.args)))
+  end, {
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead)
+    end,
+    desc = "View encrypted buffer in floating window",
+    force = true,
+  })
 
-  vim.api.nvim_create_user_command("VaultToggle", function()
-    M.toggle()
-  end, { desc = "Toggle vault encryption state", force = true })
+  vim.api.nvim_create_user_command("VaultToggle", function(command_opts)
+    M.toggle(nil, parse_operation_options(parse_command_args(command_opts.args)))
+  end, {
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead)
+    end,
+    desc = "Toggle vault encryption state",
+    force = true,
+  })
 
-  vim.api.nvim_create_user_command("VaultEdit", function()
-    M.edit()
-  end, { desc = "Edit encrypted buffer in a secure scratch buffer", force = true })
+  vim.api.nvim_create_user_command("VaultEdit", function(command_opts)
+    M.edit(nil, parse_operation_options(parse_command_args(command_opts.args)))
+  end, {
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead)
+    end,
+    desc = "Edit encrypted buffer in a secure scratch buffer",
+    force = true,
+  })
+
+  vim.api.nvim_create_user_command("VaultClearPasswordCache", function()
+    M.clear_password_cache()
+  end, { desc = "Clear cached Ansible Vault password", force = true })
+
+  vim.api.nvim_create_user_command("VaultDiff", function(command_opts)
+    M.diff(parse_operation_options(parse_command_args(command_opts.args)))
+  end, {
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_diff_args(arg_lead)
+    end,
+    desc = "Diff decrypted vault content",
+    force = true,
+  })
+
+  vim.api.nvim_create_user_command("VaultFiles", function(command_opts)
+    M.files(parse_operation_options(parse_command_args(command_opts.args)))
+  end, {
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_files_args(arg_lead)
+    end,
+    desc = "Pick an Ansible Vault file",
+    force = true,
+  })
 
   vim.api.nvim_create_user_command("VaultRekey", function(command_opts)
-    M.rekey({ args = parse_command_args(command_opts.args) })
-  end, { nargs = "*", desc = "Rekey encrypted file with ansible-vault", force = true })
+    M.rekey(parse_operation_options(parse_command_args(command_opts.args), { rekey = true }))
+  end, {
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead, true)
+    end,
+    desc = "Rekey encrypted file with ansible-vault",
+    force = true,
+  })
 
   vim.api.nvim_create_user_command("VaultEncryptString", function(command_opts)
-    M.encrypt_string(command_opts)
-  end, { range = true, desc = "Encrypt selected string", force = true })
+    M.encrypt_string(
+      command_opts,
+      parse_operation_options(parse_command_args(command_opts.args), { label_shortcut = true })
+    )
+  end, {
+    range = true,
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead, false, true)
+    end,
+    desc = "Encrypt selected string",
+    force = true,
+  })
 
   vim.api.nvim_create_user_command("VaultDecryptString", function(command_opts)
-    M.decrypt_string(command_opts)
-  end, { range = true, desc = "Decrypt selected string", force = true })
+    M.decrypt_string(command_opts, parse_operation_options(parse_command_args(command_opts.args)))
+  end, {
+    range = true,
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead)
+    end,
+    desc = "Decrypt selected string",
+    force = true,
+  })
 
   vim.api.nvim_create_user_command("VaultViewString", function(command_opts)
-    M.view_string(command_opts)
-  end, { range = true, desc = "View selected encrypted string", force = true })
+    M.view_string(command_opts, parse_operation_options(parse_command_args(command_opts.args)))
+  end, {
+    range = true,
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead)
+    end,
+    desc = "View selected encrypted string",
+    force = true,
+  })
 
-  vim.api.nvim_create_user_command("VaultEncryptStringUnderCursor", function()
-    M.encrypt_string_under_cursor()
-  end, { desc = "Encrypt YAML value under cursor", force = true })
+  vim.api.nvim_create_user_command("VaultEncryptStringUnderCursor", function(command_opts)
+    M.encrypt_string_under_cursor(
+      parse_operation_options(parse_command_args(command_opts.args), { label_shortcut = true })
+    )
+  end, {
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead, false, true)
+    end,
+    desc = "Encrypt YAML value under cursor",
+    force = true,
+  })
 
-  vim.api.nvim_create_user_command("VaultViewStringUnderCursor", function()
-    M.view_string_under_cursor()
-  end, { desc = "View vault string under cursor", force = true })
+  vim.api.nvim_create_user_command("VaultViewStringUnderCursor", function(command_opts)
+    M.view_string_under_cursor(parse_operation_options(parse_command_args(command_opts.args)))
+  end, {
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead)
+    end,
+    desc = "View vault string under cursor",
+    force = true,
+  })
 
-  vim.api.nvim_create_user_command("VaultDecryptStringUnderCursor", function()
-    M.decrypt_string_under_cursor()
-  end, { desc = "Decrypt vault string under cursor", force = true })
+  vim.api.nvim_create_user_command("VaultDecryptStringUnderCursor", function(command_opts)
+    M.decrypt_string_under_cursor(parse_operation_options(parse_command_args(command_opts.args)))
+  end, {
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead)
+    end,
+    desc = "Decrypt vault string under cursor",
+    force = true,
+  })
 
   local group = vim.api.nvim_create_augroup(AUGROUP, { clear = true })
-  if M.config.auto_detect then
+  if M.config.auto_detect or M.config.auto_edit then
     vim.api.nvim_create_autocmd("BufReadPost", {
       group = group,
       pattern = "*",
       callback = function(event)
-        vim.b[event.buf].ansible_vault_encrypted = M.is_buffer_encrypted(event.buf)
+        local encrypted = M.is_buffer_encrypted(event.buf)
+        if M.config.auto_detect then
+          vim.b[event.buf].ansible_vault_encrypted = encrypted
+        end
+
+        if vim.b[event.buf].ansible_vault_skip_auto_edit_once then
+          vim.b[event.buf].ansible_vault_skip_auto_edit_once = nil
+          return
+        end
+
+        if suppress_auto_edit_path
+            and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(event.buf), ":p") == suppress_auto_edit_path then
+          suppress_auto_edit_path = nil
+          return
+        end
+
+        if encrypted and M.config.auto_edit then
+          vim.schedule(function()
+            if is_valid_buf(event.buf) and M.is_buffer_encrypted(event.buf) then
+              M.edit(event.buf)
+            end
+          end)
+        end
       end,
     })
   end

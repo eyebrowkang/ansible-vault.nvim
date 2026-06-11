@@ -15,8 +15,13 @@ English documentation: [README.md](README.md)
 - 在光标下加密、查看、解密 inline vault 字符串
 - 在加密/解密状态之间切换
 - 对加密文件执行 rekey
+- 将当前 buffer 解密后与另一个文件或 Git 版本做 diff
+- 使用 Telescope 或内置 `vim.ui.select` 查找 vault 文件
 - 自动识别 Ansible Vault 文件
+- 可选：打开加密文件时自动进入 `VaultEdit` 安全编辑流程
 - 支持 password file、一个或多个 vault ID 和交互式密码输入
+- 可选：在内存中短时缓存交互式密码
+- 支持命令级凭据覆盖和命令行补全
 - 支持 `:checkhealth ansible-vault` 诊断
 - 支持通过 `conda run` 调用 Conda 环境中的 `ansible-vault`
 - 可用于 statusline 显示 vault 状态
@@ -78,6 +83,15 @@ require("ansible-vault").setup({
   -- 读取文件后自动识别 Ansible Vault 文件
   auto_detect = true,
 
+  -- 读取加密文件后自动使用 :VaultEdit 打开安全编辑 buffer
+  auto_edit = false,
+
+  -- 交互式密码在内存中的缓存秒数。0 表示每次操作都重新询问。
+  password_cache_ttl = 0,
+
+  -- :VaultFiles picker 后端："auto"、"telescope" 或 "builtin"
+  picker = "auto",
+
   -- ansible-vault 所在的 Conda 环境名
   -- 插件会执行：conda run -n <env> ansible-vault ...
   conda_env = nil,
@@ -131,6 +145,18 @@ require("ansible-vault").setup({
 如果不希望插件显式传入 `--encrypt-vault-id`，保持
 `encrypt_vault_id = nil`。
 
+大多数命令也支持临时覆盖凭据配置。覆盖只对本次命令生效，不会修改全局
+`setup()` 配置：
+
+```vim
+:VaultEdit --vault-id prod@~/.ansible/prod-pass
+:VaultView --vault-password-file ~/.ansible/prod-pass
+:VaultEncryptString prod
+```
+
+像 `prod` 这样的裸 label 快捷写法只用于 inline 加密命令，等价于
+`--encrypt-vault-id prod`。
+
 为 `VaultRekey` 配置新密码文件或新 vault ID：
 
 ```lua
@@ -165,6 +191,16 @@ require("ansible-vault").setup({
 })
 ```
 
+如果你主要使用交互式密码，可以短时间缓存在 Neovim 进程内存中：
+
+```lua
+require("ansible-vault").setup({
+  password_cache_ttl = 300,
+})
+```
+
+密码缓存默认关闭。需要手动清理时执行 `:VaultClearPasswordCache`。
+
 ## 命令
 
 | 命令 | 说明 |
@@ -173,6 +209,10 @@ require("ansible-vault").setup({
 | `:VaultDecrypt` | 解密当前 buffer |
 | `:VaultView` | 在只读浮窗中查看解密内容 |
 | `:VaultEdit` | 在 scratch buffer 中编辑解密内容，`:write` 时重新加密保存 |
+| `:VaultClearPasswordCache` | 清理内存中的交互式密码缓存 |
+| `:VaultDiff {file}` | 将当前 buffer 解密后与另一个文件做 diff |
+| `:VaultDiff --git [ref]` | 将当前文件解密后与某个 Git 版本做 diff |
+| `:VaultFiles [view\|edit\|rekey]` | 选择 vault 文件并查看、编辑或 rekey |
 | `:VaultRekey [args]` | 对当前加密文件执行 rekey |
 | `:VaultToggle` | 在加密/解密状态之间切换 |
 | `:VaultEncryptString` | 加密视觉选择的文本 |
@@ -230,10 +270,54 @@ vault ID label、`encrypt_vault_id` 以及 `VaultRekey` 目标配置。
 如果 scratch buffer 打开期间原文件在磁盘上发生了变化，插件会拒绝保存，
 避免覆盖外部修改。
 
+### 自动安全编辑加密文件
+
+如果希望打开加密文件时直接进入更安全的 `:VaultEdit` scratch 流程：
+
+```lua
+require("ansible-vault").setup({
+  auto_edit = true,
+})
+```
+
+保存后插件会重新载入原始加密 buffer，并避免因为重新载入而再次触发自动编辑。
+
 ### 切换当前 buffer 状态
 
 执行 `:VaultToggle` 可以在普通内容和 vault 密文之间切换。这个命令适合快速
 查看，但要小心不要把解密后的 secret 误保存到磁盘。
+
+### 对解密后的内容做 diff
+
+将当前 buffer 与另一个 vault 文件比较：
+
+```vim
+:VaultDiff ../group_vars/prod/vault.yml
+```
+
+将当前文件与 Git 版本比较：
+
+```vim
+:VaultDiff --git HEAD
+:VaultDiff --git main
+```
+
+两侧内容都会先解密到临时 nofile buffer，然后启用 Neovim diff 模式。普通
+明文文件也可以参与比较，方便迁移或排查时使用。
+
+### 查找 vault 文件
+
+执行：
+
+```vim
+:VaultFiles view
+:VaultFiles edit
+:VaultFiles rekey
+```
+
+插件会扫描当前工作目录下首行为 Ansible Vault header 的文件。安装了
+Telescope 时会自动使用 Telescope，否则回退到 `vim.ui.select`。如果希望始终
+使用内置 picker，可以设置 `picker = "builtin"`。
 
 ### 加密 YAML inline 字符串
 
@@ -346,6 +430,8 @@ vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decry
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
 vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
+vim.keymap.set("n", "<leader>vD", "<cmd>VaultDiff --git HEAD<cr>", { desc = "Vault Diff" })
+vim.keymap.set("n", "<leader>vf", "<cmd>VaultFiles view<cr>", { desc = "Vault Files" })
 vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>", { desc = "Vault Toggle" })
 vim.keymap.set("v", "<leader>vs", "<cmd>VaultEncryptString<cr>", { desc = "Vault Encrypt String" })
 vim.keymap.set("v", "<leader>vS", "<cmd>VaultDecryptString<cr>", { desc = "Vault Decrypt String" })
@@ -386,6 +472,10 @@ vault.decrypt()
 vault.view()
 vault.edit()
 vault.rekey()
+vault.diff({ positionals = { "../other-vault.yml" } })
+vault.diff({ git_ref = "HEAD" })
+vault.files({ positionals = { "view" } })
+vault.clear_password_cache()
 vault.toggle()
 vault.encrypt_string()
 vault.decrypt_string()
@@ -402,6 +492,8 @@ vault.status()
   路径，也不会把配置值交给 shell 求值。
 - 交互式密码通过 `inputsecret()` 获取，并在 vault 操作期间写入临时的 `0600`
   password file。
+- `password_cache_ttl` 默认关闭。开启后，交互式密码会在过期前保存在 Neovim
+  进程内存中，也可以通过 `:VaultClearPasswordCache` 主动清理。
 - `VaultEdit` 使用 scratch `acwrite` buffer，并设置 `swapfile=false`、
   `undofile=false`、`bufhidden=wipe`。
 - `VaultEdit` 会先写入同目录临时文件，再原子替换原文件。

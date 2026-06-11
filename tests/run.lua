@@ -106,6 +106,7 @@ case "$action" in
   decrypt)
     case "$input" in
       *EDITME*) printf 'plain: old\n' ;;
+      *TARGET*) printf 'plain: target\n' ;;
       *ENCSTR*) printf 'secret\n' ;;
       *) printf 'plain: value\n' ;;
     esac
@@ -158,9 +159,14 @@ local function reset_config(fake, opts)
   vault.config.rekey_password_file = nil
   vault.config.rekey_vault_id = nil
   vault.config.auto_detect = true
+  vault.config.auto_edit = false
+  vault.config.password_cache_ttl = 0
+  vault.config.picker = "auto"
   vault.config.conda_env = nil
   vault.config.ansible_vault_path = nil
   vault.config.debug = false
+  vault.clear_password_cache()
+  notifications = {}
 
   local config = {
     ansible_vault_path = fake.path,
@@ -443,6 +449,99 @@ tests["VaultEncryptString can replace only a YAML value"] = function()
   assert_eq(lines[2], "          $ANSIBLE_VAULT;1.1;AES256", "value-only YAML output has wrong vault header")
 end
 
+tests["command args can override encrypt vault id"] = function()
+  local fake = create_fake_vault()
+  local dev_pass = make_password_file(fake.dir)
+  local prod_pass = make_password_file(fake.dir)
+  reset_config(fake, {
+    password_file = false,
+    vault_ids = { "dev@" .. dev_pass, "prod@" .. prod_pass },
+  })
+
+  local line = "password: secret"
+  local buf = new_buffer({ line })
+  vim.fn.setpos("'<", { 0, 1, 1, 0 })
+  vim.fn.setpos("'>", { 0, 1, #line, 0 })
+
+  vim.cmd("VaultEncryptString prod")
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
+  end, "VaultEncryptString command arg did not encrypt")
+
+  assert_true(log_contains(fake.log, "ARG:--encrypt-vault-id"), "shortcut encrypt vault id flag was not passed")
+  assert_true(log_has_line(fake.log, "ARG:prod"), "shortcut encrypt vault id value was not passed")
+end
+
+tests["command vault-id override replaces configured password file"] = function()
+  local fake = create_fake_vault()
+  local old_pass = fake.dir .. "/old-pass"
+  local prod_pass = fake.dir .. "/prod-pass"
+  write_file(old_pass, "old\n")
+  write_file(prod_pass, "prod\n")
+
+  reset_config(fake, { password_file = old_pass })
+
+  new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "TARGET" })
+  vim.cmd("VaultView --vault-id prod@" .. prod_pass)
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, -1, false)[1] == "plain: target"
+  end, "VaultView with command vault-id override did not finish")
+
+  assert_true(log_contains(fake.log, "ARG:--vault-id"), "command vault-id flag was not passed")
+  assert_true(log_has_line(fake.log, "ARG:prod@" .. prod_pass), "command vault-id value was not passed")
+  assert_false(log_has_line(fake.log, "ARG:" .. old_pass), "configured password file was not overridden")
+
+  vim.api.nvim_win_close(0, true)
+end
+
+tests["command completion exposes override flags and inline labels"] = function()
+  local fake = create_fake_vault()
+  local prod_pass = make_password_file(fake.dir)
+  reset_config(fake, {
+    password_file = false,
+    vault_ids = { "prod@" .. prod_pass },
+  })
+
+  local label_completion = vim.fn.getcompletion("VaultEncryptString p", "cmdline")
+  assert_true(vim.tbl_contains(label_completion, "prod"), "inline encrypt label was not completed")
+
+  local flag_completion = vim.fn.getcompletion("VaultEdit --vault", "cmdline")
+  assert_true(vim.tbl_contains(flag_completion, "--vault-id"), "vault-id flag was not completed")
+  assert_true(
+    vim.tbl_contains(flag_completion, "--vault-password-file"),
+    "vault-password-file flag was not completed"
+  )
+end
+
+tests["interactive password cache avoids repeated prompts"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake, { password_file = false, password_cache_ttl = 60 })
+
+  local original_inputsecret = vim.fn.inputsecret
+  local prompt_count = 0
+  vim.fn.inputsecret = function()
+    prompt_count = prompt_count + 1
+    return "secret"
+  end
+
+  local first = new_buffer({ "first" })
+  vault.encrypt(first)
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(first, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
+  end, "first cached-password encrypt did not finish")
+
+  local second = new_buffer({ "second" })
+  vault.encrypt(second)
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(second, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
+  end, "second cached-password encrypt did not finish")
+
+  vim.fn.inputsecret = original_inputsecret
+  assert_eq(prompt_count, 1, "password prompt should have been cached")
+end
+
 tests["VaultDecryptString replaces selected YAML vault block"] = function()
   local fake = create_fake_vault()
   reset_config(fake)
@@ -462,6 +561,119 @@ tests["VaultDecryptString replaces selected YAML vault block"] = function()
   end, "selected YAML vault block was not decrypted")
 
   assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "password: secret" })
+end
+
+tests["VaultDiff opens decrypted diff buffers"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local target_file = fake.dir .. "/target.yml"
+  write_file(target_file, "$ANSIBLE_VAULT;1.1;AES256\nTARGET\n")
+
+  local buf = new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
+  vim.bo[buf].filetype = "yaml"
+  local tab_count = #vim.api.nvim_list_tabpages()
+
+  vault.diff({ positionals = { target_file } })
+
+  wait_until(function()
+    return #vim.api.nvim_list_tabpages() > tab_count
+  end, "VaultDiff did not open a diff tab")
+
+  local tab = vim.api.nvim_get_current_tabpage()
+  local contents = {}
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+    local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)
+    table.insert(contents, table.concat(lines, "\n"))
+  end
+
+  assert_true(vim.tbl_contains(contents, "plain: old"), "current decrypted content was not in diff")
+  assert_true(vim.tbl_contains(contents, "plain: target"), "target decrypted content was not in diff")
+  vim.cmd("tabclose!")
+end
+
+tests["auto_edit opens encrypted files in a scratch buffer"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake, { auto_edit = true })
+
+  local original_file = fake.dir .. "/auto-edit.yml"
+  write_file(original_file, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
+
+  vim.cmd("edit " .. vim.fn.fnameescape(original_file))
+  local original_buf = vim.api.nvim_get_current_buf()
+
+  wait_until(function()
+    return vim.api.nvim_get_current_buf() ~= original_buf and vim.bo[vim.api.nvim_get_current_buf()].buftype == "acwrite"
+  end, "auto_edit did not open VaultEdit scratch buffer")
+
+  vim.api.nvim_buf_delete(vim.api.nvim_get_current_buf(), { force = true })
+end
+
+tests["VaultFiles builtin picker can view selected vault file"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake, { picker = "builtin" })
+
+  local original_cwd = vim.fn.getcwd()
+  local original_select = vim.ui.select
+  local vault_file = fake.dir .. "/picked.yml"
+  write_file(vault_file, "$ANSIBLE_VAULT;1.1;AES256\nTARGET\n")
+
+  vim.fn.chdir(fake.dir)
+  vim.ui.select = function(items, _, callback)
+    assert_eq(items, { "picked.yml" }, "VaultFiles did not discover the expected vault file")
+    callback(items[1])
+  end
+
+  vault.files({ positionals = { "view" } })
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, -1, false)[1] == "plain: target"
+  end, "VaultFiles did not view the selected vault file")
+
+  vim.ui.select = original_select
+  vim.fn.chdir(original_cwd)
+  vim.api.nvim_win_close(0, true)
+end
+
+tests["VaultFiles edit suppresses auto_edit duplicate scratch buffers"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake, { picker = "builtin", auto_edit = true })
+
+  local original_cwd = vim.fn.getcwd()
+  local original_select = vim.ui.select
+  local vault_file = fake.dir .. "/picked.yml"
+  write_file(vault_file, "$ANSIBLE_VAULT;1.1;AES256\nTARGET\n")
+
+  vim.fn.chdir(fake.dir)
+  vim.ui.select = function(items, _, callback)
+    assert_eq(items, { "picked.yml" }, "VaultFiles did not discover the expected vault file")
+    callback(items[1])
+  end
+
+  vault.files({ positionals = { "edit" } })
+
+  wait_until(function()
+    return vim.bo[vim.api.nvim_get_current_buf()].buftype == "acwrite"
+  end, "VaultFiles edit did not open a scratch buffer")
+
+  vim.wait(100, function()
+    return false
+  end, 20)
+
+  local scratch_count = 0
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(buf)
+        and vim.bo[buf].buftype == "acwrite"
+        and vim.api.nvim_buf_get_name(buf):find("picked.yml", 1, true) then
+      scratch_count = scratch_count + 1
+    end
+  end
+
+  assert_eq(scratch_count, 1, "VaultFiles edit opened duplicate scratch buffers")
+
+  vim.ui.select = original_select
+  vim.fn.chdir(original_cwd)
+  vim.api.nvim_buf_delete(vim.api.nvim_get_current_buf(), { force = true })
 end
 
 tests["under cursor commands encrypt view and decrypt YAML vault strings"] = function()

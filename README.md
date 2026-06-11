@@ -14,8 +14,13 @@ A Neovim plugin for encrypting and decrypting files using Ansible Vault.
 - Encrypt, view, and decrypt inline vault strings under the cursor
 - Toggle between encrypted/decrypted states
 - Rekey encrypted files
+- Diff decrypted vault content against another file or a Git revision
+- Find vault files with Telescope or the built-in `vim.ui.select` picker
 - Auto-detect vault-encrypted files
+- Optionally auto-open encrypted files with `VaultEdit`
 - Support for password file, one or more vault IDs, or interactive password input
+- Optional in-memory cache for interactive passwords
+- Per-command credential overrides with command-line completion
 - `:checkhealth ansible-vault` diagnostics
 - Conda environment support via `conda run`
 - Statusline integration
@@ -42,6 +47,12 @@ A Neovim plugin for encrypting and decrypting files using Ansible Vault.
       vault_ids = nil,
       -- Optional: vault ID label to use when encrypting
       encrypt_vault_id = nil,
+      -- Optional: automatically open encrypted files with VaultEdit
+      auto_edit = false,
+      -- Optional: cache interactive passwords in memory for N seconds
+      password_cache_ttl = 0,
+      -- Optional: VaultFiles picker backend ("auto", "telescope", "builtin")
+      picker = "auto",
       -- Optional: auto detect encrypted files (default: true)
       auto_detect = true,
       -- Optional: conda environment name
@@ -89,6 +100,16 @@ require("ansible-vault").setup({
 
   -- Auto detect vault encrypted files on BufReadPost
   auto_detect = true,
+
+  -- Automatically open encrypted files with :VaultEdit after BufReadPost
+  auto_edit = false,
+
+  -- Cache interactive passwords in memory for N seconds.
+  -- Set to 0 to prompt for every operation.
+  password_cache_ttl = 0,
+
+  -- Picker backend for :VaultFiles: "auto", "telescope", or "builtin"
+  picker = "auto",
 
   -- Conda environment name where ansible-vault is installed.
   -- The plugin runs: conda run -n <env> ansible-vault ...
@@ -143,6 +164,18 @@ require("ansible-vault").setup({
 Leave `encrypt_vault_id = nil` if you want `ansible-vault` to choose the
 encryption identity from the configured vault IDs.
 
+Most commands also accept temporary credential overrides. These do not mutate
+your global setup:
+
+```vim
+:VaultEdit --vault-id prod@~/.ansible/prod-pass
+:VaultView --vault-password-file ~/.ansible/prod-pass
+:VaultEncryptString prod
+```
+
+The bare label shortcut, such as `prod`, is supported by the inline encrypt
+commands and maps to `--encrypt-vault-id prod`.
+
 Configure `VaultRekey` with a new password file or a new vault ID:
 
 ```lua
@@ -177,6 +210,17 @@ require("ansible-vault").setup({
 })
 ```
 
+Interactive passwords can be cached in Neovim memory for a short period:
+
+```lua
+require("ansible-vault").setup({
+  password_cache_ttl = 300,
+})
+```
+
+The cache is disabled by default. Clear it manually with
+`:VaultClearPasswordCache`.
+
 ## Commands
 
 | Command | Description |
@@ -185,6 +229,10 @@ require("ansible-vault").setup({
 | `:VaultDecrypt` | Decrypt current buffer |
 | `:VaultView` | View decrypted content in floating window |
 | `:VaultEdit` | Edit encrypted file in a scratch buffer, encrypt on save |
+| `:VaultClearPasswordCache` | Clear the in-memory interactive password cache |
+| `:VaultDiff {file}` | Diff decrypted current buffer against another file |
+| `:VaultDiff --git [ref]` | Diff decrypted current buffer against a Git revision |
+| `:VaultFiles [view\|edit\|rekey]` | Pick a vault file and view, edit, or rekey it |
 | `:VaultRekey [args]` | Rekey the current encrypted file |
 | `:VaultToggle` | Toggle between encrypted/decrypted state |
 | `:VaultEncryptString` | Encrypt selected text (visual mode) |
@@ -245,11 +293,59 @@ closed and the original encrypted file is reloaded.
 If the original file changed on disk while the scratch buffer was open, the save
 is refused to avoid overwriting someone else's changes.
 
+### Automatically Edit Encrypted Files
+
+Enable `auto_edit` if you want encrypted files to open directly in the safer
+`:VaultEdit` scratch workflow:
+
+```lua
+require("ansible-vault").setup({
+  auto_edit = true,
+})
+```
+
+The original encrypted buffer is reloaded after save. The plugin suppresses the
+automatic edit loop for that reload.
+
 ### Toggle a Buffer
 
 Run `:VaultToggle` to encrypt a plain buffer or decrypt an encrypted buffer.
 This is convenient for quick checks, but be careful not to save decrypted
 secrets accidentally.
+
+### Diff Decrypted Vault Content
+
+Compare the current buffer with another vault file:
+
+```vim
+:VaultDiff ../group_vars/prod/vault.yml
+```
+
+Compare the current file with a Git revision:
+
+```vim
+:VaultDiff --git HEAD
+:VaultDiff --git main
+```
+
+Both sides are decrypted into temporary nofile buffers before Neovim diff mode
+is enabled. Plain files also work, so you can compare encrypted and decrypted
+versions during migrations.
+
+### Pick Vault Files
+
+Run:
+
+```vim
+:VaultFiles view
+:VaultFiles edit
+:VaultFiles rekey
+```
+
+The picker scans files under the current working directory and keeps files whose
+first line is an Ansible Vault header. Telescope is used automatically when it
+is installed; otherwise the plugin falls back to `vim.ui.select`. Set
+`picker = "builtin"` to always use the built-in picker.
 
 ### Encrypt an Inline YAML String
 
@@ -364,6 +460,8 @@ vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decry
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
 vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
+vim.keymap.set("n", "<leader>vD", "<cmd>VaultDiff --git HEAD<cr>", { desc = "Vault Diff" })
+vim.keymap.set("n", "<leader>vf", "<cmd>VaultFiles view<cr>", { desc = "Vault Files" })
 vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>", { desc = "Vault Toggle" })
 vim.keymap.set("v", "<leader>vs", "<cmd>VaultEncryptString<cr>", { desc = "Vault Encrypt String" })
 vim.keymap.set("v", "<leader>vS", "<cmd>VaultDecryptString<cr>", { desc = "Vault Decrypt String" })
@@ -418,6 +516,16 @@ vault.edit()
 -- Rekey current encrypted file
 vault.rekey()
 
+-- Diff decrypted current buffer against a file or Git revision
+vault.diff({ positionals = { "../other-vault.yml" } })
+vault.diff({ git_ref = "HEAD" })
+
+-- Pick vault files from the current working directory
+vault.files({ positionals = { "view" } })
+
+-- Clear the optional in-memory password cache
+vault.clear_password_cache()
+
 -- Toggle encryption state
 vault.toggle()
 
@@ -465,6 +573,9 @@ inserted as the value for `password`.
   are supported and configuration values are not evaluated by a shell.
 - Interactive passwords are collected with `inputsecret()` and written to a
   temporary `0600` password file for the duration of the vault operation.
+- `password_cache_ttl` is disabled by default. When enabled, the interactive
+  password is kept in Neovim process memory until it expires or
+  `:VaultClearPasswordCache` is run.
 - `VaultEdit` keeps the decrypted content in a scratch `acwrite` buffer with
   `swapfile=false`, `undofile=false`, and `bufhidden=wipe`.
 - `VaultEdit` writes encrypted output through a temporary file in the same
