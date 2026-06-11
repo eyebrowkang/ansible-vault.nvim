@@ -22,6 +22,9 @@ English documentation: [README.md](README.md)
 - 支持 password file、一个或多个 vault ID 和交互式密码输入
 - 可选：在内存中短时缓存交互式密码
 - 支持命令级凭据覆盖和命令行补全
+- `:VaultInfo` 查看当前 buffer 和插件配置诊断信息
+- 可配置 vault 命令超时和成功通知静音
+- 通过 `User` autocmd events 集成 statusline 或其他插件
 - 支持 `:checkhealth ansible-vault` 诊断
 - 支持通过 `conda run` 调用 Conda 环境中的 `ansible-vault`
 - 可用于 statusline 显示 vault 状态
@@ -91,6 +94,12 @@ require("ansible-vault").setup({
 
   -- :VaultFiles picker 后端："auto"、"telescope" 或 "builtin"
   picker = "auto",
+
+  -- ansible-vault 命令超时时间，单位毫秒。0 表示关闭超时。
+  timeout_ms = 30000,
+
+  -- 操作成功后是否显示 info 级通知
+  notify_success = true,
 
   -- ansible-vault 所在的 Conda 环境名
   -- 插件会执行：conda run -n <env> ansible-vault ...
@@ -213,6 +222,7 @@ require("ansible-vault").setup({
 | `:VaultDiff {file}` | 将当前 buffer 解密后与另一个文件做 diff |
 | `:VaultDiff --git [ref]` | 将当前文件解密后与某个 Git 版本做 diff |
 | `:VaultFiles [view\|edit\|rekey]` | 选择 vault 文件并查看、编辑或 rekey |
+| `:VaultInfo [args]` | 查看当前 buffer 和插件配置诊断信息 |
 | `:VaultRekey [args]` | 对当前加密文件执行 rekey |
 | `:VaultToggle` | 在加密/解密状态之间切换 |
 | `:VaultEncryptString` | 加密视觉选择的文本 |
@@ -318,6 +328,32 @@ require("ansible-vault").setup({
 插件会扫描当前工作目录下首行为 Ansible Vault header 的文件。安装了
 Telescope 时会自动使用 Telescope，否则回退到 `vim.ui.select`。如果希望始终
 使用内置 picker，可以设置 `picker = "builtin"`。
+
+### 查看状态信息
+
+执行：
+
+```vim
+:VaultInfo
+```
+
+信息窗口会显示当前 buffer 是否加密、凭据来源、已配置的 vault label、
+auto-edit/picker 设置、命令超时、密码缓存状态，以及最近一次成功的 vault
+操作。
+
+### 调整通知和超时
+
+默认情况下，vault 命令 30 秒后超时。可以设置 `timeout_ms = 0` 关闭超时，
+或者降低这个值以更快得到失败反馈：
+
+```lua
+require("ansible-vault").setup({
+  timeout_ms = 10000,
+  notify_success = false,
+})
+```
+
+`notify_success = false` 只会静音成功后的 info 通知；错误和警告仍然会显示。
 
 ### 加密 YAML inline 字符串
 
@@ -475,6 +511,8 @@ vault.rekey()
 vault.diff({ positionals = { "../other-vault.yml" } })
 vault.diff({ git_ref = "HEAD" })
 vault.files({ positionals = { "view" } })
+vault.info()
+local info_lines = vault.get_info()
 vault.clear_password_cache()
 vault.toggle()
 vault.encrypt_string()
@@ -485,6 +523,25 @@ vault.view_string_under_cursor()
 vault.decrypt_string_under_cursor()
 vault.status()
 ```
+
+## User Events
+
+插件会在成功操作后触发 `User` autocmd。你可以监听具体事件，例如
+`AnsibleVaultEncrypt`，也可以监听所有操作的 `AnsibleVaultOperation`：
+
+```lua
+vim.api.nvim_create_autocmd("User", {
+  pattern = "AnsibleVaultOperation",
+  callback = function(event)
+    vim.print(event.data.operation)
+  end,
+})
+```
+
+当前事件包括 `AnsibleVaultEncrypt`、`AnsibleVaultDecrypt`、
+`AnsibleVaultView`、`AnsibleVaultEditOpen`、`AnsibleVaultEditSave`、
+`AnsibleVaultRekey`、`AnsibleVaultStringEncrypt`、
+`AnsibleVaultStringDecrypt` 和 `AnsibleVaultDiff`。
 
 ## 安全说明
 
@@ -510,6 +567,15 @@ make test
 ```
 
 测试使用 fake `ansible-vault` 可执行文件，因此不要求本机安装 Ansible。
+
+使用 `uv` 运行真实二进制 smoke test：
+
+```sh
+make test-real
+```
+
+该命令会创建 `.venv`，安装 `ansible-core`，并让 Neovim 使用真实的
+`.venv/bin/ansible-vault` 运行 smoke test。
 
 ## License
 

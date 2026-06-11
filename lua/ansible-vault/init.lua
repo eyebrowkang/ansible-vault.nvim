@@ -9,6 +9,8 @@
 ---@field auto_edit? boolean Automatically open encrypted files with VaultEdit (default: false)
 ---@field password_cache_ttl? number Cache interactive passwords in memory for N seconds (default: 0)
 ---@field picker? "auto"|"telescope"|"builtin" Picker backend for VaultFiles (default: "auto")
+---@field timeout_ms? number ansible-vault job timeout in milliseconds (default: 30000, set 0 to disable)
+---@field notify_success? boolean Show success/info notifications (default: true)
 ---@field conda_env? string Conda environment name where ansible-vault is installed
 ---@field ansible_vault_path? string Custom path to ansible-vault executable
 ---@field debug? boolean Enable debug logging (default: false)
@@ -35,6 +37,8 @@ local DEFAULT_CONFIG = {
   auto_edit = false,
   password_cache_ttl = 0,
   picker = "auto",
+  timeout_ms = 30000,
+  notify_success = true,
   conda_env = nil,
   ansible_vault_path = nil,
   debug = false,
@@ -48,6 +52,7 @@ local password_cache = {
   expires_at = 0,
 }
 
+local last_operation = nil
 local suppress_auto_edit_path = nil
 
 ---Debug log helper
@@ -72,6 +77,87 @@ end
 local function effective_config(opts)
   local overrides = opts and (opts.overrides or opts) or {}
   return vim.tbl_deep_extend("force", M.config, overrides)
+end
+
+---@param message string
+---@param level integer
+---@param opts? table
+local function notify(message, level, opts)
+  local config = effective_config(opts)
+  if level == vim.log.levels.INFO and config.notify_success == false then
+    return
+  end
+  vim.notify(message, level)
+end
+
+---@param operation string
+---@param data? table
+local function emit_event(operation, data)
+  local payload = vim.tbl_deep_extend("force", { operation = operation }, data or {})
+  last_operation = {
+    operation = operation,
+    time = os.time(),
+    data = payload,
+  }
+
+  pcall(vim.api.nvim_exec_autocmds, "User", {
+    pattern = "AnsibleVault" .. operation,
+    data = payload,
+  })
+  pcall(vim.api.nvim_exec_autocmds, "User", {
+    pattern = "AnsibleVaultOperation",
+    data = payload,
+  })
+end
+
+---@param opts? table
+---@return integer|nil
+local function get_timeout_ms(opts)
+  local timeout = effective_config(opts).timeout_ms
+  if type(timeout) == "number" and timeout > 0 then
+    return math.floor(timeout)
+  end
+  return nil
+end
+
+---@param job_id integer
+---@param action string
+---@param opts? table
+---@return fun()
+---@return fun(): boolean
+local function start_job_timeout(job_id, action, opts)
+  local timeout = get_timeout_ms(opts)
+  if not timeout then
+    return function() end, function()
+      return false
+    end
+  end
+
+  local timed_out = false
+  local timer = uv.new_timer()
+  if not timer then
+    return function() end, function()
+      return false
+    end
+  end
+
+  timer:start(timeout, 0, function()
+    timed_out = true
+    vim.schedule(function()
+      pcall(vim.fn.jobstop, job_id)
+    end)
+  end)
+
+  local stop = function()
+    if timer and not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+  end
+
+  return stop, function()
+    return timed_out
+  end
 end
 
 ---@param ttl any
@@ -337,6 +423,10 @@ local function run_vault(action, input, args, callback, opts)
   local argv = build_vault_argv(action, args or {}, "-", opts)
   local stdout_data = {}
   local stderr_data = {}
+  local stop_timeout = function() end
+  local did_timeout = function()
+    return false
+  end
 
   debug_log("running: %s", table.concat(argv, " "))
 
@@ -352,8 +442,14 @@ local function run_vault(action, input, args, callback, opts)
     end,
     on_exit = function(_, exit_code)
       vim.schedule(function()
+        stop_timeout()
         local stdout = join_job_data(stdout_data)
         local stderr = join_job_data(stderr_data)
+
+        if did_timeout() then
+          callback(false, string.format("ansible-vault %s timed out after %dms", action, get_timeout_ms(opts) or 0))
+          return
+        end
 
         if exit_code == 0 then
           callback(true, stdout)
@@ -370,6 +466,7 @@ local function run_vault(action, input, args, callback, opts)
     return
   end
 
+  stop_timeout, did_timeout = start_job_timeout(job_id, action, opts)
   vim.fn.chansend(job_id, input)
   vim.fn.chanclose(job_id, "stdin")
 end
@@ -516,6 +613,10 @@ local function run_vault_file(action, file_path, args, callback, opts)
   local argv = build_vault_argv(action, args or {}, file_path, opts)
   local stdout_data = {}
   local stderr_data = {}
+  local stop_timeout = function() end
+  local did_timeout = function()
+    return false
+  end
 
   debug_log("running: %s", table.concat(argv, " "))
 
@@ -530,8 +631,14 @@ local function run_vault_file(action, file_path, args, callback, opts)
     end,
     on_exit = function(_, exit_code)
       vim.schedule(function()
+        stop_timeout()
         local stdout = join_job_data(stdout_data)
         local stderr = join_job_data(stderr_data)
+
+        if did_timeout() then
+          callback(false, string.format("ansible-vault %s timed out after %dms", action, get_timeout_ms(opts) or 0))
+          return
+        end
 
         if exit_code == 0 then
           callback(true, stdout)
@@ -545,7 +652,10 @@ local function run_vault_file(action, file_path, args, callback, opts)
 
   if job_id <= 0 then
     callback(false, "Failed to start ansible-vault")
+    return
   end
+
+  stop_timeout, did_timeout = start_job_timeout(job_id, action, opts)
 end
 
 ---@param buf? integer
@@ -608,8 +718,9 @@ end
 ---@param expected_changedtick integer
 ---@param output string
 ---@param success_message string
+---@param opts? table
 ---@return boolean
-local function replace_buffer_lines(buf, expected_changedtick, output, success_message)
+local function replace_buffer_lines(buf, expected_changedtick, output, success_message, opts)
   if not is_valid_buf(buf) then
     vim.notify("Vault operation finished, but the target buffer no longer exists", vim.log.levels.WARN)
     return false
@@ -628,7 +739,7 @@ local function replace_buffer_lines(buf, expected_changedtick, output, success_m
   end
 
   vim.b[buf].ansible_vault_encrypted = M.is_encrypted(lines)
-  vim.notify(success_message, vim.log.levels.INFO)
+  notify(success_message, vim.log.levels.INFO, opts)
   return true
 end
 
@@ -739,7 +850,9 @@ function M.encrypt(buf, opts)
       finish_buffer_operation(target, "encrypt")
 
       if success then
-        replace_buffer_lines(target, tick, output, "Buffer encrypted successfully")
+        if replace_buffer_lines(target, tick, output, "Buffer encrypted successfully", opts) then
+          emit_event("Encrypt", { buf = target })
+        end
       else
         vim.notify("Encryption failed: " .. output, vim.log.levels.ERROR)
       end
@@ -786,7 +899,9 @@ function M.decrypt(buf, opts)
       finish_buffer_operation(target, "decrypt")
 
       if success then
-        replace_buffer_lines(target, tick, output, "Buffer decrypted successfully")
+        if replace_buffer_lines(target, tick, output, "Buffer decrypted successfully", opts) then
+          emit_event("Decrypt", { buf = target })
+        end
       else
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
       end
@@ -827,6 +942,7 @@ function M.view(buf, opts)
 
       if success then
         open_output_window(output, " Vault View (read-only) ", filetype)
+        emit_event("View", { buf = target })
       else
         vim.notify("View failed: " .. output, vim.log.levels.ERROR)
       end
@@ -1158,7 +1274,8 @@ local function encrypt_string_selection(buf, selection, opts)
       )
 
       if ok then
-        vim.notify("String encrypted successfully", vim.log.levels.INFO)
+        notify("String encrypted successfully", vim.log.levels.INFO, opts)
+        emit_event("StringEncrypt", { buf = buf, name = plan.name })
       else
         vim.notify("Failed to update selection: " .. err, vim.log.levels.ERROR)
       end
@@ -1457,7 +1574,8 @@ function M.edit(buf, opts)
 
             cleanup_edit_buffer(cur_buf)
             close_edit_buffer(cur_buf, orig_buf, orig_file, original_win)
-            vim.notify("Encrypted and saved: " .. orig_file, vim.log.levels.INFO)
+            notify("Encrypted and saved: " .. orig_file, vim.log.levels.INFO, opts)
+            emit_event("EditSave", { buf = orig_buf, file = orig_file })
           end, opts)
         end,
       })
@@ -1470,7 +1588,8 @@ function M.edit(buf, opts)
         end,
       })
 
-      vim.notify("Editing decrypted content. :w encrypts and saves.", vim.log.levels.INFO)
+      notify("Editing decrypted content. :w encrypts and saves.", vim.log.levels.INFO, opts)
+      emit_event("EditOpen", { buf = edit_buf, original_buf = original_buf, file = original_file })
     end, opts)
   end, opts)
 end
@@ -1538,7 +1657,8 @@ function M.rekey(opts)
         vim.b[target].ansible_vault_encrypted = M.is_buffer_encrypted(target)
       end
 
-      vim.notify("Vault file rekeyed successfully", vim.log.levels.INFO)
+      notify("Vault file rekeyed successfully", vim.log.levels.INFO, opts)
+      emit_event("Rekey", { buf = target, file = file_path })
     end, opts)
   end, opts)
 end
@@ -1729,7 +1849,8 @@ local function decrypt_string_selection(target, selection, mode, opts)
       )
 
       if ok then
-        vim.notify("String decrypted successfully", vim.log.levels.INFO)
+        notify("String decrypted successfully", vim.log.levels.INFO, opts)
+        emit_event("StringDecrypt", { buf = target, name = parsed.var_name })
       else
         vim.notify("Failed to update selection: " .. err, vim.log.levels.ERROR)
       end
@@ -1912,6 +2033,7 @@ function M.diff(opts)
           target_plain,
           filetype
         )
+        emit_event("Diff", { buf = target, target = target_name })
       end)
     end)
   end
@@ -2038,6 +2160,123 @@ function M.files(opts)
   end)
 end
 
+---@param value boolean
+---@return string
+local function yes_no(value)
+  return value and "yes" or "no"
+end
+
+---@param config table
+---@return string
+local function describe_password_source(config)
+  if is_nonempty_string(config.password_file) then
+    return "password_file"
+  end
+
+  if type(config.vault_ids) == "table" and #config.vault_ids > 0 then
+    return string.format("vault_ids (%d)", #config.vault_ids)
+  end
+
+  if is_nonempty_string(config.vault_id) then
+    return "vault_id"
+  end
+
+  return "interactive"
+end
+
+---@param config table
+---@return string
+local function describe_vault_labels(config)
+  local labels = {}
+  local add_label = function(vault_id)
+    local label = type(vault_id) == "string" and vault_id:match("^([^@]+)@")
+    if label then
+      table.insert(labels, label)
+    end
+  end
+
+  if type(config.vault_ids) == "table" then
+    for _, vault_id in ipairs(config.vault_ids) do
+      add_label(vault_id)
+    end
+  end
+  add_label(config.vault_id)
+
+  if #labels == 0 then
+    return "none"
+  end
+  return table.concat(labels, ", ")
+end
+
+---@param config table
+---@return string
+local function describe_password_cache(config)
+  if not should_cache_password(config.password_cache_ttl) then
+    return "disabled"
+  end
+
+  if password_cache.password and password_cache.expires_at > now_seconds() then
+    return string.format("active (%ds remaining)", password_cache.expires_at - now_seconds())
+  end
+
+  return "enabled, empty"
+end
+
+---Return human-readable plugin and buffer state lines.
+---@param buf? integer
+---@param opts? table
+---@return string[]
+function M.get_info(buf, opts)
+  local target = normalize_buf(buf)
+  local config = effective_config(opts)
+  local buffer_name = is_valid_buf(target) and vim.api.nvim_buf_get_name(target) or ""
+  local pending = is_valid_buf(target) and vim.b[target].ansible_vault_pending or nil
+  local modified = is_valid_buf(target) and vim.bo[target].modified or false
+
+  local timeout = get_timeout_ms(opts)
+  local lines = {
+    "Ansible Vault",
+    "",
+    "Buffer: " .. (buffer_name ~= "" and buffer_name or "[No Name]"),
+    "Encrypted: " .. yes_no(is_valid_buf(target) and M.is_buffer_encrypted(target)),
+    "Modified: " .. yes_no(modified),
+    "Pending operation: " .. (pending or "none"),
+    "",
+    "Executable: " .. table.concat(get_vault_argv(opts), " "),
+    "Credential source: " .. describe_password_source(config),
+    "Vault labels: " .. describe_vault_labels(config),
+    "Encrypt vault ID: " .. (is_nonempty_string(config.encrypt_vault_id) and config.encrypt_vault_id or "default"),
+    "Rekey target: "
+      .. (
+        is_nonempty_string(config.rekey_password_file) and "password_file"
+        or is_nonempty_string(config.rekey_vault_id) and "vault_id"
+        or "command args"
+      ),
+    "",
+    "Auto detect: " .. yes_no(config.auto_detect ~= false),
+    "Auto edit: " .. yes_no(config.auto_edit == true),
+    "Picker: " .. tostring(config.picker or "auto"),
+    "Timeout: " .. (timeout and string.format("%dms", timeout) or "disabled"),
+    "Success notifications: " .. yes_no(config.notify_success ~= false),
+    "Password cache: " .. describe_password_cache(config),
+  }
+
+  if last_operation then
+    table.insert(lines, "")
+    table.insert(lines, "Last operation: " .. last_operation.operation)
+    table.insert(lines, "Last operation time: " .. os.date("%Y-%m-%d %H:%M:%S", last_operation.time))
+  end
+
+  return lines
+end
+
+---Show plugin and current buffer state in a floating window.
+---@param buf? integer
+---@param opts? table
+function M.info(buf, opts)
+  open_output_window(table.concat(M.get_info(buf, opts), "\n"), " Ansible Vault Info ", "")
+end
+
 ---Get status string for statusline.
 ---@param buf? integer
 ---@return string
@@ -2051,7 +2290,7 @@ end
 ---Clear the in-memory interactive password cache.
 function M.clear_password_cache()
   clear_password_cache()
-  vim.notify("Ansible Vault password cache cleared", vim.log.levels.INFO)
+  notify("Ansible Vault password cache cleared", vim.log.levels.INFO)
 end
 
 ---Setup the plugin.
@@ -2137,6 +2376,17 @@ function M.setup(opts)
       return complete_files_args(arg_lead)
     end,
     desc = "Pick an Ansible Vault file",
+    force = true,
+  })
+
+  vim.api.nvim_create_user_command("VaultInfo", function(command_opts)
+    M.info(nil, parse_operation_options(parse_command_args(command_opts.args)))
+  end, {
+    nargs = "*",
+    complete = function(arg_lead)
+      return complete_operation_args(arg_lead, true)
+    end,
+    desc = "Show Ansible Vault buffer and configuration info",
     force = true,
   })
 

@@ -162,6 +162,8 @@ local function reset_config(fake, opts)
   vault.config.auto_edit = false
   vault.config.password_cache_ttl = 0
   vault.config.picker = "auto"
+  vault.config.timeout_ms = 30000
+  vault.config.notify_success = true
   vault.config.conda_env = nil
   vault.config.ansible_vault_path = nil
   vault.config.debug = false
@@ -540,6 +542,64 @@ tests["interactive password cache avoids repeated prompts"] = function()
 
   vim.fn.inputsecret = original_inputsecret
   assert_eq(prompt_count, 1, "password prompt should have been cached")
+end
+
+tests["notify_success false suppresses success notifications"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake, { notify_success = false })
+
+  local buf = new_buffer({ "plain: value" })
+  vault.encrypt(buf)
+
+  wait_until(function()
+    return vault.is_buffer_encrypted(buf)
+  end, "encrypt did not finish with notify_success disabled")
+
+  assert_false(notification_contains("Buffer encrypted successfully"), "success notification was not suppressed")
+end
+
+tests["slow vault operations time out"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake, { timeout_ms = 50 })
+  vim.env.FAKE_VAULT_SLEEP = "1"
+
+  local buf = new_buffer({ "plain: value" })
+  vault.encrypt(buf)
+
+  wait_until(function()
+    return notification_contains("timed out")
+  end, "slow vault operation did not time out")
+
+  assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "plain: value" }, "timed out operation changed buffer")
+  vim.env.FAKE_VAULT_SLEEP = nil
+end
+
+tests["VaultInfo reports state and operations emit User events"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local event_data
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "AnsibleVaultEncrypt",
+    once = true,
+    callback = function(event)
+      event_data = event.data
+    end,
+  })
+
+  local buf = new_buffer({ "plain: value" })
+  vault.encrypt(buf)
+
+  wait_until(function()
+    return vault.is_buffer_encrypted(buf)
+  end, "encrypt did not finish before VaultInfo check")
+
+  assert_true(event_data and event_data.operation == "Encrypt", "encrypt User event was not emitted")
+
+  local info = table.concat(vault.get_info(buf), "\n")
+  assert_true(info:find("Encrypted: yes", 1, true), "VaultInfo did not report encrypted state")
+  assert_true(info:find("Credential source: password_file", 1, true), "VaultInfo did not report credential source")
+  assert_true(info:find("Last operation: Encrypt", 1, true), "VaultInfo did not report last operation")
 end
 
 tests["VaultDecryptString replaces selected YAML vault block"] = function()

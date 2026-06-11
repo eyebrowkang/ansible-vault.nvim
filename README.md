@@ -21,6 +21,9 @@ A Neovim plugin for encrypting and decrypting files using Ansible Vault.
 - Support for password file, one or more vault IDs, or interactive password input
 - Optional in-memory cache for interactive passwords
 - Per-command credential overrides with command-line completion
+- `:VaultInfo` buffer/config diagnostics
+- Configurable vault command timeout and quiet success notifications
+- `User` autocmd events for statusline and plugin integrations
 - `:checkhealth ansible-vault` diagnostics
 - Conda environment support via `conda run`
 - Statusline integration
@@ -53,6 +56,10 @@ A Neovim plugin for encrypting and decrypting files using Ansible Vault.
       password_cache_ttl = 0,
       -- Optional: VaultFiles picker backend ("auto", "telescope", "builtin")
       picker = "auto",
+      -- Optional: ansible-vault job timeout in milliseconds (0 disables it)
+      timeout_ms = 30000,
+      -- Optional: suppress success/info notifications
+      notify_success = true,
       -- Optional: auto detect encrypted files (default: true)
       auto_detect = true,
       -- Optional: conda environment name
@@ -110,6 +117,12 @@ require("ansible-vault").setup({
 
   -- Picker backend for :VaultFiles: "auto", "telescope", or "builtin"
   picker = "auto",
+
+  -- ansible-vault job timeout in milliseconds. Set 0 to disable.
+  timeout_ms = 30000,
+
+  -- Show success/info notifications after completed operations
+  notify_success = true,
 
   -- Conda environment name where ansible-vault is installed.
   -- The plugin runs: conda run -n <env> ansible-vault ...
@@ -233,6 +246,7 @@ The cache is disabled by default. Clear it manually with
 | `:VaultDiff {file}` | Diff decrypted current buffer against another file |
 | `:VaultDiff --git [ref]` | Diff decrypted current buffer against a Git revision |
 | `:VaultFiles [view\|edit\|rekey]` | Pick a vault file and view, edit, or rekey it |
+| `:VaultInfo [args]` | Show current buffer and plugin configuration diagnostics |
 | `:VaultRekey [args]` | Rekey the current encrypted file |
 | `:VaultToggle` | Toggle between encrypted/decrypted state |
 | `:VaultEncryptString` | Encrypt selected text (visual mode) |
@@ -346,6 +360,33 @@ The picker scans files under the current working directory and keeps files whose
 first line is an Ansible Vault header. Telescope is used automatically when it
 is installed; otherwise the plugin falls back to `vim.ui.select`. Set
 `picker = "builtin"` to always use the built-in picker.
+
+### Inspect State
+
+Run:
+
+```vim
+:VaultInfo
+```
+
+The info window shows the current buffer state, credential source, configured
+vault labels, auto-edit/picker settings, timeout, password-cache state, and the
+last successful vault operation.
+
+### Tune Notifications and Timeouts
+
+By default, vault jobs time out after 30 seconds. Set `timeout_ms = 0` to
+disable the timeout, or lower it for tighter feedback:
+
+```lua
+require("ansible-vault").setup({
+  timeout_ms = 10000,
+  notify_success = false,
+})
+```
+
+Errors and warnings are still shown when `notify_success = false`; only
+successful informational messages are suppressed.
 
 ### Encrypt an Inline YAML String
 
@@ -523,6 +564,10 @@ vault.diff({ git_ref = "HEAD" })
 -- Pick vault files from the current working directory
 vault.files({ positionals = { "view" } })
 
+-- Show current buffer and plugin state
+vault.info()
+local info_lines = vault.get_info()
+
 -- Clear the optional in-memory password cache
 vault.clear_password_cache()
 
@@ -546,6 +591,26 @@ vault.decrypt_string_under_cursor()
 -- Get status string for statusline
 vault.status()
 ```
+
+## User Events
+
+The plugin emits `User` autocommands after successful operations. Listen to a
+specific event such as `AnsibleVaultEncrypt`, or to `AnsibleVaultOperation` for
+all operations:
+
+```lua
+vim.api.nvim_create_autocmd("User", {
+  pattern = "AnsibleVaultOperation",
+  callback = function(event)
+    vim.print(event.data.operation)
+  end,
+})
+```
+
+Current events are `AnsibleVaultEncrypt`, `AnsibleVaultDecrypt`,
+`AnsibleVaultView`, `AnsibleVaultEditOpen`, `AnsibleVaultEditSave`,
+`AnsibleVaultRekey`, `AnsibleVaultStringEncrypt`,
+`AnsibleVaultStringDecrypt`, and `AnsibleVaultDiff`.
 
 ## Inline YAML Strings
 
@@ -596,6 +661,15 @@ make test
 
 The tests use a fake `ansible-vault` executable, so they do not require Ansible
 to be installed.
+
+Run the real binary smoke test with `uv`:
+
+```sh
+make test-real
+```
+
+This creates `.venv`, installs `ansible-core`, and runs Neovim against the real
+`.venv/bin/ansible-vault` binary.
 
 ## License
 
