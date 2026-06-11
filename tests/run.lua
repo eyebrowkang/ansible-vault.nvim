@@ -76,17 +76,24 @@ fi
 action="$1"
 shift
 name="encrypted_string"
+file_arg=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --stdin-name)
       shift
       name="$1"
       ;;
+    *)
+      file_arg="$1"
+      ;;
   esac
   shift || break
 done
 
-input=$(cat)
+input=""
+if [ "$action" != "rekey" ]; then
+  input=$(cat)
+fi
 if [ -n "$FAKE_VAULT_SLEEP" ]; then
   sleep "$FAKE_VAULT_SLEEP"
 fi
@@ -99,6 +106,7 @@ case "$action" in
   decrypt)
     case "$input" in
       *EDITME*) printf 'plain: old\n' ;;
+      *ENCSTR*) printf 'secret\n' ;;
       *) printf 'plain: value\n' ;;
     esac
     ;;
@@ -106,6 +114,13 @@ case "$action" in
     printf '%s: !vault |\n' "$name"
     printf '          $ANSIBLE_VAULT;1.1;AES256\n'
     printf '          ENCSTR:%s\n' "$input"
+    ;;
+  rekey)
+    if [ -z "$file_arg" ]; then
+      printf 'missing file arg\n' >&2
+      exit 2
+    fi
+    printf '$ANSIBLE_VAULT;1.1;AES256\nREKEYED\n' > "$file_arg"
     ;;
   *)
     printf 'unknown action: %s\n' "$action" >&2
@@ -138,7 +153,10 @@ local function reset_config(fake, opts)
 
   vault.config.password_file = nil
   vault.config.vault_id = nil
+  vault.config.vault_ids = nil
   vault.config.encrypt_vault_id = nil
+  vault.config.rekey_password_file = nil
+  vault.config.rekey_vault_id = nil
   vault.config.auto_detect = true
   vault.config.conda_env = nil
   vault.config.ansible_vault_path = nil
@@ -274,6 +292,29 @@ tests["vault_id does not imply default encrypt vault id"] = function()
   assert_true(log_has_line(fake.log, "ARG:prod"), "explicit encrypt_vault_id value was not passed")
 end
 
+tests["vault_ids pass multiple vault identities"] = function()
+  local fake = create_fake_vault()
+  local dev_pass = make_password_file(fake.dir)
+  local prod_pass = make_password_file(fake.dir)
+  reset_config(fake, {
+    password_file = false,
+    vault_ids = { "dev@" .. dev_pass, "prod@" .. prod_pass },
+    encrypt_vault_id = "prod",
+  })
+
+  local buf = new_buffer({ "plain" })
+  vault.encrypt(buf)
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
+  end, "encrypt with vault_ids did not finish")
+
+  assert_true(log_contains(fake.log, "ARG:dev@" .. dev_pass), "dev vault_id was not passed")
+  assert_true(log_contains(fake.log, "ARG:prod@" .. prod_pass), "prod vault_id was not passed")
+  assert_true(log_contains(fake.log, "ARG:--encrypt-vault-id"), "encrypt_vault_id flag was not passed")
+  assert_true(log_has_line(fake.log, "ARG:prod"), "encrypt_vault_id value was not passed")
+end
+
 tests["view preserves source filetype"] = function()
   local fake = create_fake_vault()
   reset_config(fake)
@@ -400,6 +441,106 @@ tests["VaultEncryptString can replace only a YAML value"] = function()
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_eq(lines[1], "password: !vault |", "value-only YAML output has wrong first line")
   assert_eq(lines[2], "          $ANSIBLE_VAULT;1.1;AES256", "value-only YAML output has wrong vault header")
+end
+
+tests["VaultDecryptString replaces selected YAML vault block"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local buf = new_buffer({
+    "password: !vault |",
+    "          $ANSIBLE_VAULT;1.1;AES256",
+    "          ENCSTR:secret",
+  })
+  vim.fn.setpos("'<", { 0, 1, 1, 0 })
+  vim.fn.setpos("'>", { 0, 3, #"          ENCSTR:secret", 0 })
+
+  vault.decrypt_string()
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: secret"
+  end, "selected YAML vault block was not decrypted")
+
+  assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "password: secret" })
+end
+
+tests["under cursor commands encrypt view and decrypt YAML vault strings"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local buf = new_buffer({ "password: secret" })
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  vault.encrypt_string_under_cursor()
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
+  end, "under-cursor YAML value was not encrypted")
+
+  vim.api.nvim_win_set_cursor(0, { 2, 10 })
+  vault.view_string_under_cursor()
+
+  wait_until(function()
+    return vim.api.nvim_get_current_buf() ~= buf
+  end, "under-cursor vault view did not open")
+
+  assert_eq(vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, -1, false), { "secret" })
+  vim.api.nvim_win_close(0, true)
+
+  vim.api.nvim_set_current_buf(buf)
+  vim.api.nvim_win_set_cursor(0, { 2, 10 })
+  vault.decrypt_string_under_cursor()
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: secret"
+  end, "under-cursor vault block was not decrypted")
+
+  assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "password: secret" })
+end
+
+tests["under cursor vault lookup does not select a previous block"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local buf = new_buffer({
+    "password: !vault |",
+    "          $ANSIBLE_VAULT;1.1;AES256",
+    "          ENCSTR:secret",
+    "other: value",
+  })
+
+  vim.api.nvim_win_set_cursor(0, { 4, 0 })
+  vault.view_string_under_cursor()
+
+  assert_eq(vim.api.nvim_get_current_buf(), buf, "view should not open for a cursor outside the vault block")
+  assert_true(notification_contains("No text selected"), "missing warning for cursor outside a vault block")
+end
+
+tests["VaultRekey rekeys a file-backed encrypted buffer"] = function()
+  local fake = create_fake_vault()
+  local new_pass = make_password_file(fake.dir)
+  reset_config(fake, { rekey_password_file = new_pass })
+
+  local original_file = fake.dir .. "/rekey.yml"
+  write_file(original_file, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
+
+  vim.cmd("edit " .. vim.fn.fnameescape(original_file))
+  local buf = vim.api.nvim_get_current_buf()
+
+  vault.rekey()
+
+  wait_until(function()
+    return read_file(original_file):find("REKEYED", 1, true) ~= nil
+  end, "VaultRekey did not rewrite the file")
+
+  assert_true(log_contains(fake.log, "ARG:--new-vault-password-file"), "new password file flag was not passed")
+  assert_true(log_contains(fake.log, "ARG:" .. new_pass), "new password file path was not passed")
+  assert_true(vault.is_buffer_encrypted(buf), "buffer was not reloaded as encrypted after rekey")
+end
+
+tests["health check runs"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+  require("ansible-vault.health").check()
 end
 
 local failures = 0

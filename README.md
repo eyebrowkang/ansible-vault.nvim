@@ -11,9 +11,12 @@ A Neovim plugin for encrypting and decrypting files using Ansible Vault.
 - Encrypt/decrypt entire buffer
 - View encrypted content in floating window (read-only)
 - Encrypt selected text as inline YAML vault strings
+- Encrypt, view, and decrypt inline vault strings under the cursor
 - Toggle between encrypted/decrypted states
+- Rekey encrypted files
 - Auto-detect vault-encrypted files
-- Support for password file, vault ID, or interactive password input
+- Support for password file, one or more vault IDs, or interactive password input
+- `:checkhealth ansible-vault` diagnostics
 - Conda environment support via `conda run`
 - Statusline integration
 
@@ -35,6 +38,8 @@ A Neovim plugin for encrypting and decrypting files using Ansible Vault.
       password_file = "~/.vault_pass",
       -- Optional: vault ID
       vault_id = nil,
+      -- Optional: multiple vault IDs
+      vault_ids = nil,
       -- Optional: vault ID label to use when encrypting
       encrypt_vault_id = nil,
       -- Optional: auto detect encrypted files (default: true)
@@ -69,9 +74,18 @@ require("ansible-vault").setup({
   -- Vault ID to use for decryption (for multi-vault setups)
   vault_id = nil,
 
+  -- Multiple vault IDs. Takes precedence over vault_id when set.
+  vault_ids = nil,
+
   -- Vault ID label to use for encryption.
   -- Leave nil to let ansible-vault choose from the configured vault IDs.
   encrypt_vault_id = nil,
+
+  -- New password file for :VaultRekey
+  rekey_password_file = nil,
+
+  -- New vault ID for :VaultRekey, for example "prod@~/.ansible/new-pass"
+  rekey_vault_id = nil,
 
   -- Auto detect vault encrypted files on BufReadPost
   auto_detect = true,
@@ -93,8 +107,9 @@ require("ansible-vault").setup({
 The plugin resolves credentials in this order:
 
 1. `password_file`
-2. `vault_id`
-3. interactive password prompt
+2. `vault_ids`
+3. `vault_id`
+4. interactive password prompt
 
 Use `password_file` for a single vault password:
 
@@ -113,8 +128,36 @@ require("ansible-vault").setup({
 })
 ```
 
+Use `vault_ids` when more than one identity is needed:
+
+```lua
+require("ansible-vault").setup({
+  vault_ids = {
+    "dev@~/.ansible/dev-pass",
+    "prod@~/.ansible/prod-pass",
+  },
+  encrypt_vault_id = "prod",
+})
+```
+
 Leave `encrypt_vault_id = nil` if you want `ansible-vault` to choose the
 encryption identity from the configured vault IDs.
+
+Configure `VaultRekey` with a new password file or a new vault ID:
+
+```lua
+require("ansible-vault").setup({
+  password_file = "~/.ansible/old-pass",
+  rekey_password_file = "~/.ansible/new-pass",
+})
+```
+
+```lua
+require("ansible-vault").setup({
+  vault_id = "old@~/.ansible/old-pass",
+  rekey_vault_id = "new@~/.ansible/new-pass",
+})
+```
 
 If `ansible-vault` is not on `PATH`, point to the executable directly:
 
@@ -142,9 +185,26 @@ require("ansible-vault").setup({
 | `:VaultDecrypt` | Decrypt current buffer |
 | `:VaultView` | View decrypted content in floating window |
 | `:VaultEdit` | Edit encrypted file in a scratch buffer, encrypt on save |
+| `:VaultRekey [args]` | Rekey the current encrypted file |
 | `:VaultToggle` | Toggle between encrypted/decrypted state |
 | `:VaultEncryptString` | Encrypt selected text (visual mode) |
+| `:VaultDecryptString` | Decrypt selected inline vault string in place |
 | `:VaultViewString` | View selected encrypted string (visual mode) |
+| `:VaultEncryptStringUnderCursor` | Encrypt the YAML value under the cursor |
+| `:VaultViewStringUnderCursor` | View the inline vault block under the cursor |
+| `:VaultDecryptStringUnderCursor` | Decrypt the inline vault block under the cursor |
+
+## Health Check
+
+Run:
+
+```vim
+:checkhealth ansible-vault
+```
+
+The health check verifies the configured executable, password file readability
+and permissions, vault ID labels, `encrypt_vault_id`, and `VaultRekey` target
+configuration.
 
 ## Usage
 
@@ -227,6 +287,73 @@ Select a YAML vault block and run:
 The decrypted value opens in a read-only floating window. Press `q` or `<Esc>`
 to close it.
 
+### Decrypt an Inline YAML Vault String
+
+Select a YAML vault block and run:
+
+```vim
+:VaultDecryptString
+```
+
+For example:
+
+```yaml
+password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          ...
+```
+
+is replaced with:
+
+```yaml
+password: secret
+```
+
+### Work With Inline Vault Strings Under Cursor
+
+When the cursor is on a plain YAML key/value line, run:
+
+```vim
+:VaultEncryptStringUnderCursor
+```
+
+When the cursor is on a YAML `!vault |` block, run:
+
+```vim
+:VaultViewStringUnderCursor
+:VaultDecryptStringUnderCursor
+```
+
+The plugin finds the surrounding vault block automatically, so you do not need
+to select the block by hand.
+
+### Rekey an Encrypted File
+
+Configure a rekey target first:
+
+```lua
+require("ansible-vault").setup({
+  password_file = "~/.ansible/old-pass",
+  rekey_password_file = "~/.ansible/new-pass",
+})
+```
+
+Then open an encrypted file and run:
+
+```vim
+:VaultRekey
+```
+
+You can also pass Ansible Vault rekey arguments directly:
+
+```vim
+:VaultRekey --new-vault-password-file ~/.ansible/new-pass
+:VaultRekey --new-vault-id prod@~/.ansible/prod-pass
+```
+
+The buffer must be file-backed, encrypted, and unmodified. After a successful
+rekey, the plugin reloads the encrypted file.
+
 ## Keymaps
 
 The plugin doesn't set any keymaps by default. You can add your own:
@@ -236,9 +363,13 @@ vim.keymap.set("n", "<leader>ve", "<cmd>VaultEncrypt<cr>", { desc = "Vault Encry
 vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decrypt" })
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
+vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
 vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>", { desc = "Vault Toggle" })
 vim.keymap.set("v", "<leader>vs", "<cmd>VaultEncryptString<cr>", { desc = "Vault Encrypt String" })
+vim.keymap.set("v", "<leader>vS", "<cmd>VaultDecryptString<cr>", { desc = "Vault Decrypt String" })
 vim.keymap.set("v", "<leader>vv", "<cmd>VaultViewString<cr>", { desc = "Vault View String" })
+vim.keymap.set("n", "<leader>vs", "<cmd>VaultEncryptStringUnderCursor<cr>", { desc = "Vault Encrypt String" })
+vim.keymap.set("n", "<leader>vS", "<cmd>VaultDecryptStringUnderCursor<cr>", { desc = "Vault Decrypt String" })
 ```
 
 ## Statusline Integration
@@ -284,14 +415,25 @@ vault.view()
 -- Edit encrypted buffer in a no-swap scratch buffer
 vault.edit()
 
+-- Rekey current encrypted file
+vault.rekey()
+
 -- Toggle encryption state
 vault.toggle()
 
 -- Encrypt selected text
 vault.encrypt_string()
 
+-- Decrypt selected text
+vault.decrypt_string()
+
 -- View selected encrypted string in floating window
 vault.view_string()
+
+-- Cursor-based inline YAML helpers
+vault.encrypt_string_under_cursor()
+vault.view_string_under_cursor()
+vault.decrypt_string_under_cursor()
 
 -- Get status string for statusline
 vault.status()

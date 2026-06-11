@@ -12,9 +12,12 @@ English documentation: [README.md](README.md)
 - 加密/解密当前 buffer
 - 在只读浮窗中查看加密内容
 - 将选中文本加密为 YAML inline vault 字符串
+- 在光标下加密、查看、解密 inline vault 字符串
 - 在加密/解密状态之间切换
+- 对加密文件执行 rekey
 - 自动识别 Ansible Vault 文件
-- 支持 password file、vault ID 和交互式密码输入
+- 支持 password file、一个或多个 vault ID 和交互式密码输入
+- 支持 `:checkhealth ansible-vault` 诊断
 - 支持通过 `conda run` 调用 Conda 环境中的 `ansible-vault`
 - 可用于 statusline 显示 vault 状态
 
@@ -59,9 +62,18 @@ require("ansible-vault").setup({
   -- vault ID，例如 "prod@~/.ansible/prod-pass"
   vault_id = nil,
 
+  -- 多个 vault ID。设置后优先于 vault_id。
+  vault_ids = nil,
+
   -- 加密时使用的 vault ID label。
   -- 保持 nil 时，由 ansible-vault 根据已配置的 vault IDs 自行选择。
   encrypt_vault_id = nil,
+
+  -- :VaultRekey 使用的新 password file
+  rekey_password_file = nil,
+
+  -- :VaultRekey 使用的新 vault ID，例如 "prod@~/.ansible/new-pass"
+  rekey_vault_id = nil,
 
   -- 读取文件后自动识别 Ansible Vault 文件
   auto_detect = true,
@@ -83,8 +95,9 @@ require("ansible-vault").setup({
 插件按以下顺序选择凭据：
 
 1. `password_file`
-2. `vault_id`
-3. 交互式密码输入
+2. `vault_ids`
+3. `vault_id`
+4. 交互式密码输入
 
 单密码文件场景：
 
@@ -103,8 +116,36 @@ require("ansible-vault").setup({
 })
 ```
 
+需要多个 vault identity 时：
+
+```lua
+require("ansible-vault").setup({
+  vault_ids = {
+    "dev@~/.ansible/dev-pass",
+    "prod@~/.ansible/prod-pass",
+  },
+  encrypt_vault_id = "prod",
+})
+```
+
 如果不希望插件显式传入 `--encrypt-vault-id`，保持
 `encrypt_vault_id = nil`。
+
+为 `VaultRekey` 配置新密码文件或新 vault ID：
+
+```lua
+require("ansible-vault").setup({
+  password_file = "~/.ansible/old-pass",
+  rekey_password_file = "~/.ansible/new-pass",
+})
+```
+
+```lua
+require("ansible-vault").setup({
+  vault_id = "old@~/.ansible/old-pass",
+  rekey_vault_id = "new@~/.ansible/new-pass",
+})
+```
 
 如果 `ansible-vault` 不在 `PATH` 中：
 
@@ -132,9 +173,25 @@ require("ansible-vault").setup({
 | `:VaultDecrypt` | 解密当前 buffer |
 | `:VaultView` | 在只读浮窗中查看解密内容 |
 | `:VaultEdit` | 在 scratch buffer 中编辑解密内容，`:write` 时重新加密保存 |
+| `:VaultRekey [args]` | 对当前加密文件执行 rekey |
 | `:VaultToggle` | 在加密/解密状态之间切换 |
 | `:VaultEncryptString` | 加密视觉选择的文本 |
+| `:VaultDecryptString` | 原地解密选中的 inline vault 字符串 |
 | `:VaultViewString` | 查看视觉选择中的 inline vault 字符串 |
+| `:VaultEncryptStringUnderCursor` | 加密光标所在 YAML value |
+| `:VaultViewStringUnderCursor` | 查看光标所在 inline vault block |
+| `:VaultDecryptStringUnderCursor` | 原地解密光标所在 inline vault block |
+
+## 健康检查
+
+执行：
+
+```vim
+:checkhealth ansible-vault
+```
+
+健康检查会验证 `ansible-vault` 可执行文件、password file 可读性和权限、
+vault ID label、`encrypt_vault_id` 以及 `VaultRekey` 目标配置。
 
 ## 使用方式
 
@@ -213,6 +270,72 @@ password: !vault |
 
 解密后的值会显示在只读浮窗中。按 `q` 或 `<Esc>` 关闭。
 
+### 原地解密 YAML inline vault 字符串
+
+选中 YAML vault block 后执行：
+
+```vim
+:VaultDecryptString
+```
+
+例如：
+
+```yaml
+password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          ...
+```
+
+会被替换为：
+
+```yaml
+password: secret
+```
+
+### 在光标下处理 inline vault 字符串
+
+当光标位于普通 YAML key/value 行时，执行：
+
+```vim
+:VaultEncryptStringUnderCursor
+```
+
+当光标位于 YAML `!vault |` block 上时，执行：
+
+```vim
+:VaultViewStringUnderCursor
+:VaultDecryptStringUnderCursor
+```
+
+插件会自动找到光标周围的 vault block，不需要手动选择整块内容。
+
+### Rekey 加密文件
+
+先配置 rekey 目标：
+
+```lua
+require("ansible-vault").setup({
+  password_file = "~/.ansible/old-pass",
+  rekey_password_file = "~/.ansible/new-pass",
+})
+```
+
+然后打开加密文件并执行：
+
+```vim
+:VaultRekey
+```
+
+也可以直接传入 Ansible Vault rekey 参数：
+
+```vim
+:VaultRekey --new-vault-password-file ~/.ansible/new-pass
+:VaultRekey --new-vault-id prod@~/.ansible/prod-pass
+```
+
+buffer 必须是文件型、已加密且没有未保存修改。rekey 成功后，插件会重新载入
+加密文件。
+
 ## 快捷键
 
 插件不会默认设置快捷键。你可以自行添加：
@@ -222,9 +345,13 @@ vim.keymap.set("n", "<leader>ve", "<cmd>VaultEncrypt<cr>", { desc = "Vault Encry
 vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decrypt" })
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
+vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
 vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>", { desc = "Vault Toggle" })
 vim.keymap.set("v", "<leader>vs", "<cmd>VaultEncryptString<cr>", { desc = "Vault Encrypt String" })
+vim.keymap.set("v", "<leader>vS", "<cmd>VaultDecryptString<cr>", { desc = "Vault Decrypt String" })
 vim.keymap.set("v", "<leader>vv", "<cmd>VaultViewString<cr>", { desc = "Vault View String" })
+vim.keymap.set("n", "<leader>vs", "<cmd>VaultEncryptStringUnderCursor<cr>", { desc = "Vault Encrypt String" })
+vim.keymap.set("n", "<leader>vS", "<cmd>VaultDecryptStringUnderCursor<cr>", { desc = "Vault Decrypt String" })
 ```
 
 ## Statusline 集成
@@ -258,9 +385,14 @@ vault.encrypt()
 vault.decrypt()
 vault.view()
 vault.edit()
+vault.rekey()
 vault.toggle()
 vault.encrypt_string()
+vault.decrypt_string()
 vault.view_string()
+vault.encrypt_string_under_cursor()
+vault.view_string_under_cursor()
+vault.decrypt_string_under_cursor()
 vault.status()
 ```
 
