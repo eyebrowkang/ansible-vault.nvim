@@ -19,8 +19,13 @@ jobs:
           version: latest
           args: --check .
 
-      - name: Install luarocks
-        uses: hishamhm/gh-actions-luarocks@v1
+      - name: Install Lua and Luarocks
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.1"
+
+      - name: Install Luarocks
+        uses: leafo/gh-actions-luarocks@v4
 
       - name: Install luacheck
         run: luarocks install luacheck
