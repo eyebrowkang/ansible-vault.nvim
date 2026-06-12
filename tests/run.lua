@@ -73,6 +73,11 @@ if [ -n "$FAKE_VAULT_LOG" ]; then
   done
 fi
 
+if [ -n "$FAKE_VAULT_FAIL" ]; then
+  printf 'fake vault error: %s\n' "$FAKE_VAULT_FAIL" >&2
+  exit 1
+fi
+
 action="$1"
 shift
 name="encrypted_string"
@@ -756,7 +761,6 @@ tests["under cursor commands encrypt view and decrypt YAML vault strings"] = fun
   end, "under-cursor vault view did not open")
 
   assert_eq(vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, -1, false), { "secret" })
-  vim.api.nvim_win_close(0, true)
 
   vim.api.nvim_set_current_buf(buf)
   vim.api.nvim_win_set_cursor(0, { 2, 10 })
@@ -807,6 +811,179 @@ tests["VaultRekey rekeys a file-backed encrypted buffer"] = function()
   assert_true(log_contains(fake.log, "ARG:--new-vault-password-file"), "new password file flag was not passed")
   assert_true(log_contains(fake.log, "ARG:" .. new_pass), "new password file path was not passed")
   assert_true(vault.is_buffer_encrypted(buf), "buffer was not reloaded as encrypted after rekey")
+end
+
+tests["B3 double VaultEdit on same file does not crash"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+  vim.env.FAKE_VAULT_SLEEP = "0.1"
+
+  local original_file = fake.dir .. "/double-edit.yml"
+  write_file(original_file, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
+
+  vim.cmd("edit " .. vim.fn.fnameescape(original_file))
+  local original_buf = vim.api.nvim_get_current_buf()
+
+  vault.edit(original_buf)
+  wait_until(function()
+    return vim.api.nvim_get_current_buf() ~= original_buf
+  end, "first VaultEdit did not open scratch buffer")
+
+  local edit_buf = vim.api.nvim_get_current_buf()
+  vim.cmd("split")
+  vault.edit(original_buf)
+
+  wait_until(function()
+    return notification_contains("buffer name conflict")
+  end, "second VaultEdit did not report name conflict")
+
+  vim.api.nvim_buf_delete(edit_buf, { force = true })
+  vim.cmd("only")
+  vim.env.FAKE_VAULT_SLEEP = nil
+end
+
+tests["B4 encrypt decrypt roundtrip preserves content structure"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local buf = new_buffer({ "line1", "line2", "" })
+  assert_eq(vim.api.nvim_buf_line_count(buf), 3, "buffer should have 3 lines including trailing empty")
+
+  vault.encrypt(buf)
+  wait_until(function()
+    return vault.is_buffer_encrypted(buf)
+  end, "encrypt did not finish")
+
+  vault.decrypt(buf)
+  wait_until(function()
+    return not vault.is_buffer_encrypted(buf)
+  end, "decrypt did not finish")
+
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  assert_true(#lines >= 1, "decrypted buffer should have content")
+  assert_false(vault.is_buffer_encrypted(buf), "buffer should not be encrypted after decrypt")
+end
+
+tests["B5 wrong password clears cache"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake, { password_file = false, password_cache_ttl = 60 })
+
+  local original_inputsecret = vim.fn.inputsecret
+  local prompt_count = 0
+  vim.fn.inputsecret = function()
+    prompt_count = prompt_count + 1
+    return "mypass"
+  end
+
+  vim.env.FAKE_VAULT_FAIL = "simulated password error"
+
+  local buf = new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
+  vault.decrypt(buf)
+  wait_until(function()
+    return notification_contains("Decryption failed")
+  end, "decrypt with wrong password did not fail")
+
+  vim.env.FAKE_VAULT_FAIL = nil
+  vault.decrypt(buf)
+  wait_until(function()
+    return not vault.is_buffer_encrypted(buf)
+  end, "decrypt with correct password did not succeed")
+
+  vim.fn.inputsecret = original_inputsecret
+  assert_eq(prompt_count, 2, "password should have been re-prompted after failure")
+end
+
+tests["B6 encrypt string ignores YAML comments"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local buf = new_buffer({ 'password: "secret" # prod' })
+  vim.fn.setpos("'<", { 0, 1, 1, 0 })
+  vim.fn.setpos("'>", { 0, 1, #'password: "secret" # prod', 0 })
+
+  vault.encrypt_string()
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
+  end, "YAML value with comment was not encrypted")
+end
+
+tests["B6 decrypt string quotes YAML special values"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local function quote(s)
+    return vault._private.yaml_quote_value(s)
+  end
+
+  assert_eq(quote("yes"), '"yes"', "boolean 'yes' should be quoted")
+  assert_eq(quote("no"), '"no"', "boolean 'no' should be quoted")
+  assert_eq(quote("true"), '"true"', "boolean 'true' should be quoted")
+  assert_eq(quote("false"), '"false"', "boolean 'false' should be quoted")
+  assert_eq(quote("null"), '"null"', "null should be quoted")
+  assert_eq(quote("on"), '"on"', "boolean 'on' should be quoted")
+  assert_eq(quote("off"), '"off"', "boolean 'off' should be quoted")
+  assert_eq(quote("# comment"), '"# comment"', "hash-prefixed should be quoted")
+  assert_eq(quote("[list]"), '"[list]"', "bracket-prefixed should be quoted")
+  assert_eq(quote("normal"), "normal", "normal value should not be quoted")
+  assert_eq(quote(""), '""', "empty should be quoted")
+end
+
+tests["B7 find vault block beyond 100 lines"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local lines = {}
+  table.insert(lines, "password: !vault |")
+  table.insert(lines, "          $ANSIBLE_VAULT;1.1;AES256")
+  for i = 1, 120 do
+    table.insert(lines, "          " .. string.rep("A", 60))
+  end
+  table.insert(lines, "          ENCSTR:verylongvalue")
+  table.insert(lines, "other: value")
+
+  local buf = new_buffer(lines)
+  local cursor_row = #lines - 1
+  vim.api.nvim_win_set_cursor(0, { cursor_row, 30 })
+
+  vault.view_string_under_cursor()
+
+  wait_until(function()
+    return vim.api.nvim_get_current_buf() ~= buf
+  end, "under-cursor vault view did not open for block > 100 lines")
+
+  assert_true(vim.api.nvim_get_current_buf() ~= buf, "view window should be open")
+  vim.api.nvim_win_close(0, true)
+end
+
+tests["B8 re-setup clears previous config"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake, { encrypt_vault_id = "prod" })
+  assert_eq(vault.config.encrypt_vault_id, "prod")
+
+  vault.setup({})
+  assert_eq(vault.config.encrypt_vault_id, nil, "encrypt_vault_id should reset to nil on re-setup")
+  assert_eq(vault.config.notify_success, true, "default value should be restored")
+end
+
+tests["B9 command args support quoted paths with spaces"] = function()
+  local fake = create_fake_vault()
+  local pass_path = fake.dir .. "/path with spaces/vault pass"
+  vim.fn.mkdir(fake.dir .. "/path with spaces", "p")
+  write_file(pass_path, "secret\n")
+  vim.fn.setfperm(pass_path, "rw-------")
+  reset_config(fake, { password_file = false })
+
+  new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
+  local cmd = "VaultView --vault-password-file '" .. pass_path .. "'"
+  vim.cmd(cmd)
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, 1, false)[1] == "plain: old"
+  end, "VaultView with quoted path did not finish")
+
+  assert_true(log_contains(fake.log, "ARG:" .. pass_path), "quoted path was not passed as one arg")
+  vim.api.nvim_win_close(0, true)
 end
 
 tests["health check runs"] = function()
