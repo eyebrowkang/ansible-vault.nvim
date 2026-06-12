@@ -994,12 +994,24 @@ local function get_selection(buf, range_opts)
 
   local has_range = range_opts and range_opts.range and range_opts.range > 0
   if has_range then
-    start_row = range_opts.line1
-    end_row = range_opts.line2
-    start_col = 1
-    local last_line = vim.api.nvim_buf_get_lines(buf, end_row - 1, end_row, false)[1] or ""
-    end_col = #last_line
-    range_linewise = true
+    local start_pos = vim.fn.getpos("'<")
+    local end_pos = vim.fn.getpos("'>")
+    local mark_start_row = start_pos[2]
+    local mark_end_row = end_pos[2]
+    local marks_match = mark_start_row == range_opts.line1 and mark_end_row == range_opts.line2
+    if marks_match then
+      start_row = mark_start_row
+      start_col = start_pos[3]
+      end_row = mark_end_row
+      end_col = end_pos[3]
+    else
+      start_row = range_opts.line1
+      end_row = range_opts.line2
+      start_col = 1
+      local last_line = vim.api.nvim_buf_get_lines(buf, end_row - 1, end_row, false)[1] or ""
+      end_col = #last_line
+      range_linewise = true
+    end
   else
     local current_mode = vim.api.nvim_get_mode().mode
     local in_visual = current_mode == "v" or current_mode == "V" or current_mode == "\22"
