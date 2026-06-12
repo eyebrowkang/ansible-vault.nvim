@@ -15,7 +15,7 @@ local function fail(message)
   error(message, 2)
 end
 
-local function assert_eq(actual, expected, message)
+local function assert_eq(actual, expected, message) -- luacheck: ignore 211
   if not vim.deep_equal(actual, expected) then
     fail(
       string.format(

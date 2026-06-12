@@ -1126,7 +1126,7 @@ end
 local function get_plain_yaml_value_under_cursor(buf)
   local row = vim.api.nvim_win_get_cursor(0)[1]
   local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
-  local indent, key, rest = line:match("^(%s*)([%w_.%-]+):%s*(.*)$")
+  local _, key, rest = line:match("^(%s*)([%w_.%-]+):%s*(.*)$")
   if not key then
     return nil
   end
@@ -1779,8 +1779,8 @@ parse_vault_from_yaml = function(content)
     local min_indent = math.huge
     for _, line in ipairs(vault_lines) do
       if line:match("%S") then
-        local indent = #(line:match("^(%s*)") or "")
-        min_indent = math.min(min_indent, indent)
+        local cur_indent = line_indent(line)
+        min_indent = math.min(min_indent, cur_indent)
       end
     end
 
@@ -1805,8 +1805,8 @@ parse_vault_from_yaml = function(content)
     local min_indent = math.huge
     for _, line in ipairs(lines) do
       if line:match("%S") then
-        local indent = #(line:match("^(%s*)") or "")
-        min_indent = math.min(min_indent, indent)
+        local cur_indent = line_indent(line)
+        min_indent = math.min(min_indent, cur_indent)
       end
     end
 
