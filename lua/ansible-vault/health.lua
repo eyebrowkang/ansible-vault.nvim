@@ -77,7 +77,9 @@ local function check_vault_ids(config)
   end
 
   if is_nonempty_string(config.encrypt_vault_id) and next(labels) ~= nil and not labels[config.encrypt_vault_id] then
-    health.warn(string.format("encrypt_vault_id '%s' does not match configured vault_id labels", config.encrypt_vault_id))
+    health.warn(
+      string.format("encrypt_vault_id '%s' does not match configured vault_id labels", config.encrypt_vault_id)
+    )
   end
 end
 
@@ -107,7 +109,9 @@ function M.check()
     end
   else
     check_vault_ids(config)
-    if not is_nonempty_string(config.vault_id) and not (type(config.vault_ids) == "table" and #config.vault_ids > 0) then
+    if
+      not is_nonempty_string(config.vault_id) and not (type(config.vault_ids) == "table" and #config.vault_ids > 0)
+    then
       health.warn("No password_file or vault_id configured; commands will prompt for a password")
     end
   end

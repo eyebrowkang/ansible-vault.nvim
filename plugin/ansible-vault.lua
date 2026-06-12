@@ -128,10 +128,7 @@ end, {
 
 vim.api.nvim_create_user_command("VaultEncryptString", function(cmd_opts)
   local vault = ensure_setup()
-  vault.encrypt_string(
-    cmd_opts,
-    vault._parse_command_options(cmd_opts.args, { label_shortcut = true })
-  )
+  vault.encrypt_string(cmd_opts, vault._parse_command_options(cmd_opts.args, { label_shortcut = true }))
 end, {
   range = true,
   nargs = "*",
@@ -164,9 +161,7 @@ end, {
 
 vim.api.nvim_create_user_command("VaultEncryptStringUnderCursor", function(cmd_opts)
   local vault = ensure_setup()
-  vault.encrypt_string_under_cursor(
-    vault._parse_command_options(cmd_opts.args, { label_shortcut = true })
-  )
+  vault.encrypt_string_under_cursor(vault._parse_command_options(cmd_opts.args, { label_shortcut = true }))
 end, {
   nargs = "*",
   complete = comp_opts_labels,

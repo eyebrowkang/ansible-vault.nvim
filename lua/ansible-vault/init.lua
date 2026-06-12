@@ -311,9 +311,11 @@ local function get_password_args(callback, opts)
     return
   end
 
-  if should_cache_password(config.password_cache_ttl)
-      and password_cache.password
-      and password_cache.expires_at > now_seconds() then
+  if
+    should_cache_password(config.password_cache_ttl)
+    and password_cache.password
+    and password_cache.expires_at > now_seconds()
+  then
     local tmpfile, err = write_secure_tempfile(password_cache.password .. "\n")
     if not tmpfile then
       vim.notify("Failed to create temp password file: " .. err, vim.log.levels.ERROR)
@@ -2391,12 +2393,9 @@ function M.get_info(buf, opts)
     "Credential source: " .. describe_password_source(config),
     "Vault labels: " .. describe_vault_labels(config),
     "Encrypt vault ID: " .. (is_nonempty_string(config.encrypt_vault_id) and config.encrypt_vault_id or "default"),
-    "Rekey target: "
-      .. (
-        is_nonempty_string(config.rekey_password_file) and "password_file"
-        or is_nonempty_string(config.rekey_vault_id) and "vault_id"
-        or "command args"
-      ),
+    "Rekey target: " .. (is_nonempty_string(config.rekey_password_file) and "password_file" or is_nonempty_string(
+      config.rekey_vault_id
+    ) and "vault_id" or "command args"),
     "",
     "Auto detect: " .. yes_no(config.auto_detect ~= false),
     "Auto edit: " .. yes_no(config.auto_edit == true),
@@ -2637,8 +2636,10 @@ function M.setup(opts)
           return
         end
 
-        if suppress_auto_edit_path
-            and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(event.buf), ":p") == suppress_auto_edit_path then
+        if
+          suppress_auto_edit_path
+          and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(event.buf), ":p") == suppress_auto_edit_path
+        then
           suppress_auto_edit_path = nil
           return
         end

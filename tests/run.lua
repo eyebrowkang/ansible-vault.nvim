@@ -13,12 +13,14 @@ end
 
 local function assert_eq(actual, expected, message)
   if not vim.deep_equal(actual, expected) then
-    fail(string.format(
-      "%s\nexpected: %s\nactual:   %s",
-      message or "values are not equal",
-      vim.inspect(expected),
-      vim.inspect(actual)
-    ))
+    fail(
+      string.format(
+        "%s\nexpected: %s\nactual:   %s",
+        message or "values are not equal",
+        vim.inspect(expected),
+        vim.inspect(actual)
+      )
+    )
   end
 end
 
@@ -64,7 +66,9 @@ local function create_fake_vault()
   local path = dir .. "/fake vault"
   local log = dir .. "/vault.log"
 
-  write_file(path, [=[
+  write_file(
+    path,
+    [=[
 #!/bin/sh
 if [ -n "$FAKE_VAULT_LOG" ]; then
   printf 'CALL\n' >> "$FAKE_VAULT_LOG"
@@ -133,7 +137,8 @@ case "$action" in
     exit 2
     ;;
 esac
-]=])
+]=]
+  )
   vim.fn.setfperm(path, "rwx------")
 
   return {
@@ -259,7 +264,11 @@ tests["async encrypt writes back to the original buffer"] = function()
     return vim.api.nvim_buf_get_lines(first, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
   end, "original buffer was not encrypted")
 
-  assert_eq(vim.api.nvim_buf_get_lines(second, 0, -1, false), { "second" }, "current buffer was modified by async callback")
+  assert_eq(
+    vim.api.nvim_buf_get_lines(second, 0, -1, false),
+    { "second" },
+    "current buffer was modified by async callback"
+  )
 end
 
 tests["async encrypt does not clobber a changed buffer"] = function()
@@ -349,7 +358,11 @@ tests["setup clears autodetect autocmd when disabled"] = function()
   local fake = create_fake_vault()
   reset_config(fake, { auto_detect = true })
   reset_config(fake, { auto_detect = false })
-  assert_eq(#vim.api.nvim_get_autocmds({ group = "AnsibleVault", event = "BufReadPost" }), 0, "autodetect autocmd was not cleared")
+  assert_eq(
+    #vim.api.nvim_get_autocmds({ group = "AnsibleVault", event = "BufReadPost" }),
+    0,
+    "autodetect autocmd was not cleared"
+  )
 end
 
 tests["VaultEdit uses a no-swap acwrite buffer and saves atomically"] = function()
@@ -516,10 +529,7 @@ tests["command completion exposes override flags and inline labels"] = function(
 
   local flag_completion = vim.fn.getcompletion("VaultEdit --vault", "cmdline")
   assert_true(vim.tbl_contains(flag_completion, "--vault-id"), "vault-id flag was not completed")
-  assert_true(
-    vim.tbl_contains(flag_completion, "--vault-password-file"),
-    "vault-password-file flag was not completed"
-  )
+  assert_true(vim.tbl_contains(flag_completion, "--vault-password-file"), "vault-password-file flag was not completed")
 end
 
 tests["interactive password cache avoids repeated prompts"] = function()
@@ -668,7 +678,8 @@ tests["auto_edit opens encrypted files in a scratch buffer"] = function()
   local original_buf = vim.api.nvim_get_current_buf()
 
   wait_until(function()
-    return vim.api.nvim_get_current_buf() ~= original_buf and vim.bo[vim.api.nvim_get_current_buf()].buftype == "acwrite"
+    return vim.api.nvim_get_current_buf() ~= original_buf
+      and vim.bo[vim.api.nvim_get_current_buf()].buftype == "acwrite"
   end, "auto_edit did not open VaultEdit scratch buffer")
 
   vim.api.nvim_buf_delete(vim.api.nvim_get_current_buf(), { force = true })
@@ -727,9 +738,11 @@ tests["VaultFiles edit suppresses auto_edit duplicate scratch buffers"] = functi
 
   local scratch_count = 0
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_loaded(buf)
-        and vim.bo[buf].buftype == "acwrite"
-        and vim.api.nvim_buf_get_name(buf):find("picked.yml", 1, true) then
+    if
+      vim.api.nvim_buf_is_loaded(buf)
+      and vim.bo[buf].buftype == "acwrite"
+      and vim.api.nvim_buf_get_name(buf):find("picked.yml", 1, true)
+    then
       scratch_count = scratch_count + 1
     end
   end

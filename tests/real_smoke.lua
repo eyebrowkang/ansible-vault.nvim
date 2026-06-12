@@ -17,12 +17,14 @@ end
 
 local function assert_eq(actual, expected, message)
   if not vim.deep_equal(actual, expected) then
-    fail(string.format(
-      "%s\nexpected: %s\nactual:   %s",
-      message or "values are not equal",
-      vim.inspect(expected),
-      vim.inspect(actual)
-    ))
+    fail(
+      string.format(
+        "%s\nexpected: %s\nactual:   %s",
+        message or "values are not equal",
+        vim.inspect(expected),
+        vim.inspect(actual)
+      )
+    )
   end
 end
 
