@@ -106,6 +106,9 @@ fi
 if [ -n "$FAKE_VAULT_SLEEP" ]; then
   sleep "$FAKE_VAULT_SLEEP"
 fi
+if [ -n "$FAKE_VAULT_STDIN_LOG" ]; then
+  printf '%s' "$input" > "$FAKE_VAULT_STDIN_LOG"
+fi
 
 case "$action" in
   encrypt)
@@ -160,7 +163,9 @@ end
 local function reset_config(fake, opts)
   notifications = {}
   vim.env.FAKE_VAULT_LOG = fake.log
+  vim.env.FAKE_VAULT_FAIL = nil
   vim.env.FAKE_VAULT_SLEEP = nil
+  vim.env.FAKE_VAULT_STDIN_LOG = nil
 
   vault.config.password_file = nil
   vault.config.vault_id = nil
@@ -426,6 +431,7 @@ tests["VaultEdit refuses to overwrite externally changed files"] = function()
   end, "VaultEdit did not detect the external file change")
 
   assert_true(vim.api.nvim_buf_is_valid(edit_buf), "edit buffer should remain open after a refused save")
+  assert_true(vim.bo[edit_buf].modified, "edit buffer should remain modified after a refused save")
   assert_true(read_file(original_file):find("EXTERNAL CHANGE", 1, true), "external file content was overwritten")
   vim.api.nvim_buf_delete(edit_buf, { force = true })
 end
@@ -909,16 +915,47 @@ end
 tests["B6 encrypt string ignores YAML comments"] = function()
   local fake = create_fake_vault()
   reset_config(fake)
+  local stdin_log = fake.dir .. "/stdin.log"
+  vim.env.FAKE_VAULT_STDIN_LOG = stdin_log
 
-  local buf = new_buffer({ 'password: "secret" # prod' })
+  local buf = new_buffer({ 'password: "sec#ret" # prod' })
   vim.fn.setpos("'<", { 0, 1, 1, 0 })
-  vim.fn.setpos("'>", { 0, 1, #'password: "secret" # prod', 0 })
+  vim.fn.setpos("'>", { 0, 1, #'password: "sec#ret" # prod', 0 })
 
   vault.encrypt_string()
 
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
   end, "YAML value with comment was not encrypted")
+
+  assert_eq(read_file(stdin_log), "sec#ret", "YAML comments or quoted # were included in the encrypted value")
+end
+
+tests["B11 blockwise string encryption preserves unselected columns"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+  local stdin_log = fake.dir .. "/stdin.log"
+  vim.env.FAKE_VAULT_STDIN_LOG = stdin_log
+
+  local buf = new_buffer({ "abcdef", "ghijkl", "mnopqr" })
+  local ctrl_v = vim.api.nvim_replace_termcodes("<C-v>", true, false, true)
+  vim.cmd("normal! gg0l" .. ctrl_v .. "jjll")
+  vim.cmd("normal! \27")
+  vim.fn.setpos("'<", { 0, 1, 2, 0 })
+  vim.fn.setpos("'>", { 0, 3, 4, 0 })
+
+  vault.encrypt_string({ line1 = 1, line2 = 3, range = 3 })
+
+  wait_until(function()
+    return vim.b[buf].ansible_vault_pending == nil
+  end, "blockwise string encryption did not finish")
+
+  assert_eq(read_file(stdin_log), "bcd\nhij\nnop", "blockwise selection did not send the selected rectangle")
+
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  assert_eq(lines[1], "aencrypted_string: !vault |ef", "first blockwise line did not preserve outside columns")
+  assert_eq(lines[2], "g          $ANSIBLE_VAULT;1.1;AES256kl", "middle blockwise line lost outside columns")
+  assert_eq(lines[3], "m          ENCSTR:bcdqr", "last selected blockwise line lost outside columns")
 end
 
 tests["B6 decrypt string quotes YAML special values"] = function()

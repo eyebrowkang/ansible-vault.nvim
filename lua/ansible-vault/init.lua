@@ -984,6 +984,7 @@ end
 ---@field end_col integer
 ---@field lines string[]
 ---@field linewise boolean
+---@field blockwise boolean
 
 ---@param buf integer
 ---@param range_opts? table
@@ -1063,6 +1064,7 @@ local function get_selection(buf, range_opts)
   local visual_mode = vim.fn.visualmode()
   local linewise = range_linewise or visual_mode == "V"
   local blockwise = visual_mode == "\22"
+  local lines
 
   if blockwise then
     lines = {}
@@ -1086,6 +1088,8 @@ local function get_selection(buf, range_opts)
     if #lines == 0 then
       return nil
     end
+    start_col = 1
+    end_col = #lines[#lines]
   end
 
   return {
@@ -1095,6 +1099,7 @@ local function get_selection(buf, range_opts)
     end_col = end_col,
     lines = lines,
     linewise = linewise,
+    blockwise = blockwise,
   }
 end
 
@@ -1132,8 +1137,62 @@ local function line_indent(line)
   return #(line:match("^(%s*)") or "")
 end
 
----@param buf integer
----@return AnsibleVaultSelection|nil
+---@param line string
+---@return string
+local function strip_yaml_comment(line)
+  local quote = nil
+  local escaped = false
+
+  for i = 1, #line do
+    local char = line:sub(i, i)
+
+    if quote then
+      if quote == '"' and char == "\\" and not escaped then
+        escaped = true
+      else
+        if char == quote and not escaped then
+          quote = nil
+        end
+        escaped = false
+      end
+    elseif char == "'" or char == '"' then
+      quote = char
+    elseif char == "#" and (i == 1 or line:sub(i - 1, i - 1):match("%s")) then
+      return line:sub(1, i - 1)
+    end
+  end
+
+  return line
+end
+
+---@param value string
+---@return string
+local function unquote_yaml_value(value)
+  local quote = value:match("^(['\"])")
+  if not quote then
+    return value
+  end
+
+  local escaped = false
+  for i = 2, #value do
+    local char = value:sub(i, i)
+    if quote == '"' and char == "\\" and not escaped then
+      escaped = true
+    else
+      if char == quote and not escaped then
+        local result = value:sub(2, i - 1)
+        if quote == '"' then
+          result = result:gsub('\\"', '"'):gsub("\\\\", "\\")
+        end
+        return result
+      end
+      escaped = false
+    end
+  end
+
+  return value:sub(2)
+end
+
 ---@param line string
 ---@return string|nil indent
 ---@return string|nil key
@@ -1146,27 +1205,12 @@ local function extract_yaml_key_value(line)
   if rest == "" or rest:match("^!vault") then
     return indent, key, nil
   end
-  rest = rest:gsub("%s*#.*$", "")
+  rest = strip_yaml_comment(rest)
   rest = rest:gsub("%s+$", "")
   if rest == "" then
     return indent, key, ""
   end
-  local quote_char = rest:match("^(['\"])")
-  local value
-  if quote_char then
-    local end_quote = rest:find(quote_char, 2, true)
-    if end_quote then
-      value = rest:sub(2, end_quote - 1)
-    else
-      value = rest:sub(2)
-    end
-  else
-    value = rest:match("^([^#%s]+)")
-    if not value then
-      return indent, key, rest
-    end
-  end
-  return indent, key, value
+  return indent, key, unquote_yaml_value(rest)
 end
 
 ---@param buf integer
@@ -1311,6 +1355,41 @@ end
 
 ---@param buf integer
 ---@param selection AnsibleVaultSelection
+---@param replacement string[]
+local function replace_selection_text(buf, selection, replacement)
+  if not selection.blockwise then
+    return pcall(
+      vim.api.nvim_buf_set_text,
+      buf,
+      selection.start_row,
+      selection.start_col,
+      selection.end_row,
+      selection.end_col,
+      replacement
+    )
+  end
+
+  local selected_row_count = selection.end_row - selection.start_row + 1
+  local original_lines = vim.api.nvim_buf_get_lines(buf, selection.start_row, selection.end_row + 1, false)
+  local new_lines = {}
+  local line_count = math.max(selected_row_count, #replacement)
+
+  for i = 1, line_count do
+    local original = original_lines[i]
+    if original then
+      local prefix = original:sub(1, selection.start_col)
+      local suffix = original:sub(selection.end_col + 1)
+      table.insert(new_lines, prefix .. (replacement[i] or "") .. suffix)
+    else
+      table.insert(new_lines, replacement[i] or "")
+    end
+  end
+
+  return pcall(vim.api.nvim_buf_set_lines, buf, selection.start_row, selection.end_row + 1, false, new_lines)
+end
+
+---@param buf integer
+---@param selection AnsibleVaultSelection
 ---@param opts? table
 local function encrypt_string_selection(buf, selection, opts)
   if not selection or #selection.lines == 0 then
@@ -1366,15 +1445,7 @@ local function encrypt_string_selection(buf, selection, opts)
         return
       end
 
-      local ok, err = pcall(
-        vim.api.nvim_buf_set_text,
-        buf,
-        plan.start_row,
-        plan.start_col,
-        plan.end_row,
-        plan.end_col,
-        format_encrypt_string_output(output, plan)
-      )
+      local ok, err = replace_selection_text(buf, selection, format_encrypt_string_output(output, plan))
 
       if ok then
         notify("String encrypted successfully", vim.log.levels.INFO, opts)
