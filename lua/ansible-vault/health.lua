@@ -84,7 +84,26 @@ local function check_vault_ids(config)
 end
 
 function M.check()
-  health.start("ansible-vault.nvim")
+  local legacy = vim.fn.has("nvim-0.10") == 0
+  if legacy then
+    health = {
+      ok = function(msg)
+        print("  - OK: " .. msg)
+      end,
+      warn = function(msg)
+        print("  - WARN: " .. msg)
+      end,
+      error = function(msg)
+        print("  - ERROR: " .. msg)
+      end,
+      info = function(msg)
+        print("  - INFO: " .. msg)
+      end,
+    }
+    print("ansible-vault.nvim health check:")
+  else
+    health.start("ansible-vault.nvim")
+  end
 
   local argv = vault._private.get_vault_argv()
   local executable = argv[1]
