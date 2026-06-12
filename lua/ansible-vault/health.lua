@@ -77,12 +77,33 @@ local function check_vault_ids(config)
   end
 
   if is_nonempty_string(config.encrypt_vault_id) and next(labels) ~= nil and not labels[config.encrypt_vault_id] then
-    health.warn(string.format("encrypt_vault_id '%s' does not match configured vault_id labels", config.encrypt_vault_id))
+    health.warn(
+      string.format("encrypt_vault_id '%s' does not match configured vault_id labels", config.encrypt_vault_id)
+    )
   end
 end
 
 function M.check()
-  health.start("ansible-vault.nvim")
+  local legacy = vim.fn.has("nvim-0.10") == 0
+  if legacy then
+    health = {
+      ok = function(msg)
+        print("  - OK: " .. msg)
+      end,
+      warn = function(msg)
+        print("  - WARN: " .. msg)
+      end,
+      error = function(msg)
+        print("  - ERROR: " .. msg)
+      end,
+      info = function(msg)
+        print("  - INFO: " .. msg)
+      end,
+    }
+    print("ansible-vault.nvim health check:")
+  else
+    health.start("ansible-vault.nvim")
+  end
 
   local argv = vault._private.get_vault_argv()
   local executable = argv[1]
@@ -107,7 +128,9 @@ function M.check()
     end
   else
     check_vault_ids(config)
-    if not is_nonempty_string(config.vault_id) and not (type(config.vault_ids) == "table" and #config.vault_ids > 0) then
+    if
+      not is_nonempty_string(config.vault_id) and not (type(config.vault_ids) == "table" and #config.vault_ids > 0)
+    then
       health.warn("No password_file or vault_id configured; commands will prompt for a password")
     end
   end

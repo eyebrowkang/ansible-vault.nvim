@@ -1,0 +1,460 @@
+*ansible-vault.nvim*  Encrypt and decrypt files with Ansible Vault in Neovim.
+
+Author: eyebrowkang
+License: MIT
+
+==============================================================================
+TABLE OF CONTENTS                                   *ansible-vault-contents*
+
+1. Introduction ....................... |ansible-vault-intro|
+2. Requirements ....................... |ansible-vault-requirements|
+3. Commands .......................... |ansible-vault-commands|
+4. Configuration ...................... |ansible-vault-config|
+5. Password Sources ................... |ansible-vault-passwords|
+6. API ................................ |ansible-vault-api|
+7. User Events ........................ |ansible-vault-events|
+8. Security ........................... |ansible-vault-security|
+9. Health Check ....................... |ansible-vault-health|
+10. Statusline Integration ............ |ansible-vault-statusline|
+
+==============================================================================
+1. INTRODUCTION                                     *ansible-vault-intro*
+
+ansible-vault.nvim is a Neovim plugin for encrypting and decrypting
+files using the `ansible-vault` command-line tool. It supports:
+
+- Encrypt/decrypt entire buffers
+- View encrypted content in floating windows
+- Encrypt selected text as inline YAML vault strings
+- Auto-detect vault-encrypted files
+- Safe editing via scratch buffers (VaultEdit)
+- Rekey encrypted files
+- Diff decrypted vault content
+- Pick vault files with Telescope or built-in picker
+- Interactive password input with optional in-memory caching
+- Command-line credential overrides with completion
+
+==============================================================================
+2. REQUIREMENTS                               *ansible-vault-requirements*
+
+- Neovim >= 0.9.0
+- `ansible-vault` command available in PATH or via conda environment
+
+==============================================================================
+3. COMMANDS                                       *ansible-vault-commands*
+
+All commands accept optional vault credential overrides as arguments.
+
+                                                 *:VaultEncrypt*
+:VaultEncrypt [args]
+    Encrypt the current buffer with ansible-vault. The buffer content
+    is replaced with ciphertext. Use `:write` to persist.
+
+                                                 *:VaultDecrypt*
+:VaultDecrypt [args]
+    Decrypt the current encrypted buffer in place.
+
+                                                 *:VaultView*
+:VaultView [args]
+    View the decrypted content of an encrypted buffer in a read-only
+    floating window. Press `q` or `<Esc>` to close.
+
+                                                 *:VaultEdit*
+:VaultEdit [args]
+    Edit an encrypted file in a secure scratch buffer. The scratch
+    buffer has `swapfile` and `undofile` disabled. On `:write`, the
+    content is encrypted and atomically written back to the original
+    file.
+
+                                                 *:VaultToggle*
+:VaultToggle [args]
+    Toggle between encrypted and decrypted state. If the buffer is
+    encrypted, decrypts it; if plain, encrypts it.
+
+                                                 *:VaultClearPasswordCache*
+:VaultClearPasswordCache
+    Clear the in-memory interactive password cache.
+
+                                                 *:VaultDiff*
+:VaultDiff {file}
+:VaultDiff --git [ref]
+    Diff the decrypted current buffer against another vault file or a
+    Git revision. Both sides are decrypted before diffing.
+
+                                                 *:VaultFiles*
+:VaultFiles [view|edit|rekey]
+    Scan the current working directory for Ansible Vault files and
+    open the selected file in view, edit, or rekey mode.
+
+                                                 *:VaultInfo*
+:VaultInfo [args]
+    Show the current buffer state and plugin configuration in a
+    floating window.
+
+                                                 *:VaultRekey*
+:VaultRekey [args]
+    Rekey the current file-backed encrypted buffer. Requires
+    `rekey_password_file`, `rekey_vault_id`, or command args.
+
+                                                 *:VaultEncryptString*
+:[range]VaultEncryptString [args]
+    Encrypt the selected text as an inline YAML vault string. When
+    a full YAML key/value line is selected, the key is preserved.
+
+                                                 *:VaultDecryptString*
+:[range]VaultDecryptString [args]
+    Decrypt a selected inline YAML vault string in place.
+
+                                                 *:VaultViewString*
+:[range]VaultViewString [args]
+    View a selected inline YAML vault string in a floating window.
+
+                                             *:VaultEncryptStringUnderCursor*
+:VaultEncryptStringUnderCursor [args]
+    Encrypt the YAML value under the cursor without making a visual
+    selection.
+
+                                             *:VaultViewStringUnderCursor*
+:VaultViewStringUnderCursor [args]
+    View the inline vault block under the cursor.
+
+                                           *:VaultDecryptStringUnderCursor*
+:VaultDecryptStringUnderCursor [args]
+    Decrypt the inline vault block under the cursor in place.
+
+> Note: For visual mode keymaps mapping to the range-accepting commands,
+  use `:` (colon) form, e.g. `:VaultEncryptString<cr>`, not `<cmd>`
+  form. This ensures the correct visual range is passed. See
+  |ansible-vault-keymaps|.
+
+                                                *ansible-vault-command-args*
+Supported command-line arguments (can be passed to any vault command):
+
+    `--vault-password-file <path>` or `--vault-pass-file <path>`
+        Override `password_file` for this operation.
+
+    `--vault-id <id>`
+        Override vault IDs for this operation. Can be repeated.
+
+    `--encrypt-vault-id <label>`
+        Override `encrypt_vault_id` for this operation.
+
+    `--new-vault-password-file <path>`  (VaultRekey only)
+    `--new-vault-id <id>`               (VaultRekey only)
+
+    Quoted arguments are supported for paths with spaces, e.g.
+    `:VaultView --vault-password-file '/path with spaces/pass'`
+
+    Encrypt-string commands also support bare label shortcuts:
+    `:VaultEncryptString prod`
+
+                                                *ansible-vault-keymaps*
+Suggested keymaps (not set by the plugin): >
+
+    vim.keymap.set("n", "<leader>ve", "<cmd>VaultEncrypt<cr>")
+    vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>")
+    vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>")
+    vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>")
+    vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>")
+    vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>")
+    vim.keymap.set("n", "<leader>vf", "<cmd>VaultFiles view<cr>")
+    vim.keymap.set("v", "<leader>vs", ":VaultEncryptString<cr>", {silent=true})
+    vim.keymap.set("v", "<leader>vS", ":VaultDecryptString<cr>", {silent=true})
+    vim.keymap.set("v", "<leader>vv", ":VaultViewString<cr>", {silent=true})
+    vim.keymap.set("n", "<leader>vs", "<cmd>VaultEncryptStringUnderCursor<cr>")
+    vim.keymap.set("n", "<leader>vS", "<cmd>VaultDecryptStringUnderCursor<cr>")
+<
+Note: Visual mode mappings use `:` form (not `<cmd>`) so that the
+current visual range is correctly passed to the command.
+
+==============================================================================
+4. CONFIGURATION                                 *ansible-vault-config*
+
+Call |ansible-vault.setup()| with your settings: >
+
+    require("ansible-vault").setup({
+      password_file = "~/.vault_pass",
+      vault_id = nil,
+      vault_ids = nil,
+      encrypt_vault_id = nil,
+      rekey_password_file = nil,
+      rekey_vault_id = nil,
+      auto_detect = true,
+      auto_edit = false,
+      password_cache_ttl = 0,
+      picker = "auto",
+      timeout_ms = 30000,
+      notify_success = true,
+      conda_env = nil,
+      ansible_vault_path = nil,
+      debug = false,
+    })
+<
+                                                 *ansible-vault-config-password_file*
+`password_file` ~
+    Path to the ansible-vault password file. Expanded with
+    |expand()|.
+
+                                                 *ansible-vault-config-vault_id*
+`vault_id` ~
+    Single vault ID, e.g. `"prod@~/.vault_pass"`. The source
+    path is expanded. Not used when `vault_ids` is set.
+
+                                                 *ansible-vault-config-vault_ids*
+`vault_ids` ~
+    Multiple vault IDs as a list. Takes precedence over `vault_id`.
+
+                                                 *ansible-vault-config-encrypt_vault_id*
+`encrypt_vault_id` ~
+    Vault ID label to use when encrypting. Passed as
+    `--encrypt-vault-id`. If `nil`, let ansible-vault choose.
+
+                                                 *ansible-vault-config-rekey_password_file*
+`rekey_password_file` ~
+    New password file target for |:VaultRekey|.
+
+                                                 *ansible-vault-config-rekey_vault_id*
+`rekey_vault_id` ~
+    New vault ID target for |:VaultRekey|.
+
+                                                 *ansible-vault-config-auto_detect*
+`auto_detect` ~
+    (boolean, default `true`)
+    Automatically detect vault-encrypted files on |BufReadPost|
+    and set `vim.b.ansible_vault_encrypted`.
+
+                                                 *ansible-vault-config-auto_edit*
+`auto_edit` ~
+    (boolean, default `false`)
+    Automatically open encrypted files with |:VaultEdit| after
+    |BufReadPost|.
+
+                                                 *ansible-vault-config-password_cache_ttl*
+`password_cache_ttl` ~
+    (number, default `0`)
+    Cache interactive passwords in Neovim memory for N seconds.
+    Set to `0` to prompt for every operation. Clear with
+    |:VaultClearPasswordCache|.
+
+                                                 *ansible-vault-config-picker*
+`picker` ~
+    (`"auto"`, `"telescope"`, or `"builtin"`, default `"auto"`)
+    Picker backend for |:VaultFiles|.
+
+                                                 *ansible-vault-config-timeout_ms*
+`timeout_ms` ~
+    (number, default `30000`)
+    Timeout in milliseconds for `ansible-vault` jobs. Set
+    to `0` to disable.
+
+                                                 *ansible-vault-config-notify_success*
+`notify_success` ~
+    (boolean, default `true`)
+    Show success/info notifications. Errors and warnings are
+    always shown.
+
+                                                 *ansible-vault-config-conda_env*
+`conda_env` ~
+    Conda environment name where `ansible-vault` is installed.
+    The plugin runs `conda run -n <env> ansible-vault ...`.
+
+                                                 *ansible-vault-config-ansible_vault_path*
+`ansible_vault_path` ~
+    Custom path to the `ansible-vault` executable.
+
+                                                 *ansible-vault-config-debug*
+`debug` ~
+    (boolean, default `false`)
+    Enable debug logging to `:messages`.
+
+==============================================================================
+5. PASSWORD SOURCES                             *ansible-vault-passwords*
+
+The plugin resolves credentials in this order:
+
+1. `password_file`                         |ansible-vault-config-password_file|
+2. `vault_ids`                             |ansible-vault-config-vault_ids|
+3. `vault_id`                              |ansible-vault-config-vault_id|
+4. Interactive password prompt
+
+Most commands also accept temporary credential overrides via
+command-line arguments. See |ansible-vault-command-args|.
+
+If the password is wrong on a decrypt operation, the cached
+password is automatically invalidated, prompting for a new one
+on the next attempt.
+
+==============================================================================
+6. API                                               *ansible-vault-api*
+
+                                     *ansible-vault.setup()*
+`setup(opts)` ~
+    Configure the plugin. See |ansible-vault-config|.
+
+                                     *ansible-vault.is_encrypted()*
+`is_encrypted(content)` ~
+    Check if content (string or list of lines) is vault
+    encrypted. Returns `boolean`.
+
+                                     *ansible-vault.is_buffer_encrypted()*
+`is_buffer_encrypted(buf?)` ~
+    Check if a buffer is vault encrypted.
+
+                                     *ansible-vault.encrypt()*
+`encrypt(buf?, opts?)` ~
+    Encrypt the current or specified buffer.
+
+                                     *ansible-vault.decrypt()*
+`decrypt(buf?, opts?)` ~
+    Decrypt the current or specified buffer.
+
+                                     *ansible-vault.view()*
+`view(buf?, opts?)` ~
+    View decrypted buffer content in a floating window.
+
+                                     *ansible-vault.edit()*
+`edit(buf?, opts?)` ~
+    Edit an encrypted buffer in a secure scratch buffer
+    (see |:VaultEdit|).
+
+                                     *ansible-vault.rekey()*
+`rekey(opts?)` ~
+    Rekey the current file-backed encrypted buffer.
+
+                                     *ansible-vault.diff()*
+`diff(opts?)` ~
+    Diff decrypted content. `opts` can contain `positionals`
+    (file path) or `git_ref`.
+
+                                     *ansible-vault.files()*
+`files(opts?)` ~
+    Pick a vault file. `opts` can contain `positionals` with
+    the action (`"view"`, `"edit"`, or `"rekey"`).
+
+                                     *ansible-vault.info()*
+`info(buf?, opts?)` ~
+    Show plugin and buffer state in a floating window.
+
+                                     *ansible-vault.get_info()*
+`get_info(buf?, opts?)` ~
+    Return diagnostic info as a list of strings.
+
+                                     *ansible-vault.toggle()*
+`toggle(buf?, opts?)` ~
+    Toggle between encrypted and decrypted state.
+
+                                     *ansible-vault.clear_password_cache()*
+`clear_password_cache()` ~
+    Clear the in-memory interactive password cache.
+
+                                     *ansible-vault.status()*
+`status(buf?)` ~
+    Return `"[VAULT]"` if the buffer is encrypted, otherwise
+    `""`. Useful for statusline integration.
+
+                                     *ansible-vault.encrypt_string()*
+`encrypt_string(range_opts?, opts?)` ~
+    Encrypt visually selected text as an inline YAML vault
+    string.
+
+                                     *ansible-vault.decrypt_string()*
+`decrypt_string(range_opts?, opts?)` ~
+    Decrypt a selected inline YAML vault string in place.
+
+                                     *ansible-vault.view_string()*
+`view_string(range_opts?, opts?)` ~
+    View a selected inline YAML vault string.
+
+                                     *ansible-vault.encrypt_string_under_cursor()*
+`encrypt_string_under_cursor(opts?)` ~
+    Encrypt the YAML value under the cursor.
+
+                                     *ansible-vault.decrypt_string_under_cursor()*
+`decrypt_string_under_cursor(opts?)` ~
+    Decrypt the inline vault block under the cursor.
+
+                                     *ansible-vault.view_string_under_cursor()*
+`view_string_under_cursor(opts?)` ~
+    View the inline vault block under the cursor.
+
+==============================================================================
+7. USER EVENTS                                   *ansible-vault-events*
+
+The plugin emits |User| autocommands after successful operations:
+
+    `AnsibleVaultEncrypt`
+    `AnsibleVaultDecrypt`
+    `AnsibleVaultView`
+    `AnsibleVaultEditOpen`
+    `AnsibleVaultEditSave`
+    `AnsibleVaultRekey`
+    `AnsibleVaultStringEncrypt`
+    `AnsibleVaultStringDecrypt`
+    `AnsibleVaultDiff`
+    `AnsibleVaultOperation`  (emitted for all operations)
+
+The event `data` contains at least `{ operation = "<name>" }`.
+
+Example: >
+
+    vim.api.nvim_create_autocmd("User", {
+      pattern = "AnsibleVaultOperation",
+      callback = function(event)
+        vim.print(event.data.operation)
+      end,
+    })
+<
+==============================================================================
+8. SECURITY                                     *ansible-vault-security*
+
+- Commands are executed as argv lists, not shell strings. Configuration
+  values are not evaluated by a shell.
+- Interactive passwords are collected with |inputsecret()| and written
+  to a temporary `0600` password file for the duration of the operation.
+- `password_cache_ttl` is disabled by default. When enabled, the
+  password is kept in Neovim process memory until expiry or until
+  |:VaultClearPasswordCache| is called.
+- |:VaultEdit| uses a scratch `acwrite` buffer with `swapfile=false`,
+  `undofile=false`, and `bufhidden=wipe`.
+- |:VaultEdit| writes encrypted output through a temporary file and
+  atomically replaces the original file.
+- |:VaultEdit| refuses to overwrite the original file if it changed
+  on disk while the scratch buffer was open.
+- Decrypted text resides in Neovim process memory while viewing or
+  editing. Review your Neovim plugins, clipboard settings, backups,
+  shada, and session recording for highly sensitive secrets.
+
+==============================================================================
+9. HEALTH CHECK                                 *ansible-vault-health*
+
+Run |:checkhealth| to verify your setup: >
+    :checkhealth ansible-vault
+<
+The health check validates:
+- `ansible-vault` executable availability
+- Password file readability and 0600 permissions
+- Vault ID label sources
+- `encrypt_vault_id` consistency
+- |:VaultRekey| target configuration
+
+==============================================================================
+10. STATUSLINE INTEGRATION                  *ansible-vault-statusline*
+
+Use |ansible-vault.status()| in your statusline: >
+
+    -- Manual integration
+    if require("ansible-vault").is_buffer_encrypted() then
+      -- buffer is encrypted
+    end
+
+    -- lualine integration
+    require("lualine").setup({
+      sections = {
+        lualine_x = {
+          { require("ansible-vault").status },
+        },
+      },
+    })
+<
+==============================================================================
+ vim:tw=78:ts=8:ft=help:norl:

@@ -247,9 +247,6 @@ end
 ---@return string
 local function join_job_data(data)
   local lines = vim.deepcopy(data)
-  if lines[#lines] == "" then
-    table.remove(lines, #lines)
-  end
   return table.concat(lines, "\n")
 end
 
@@ -314,9 +311,11 @@ local function get_password_args(callback, opts)
     return
   end
 
-  if should_cache_password(config.password_cache_ttl)
-      and password_cache.password
-      and password_cache.expires_at > now_seconds() then
+  if
+    should_cache_password(config.password_cache_ttl)
+    and password_cache.password
+    and password_cache.expires_at > now_seconds()
+  then
     local tmpfile, err = write_secure_tempfile(password_cache.password .. "\n")
     if not tmpfile then
       vim.notify("Failed to create temp password file: " .. err, vim.log.levels.ERROR)
@@ -446,13 +445,13 @@ local function run_vault(action, input, args, callback, opts)
         local stdout = join_job_data(stdout_data)
         local stderr = join_job_data(stderr_data)
 
-        if did_timeout() then
-          callback(false, string.format("ansible-vault %s timed out after %dms", action, get_timeout_ms(opts) or 0))
+        if exit_code == 0 then
+          callback(true, stdout)
           return
         end
 
-        if exit_code == 0 then
-          callback(true, stdout)
+        if did_timeout() then
+          callback(false, string.format("ansible-vault %s timed out after %dms", action, get_timeout_ms(opts) or 0))
           return
         end
 
@@ -477,7 +476,56 @@ local function parse_command_args(args)
   if not is_nonempty_string(args) then
     return {}
   end
-  return vim.fn.split(args)
+
+  local function is_space(char)
+    return char == " " or char == "\t"
+  end
+
+  local result = {}
+  local i = 1
+  local len = #args
+  while i <= len do
+    local c = args:sub(i, i)
+    if is_space(c) then
+      i = i + 1
+    else
+      local token = {}
+      local quote = nil
+
+      while i <= len do
+        c = args:sub(i, i)
+
+        if quote then
+          if c == quote then
+            quote = nil
+            i = i + 1
+          elseif c == "\\" and i < len then
+            i = i + 1
+            table.insert(token, args:sub(i, i))
+            i = i + 1
+          else
+            table.insert(token, c)
+            i = i + 1
+          end
+        elseif is_space(c) then
+          break
+        elseif c == "'" or c == '"' then
+          quote = c
+          i = i + 1
+        elseif c == "\\" and i < len then
+          i = i + 1
+          table.insert(token, args:sub(i, i))
+          i = i + 1
+        else
+          table.insert(token, c)
+          i = i + 1
+        end
+      end
+
+      table.insert(result, table.concat(token))
+    end
+  end
+  return result
 end
 
 ---@param args string[]|nil
@@ -635,13 +683,13 @@ local function run_vault_file(action, file_path, args, callback, opts)
         local stdout = join_job_data(stdout_data)
         local stderr = join_job_data(stderr_data)
 
-        if did_timeout() then
-          callback(false, string.format("ansible-vault %s timed out after %dms", action, get_timeout_ms(opts) or 0))
+        if exit_code == 0 then
+          callback(true, stdout)
           return
         end
 
-        if exit_code == 0 then
-          callback(true, stdout)
+        if did_timeout() then
+          callback(false, string.format("ansible-vault %s timed out after %dms", action, get_timeout_ms(opts) or 0))
           return
         end
 
@@ -903,6 +951,7 @@ function M.decrypt(buf, opts)
           emit_event("Decrypt", { buf = target })
         end
       else
+        clear_password_cache()
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
       end
     end, opts)
@@ -944,6 +993,7 @@ function M.view(buf, opts)
         open_output_window(output, " Vault View (read-only) ", filetype)
         emit_event("View", { buf = target })
       else
+        clear_password_cache()
         vim.notify("View failed: " .. output, vim.log.levels.ERROR)
       end
     end, opts)
@@ -957,38 +1007,70 @@ end
 ---@field end_col integer
 ---@field lines string[]
 ---@field linewise boolean
+---@field blockwise boolean
 
 ---@param buf integer
 ---@param range_opts? table
 ---@return AnsibleVaultSelection|nil
 local function get_selection(buf, range_opts)
-  local start_pos = vim.fn.getpos("'<")
-  local end_pos = vim.fn.getpos("'>")
-  local start_row = start_pos[2]
-  local start_col = start_pos[3]
-  local end_row = end_pos[2]
-  local end_col = end_pos[3]
+  local start_row, start_col, end_row, end_col
   local range_linewise = false
 
   local has_range = range_opts and range_opts.range and range_opts.range > 0
-  local marks_match_range = has_range and start_row == range_opts.line1 and end_row == range_opts.line2
-  if has_range and not marks_match_range then
-    start_row = range_opts.line1
-    end_row = range_opts.line2
-    start_col = 1
-    local last_line = vim.api.nvim_buf_get_lines(buf, end_row - 1, end_row, false)[1] or ""
-    end_col = #last_line
-    range_linewise = true
-  elseif start_row == 0 or end_row == 0 then
-    if not range_opts or not range_opts.line1 or not range_opts.line2 then
-      return nil
+  if has_range then
+    local start_pos = vim.fn.getpos("'<")
+    local end_pos = vim.fn.getpos("'>")
+    local mark_start_row = start_pos[2]
+    local mark_end_row = end_pos[2]
+    local marks_match = mark_start_row == range_opts.line1 and mark_end_row == range_opts.line2
+    if marks_match then
+      start_row = mark_start_row
+      start_col = start_pos[3]
+      end_row = mark_end_row
+      end_col = end_pos[3]
+    else
+      start_row = range_opts.line1
+      end_row = range_opts.line2
+      start_col = 1
+      local last_line = vim.api.nvim_buf_get_lines(buf, end_row - 1, end_row, false)[1] or ""
+      end_col = #last_line
+      range_linewise = true
     end
-    start_row = range_opts.line1
-    end_row = range_opts.line2
-    start_col = 1
-    local last_line = vim.api.nvim_buf_get_lines(buf, end_row - 1, end_row, false)[1] or ""
-    end_col = #last_line
-    range_linewise = true
+  else
+    local current_mode = vim.api.nvim_get_mode().mode
+    local in_visual = current_mode == "v" or current_mode == "V" or current_mode == "\22"
+    if in_visual then
+      local v_start = vim.fn.getpos("v")
+      local v_end = vim.fn.getpos(".")
+      if v_start[2] > 0 and v_end[2] > 0 then
+        start_row = v_start[2]
+        start_col = v_start[3]
+        end_row = v_end[2]
+        end_col = v_end[3]
+        range_linewise = current_mode == "V"
+      end
+    end
+
+    if not start_row then
+      local start_pos = vim.fn.getpos("'<")
+      local end_pos = vim.fn.getpos("'>")
+      start_row = start_pos[2]
+      start_col = start_pos[3]
+      end_row = end_pos[2]
+      end_col = end_pos[3]
+    end
+
+    if start_row == 0 or end_row == 0 then
+      if not range_opts or not range_opts.line1 or not range_opts.line2 then
+        return nil
+      end
+      start_row = range_opts.line1
+      end_row = range_opts.line2
+      start_col = 1
+      local last_line = vim.api.nvim_buf_get_lines(buf, end_row - 1, end_row, false)[1] or ""
+      end_col = #last_line
+      range_linewise = true
+    end
   end
 
   if start_row > end_row or (start_row == end_row and start_col > end_col) then
@@ -999,25 +1081,38 @@ local function get_selection(buf, range_opts)
   local line_count = vim.api.nvim_buf_line_count(buf)
   start_row = math.max(1, math.min(start_row, line_count))
   end_row = math.max(1, math.min(end_row, line_count))
-
-  local lines = vim.api.nvim_buf_get_lines(buf, start_row - 1, end_row, false)
-  if #lines == 0 then
-    return nil
-  end
+  start_col = math.max(1, start_col)
+  end_col = math.max(0, end_col)
 
   local visual_mode = vim.fn.visualmode()
   local linewise = range_linewise or visual_mode == "V"
+  local blockwise = visual_mode == "\22"
+  local lines
 
-  if linewise then
+  if blockwise then
+    lines = {}
+    for row = start_row, end_row do
+      local line_text = vim.api.nvim_buf_get_text(buf, row - 1, start_col - 1, row - 1, end_col, {})
+      table.insert(lines, line_text[1] or "")
+    end
+  elseif not linewise then
+    local lines_from_text = vim.api.nvim_buf_get_text(buf, start_row - 1, start_col - 1, end_row - 1, end_col, {})
+    if not lines_from_text or #lines_from_text == 0 then
+      local fallback = vim.api.nvim_buf_get_lines(buf, start_row - 1, end_row, false)
+      if #fallback == 0 then
+        return nil
+      end
+      lines = fallback
+    else
+      lines = lines_from_text
+    end
+  else
+    lines = vim.api.nvim_buf_get_lines(buf, start_row - 1, end_row, false)
+    if #lines == 0 then
+      return nil
+    end
     start_col = 1
     end_col = #lines[#lines]
-  else
-    if #lines == 1 then
-      lines[1] = lines[1]:sub(start_col, end_col)
-    else
-      lines[1] = lines[1]:sub(start_col)
-      lines[#lines] = lines[#lines]:sub(1, end_col)
-    end
   end
 
   return {
@@ -1027,6 +1122,7 @@ local function get_selection(buf, range_opts)
     end_col = end_col,
     lines = lines,
     linewise = linewise,
+    blockwise = blockwise,
   }
 end
 
@@ -1064,17 +1160,91 @@ local function line_indent(line)
   return #(line:match("^(%s*)") or "")
 end
 
+---@param line string
+---@return string
+local function strip_yaml_comment(line)
+  local quote = nil
+  local escaped = false
+
+  for i = 1, #line do
+    local char = line:sub(i, i)
+
+    if quote then
+      if quote == '"' and char == "\\" and not escaped then
+        escaped = true
+      else
+        if char == quote and not escaped then
+          quote = nil
+        end
+        escaped = false
+      end
+    elseif char == "'" or char == '"' then
+      quote = char
+    elseif char == "#" and (i == 1 or line:sub(i - 1, i - 1):match("%s")) then
+      return line:sub(1, i - 1)
+    end
+  end
+
+  return line
+end
+
+---@param value string
+---@return string
+local function unquote_yaml_value(value)
+  local quote = value:match("^(['\"])")
+  if not quote then
+    return value
+  end
+
+  local escaped = false
+  for i = 2, #value do
+    local char = value:sub(i, i)
+    if quote == '"' and char == "\\" and not escaped then
+      escaped = true
+    else
+      if char == quote and not escaped then
+        local result = value:sub(2, i - 1)
+        if quote == '"' then
+          result = result:gsub('\\"', '"'):gsub("\\\\", "\\")
+        end
+        return result
+      end
+      escaped = false
+    end
+  end
+
+  return value:sub(2)
+end
+
+---@param line string
+---@return string|nil indent
+---@return string|nil key
+---@return string|nil value
+local function extract_yaml_key_value(line)
+  local indent, key, rest = line:match("^(%s*)([%w_.%-]+):%s*(.*)$")
+  if not key then
+    return nil, nil, nil
+  end
+  if rest == "" or rest:match("^!vault") then
+    return indent, key, nil
+  end
+  rest = strip_yaml_comment(rest)
+  rest = rest:gsub("%s+$", "")
+  if rest == "" then
+    return indent, key, ""
+  end
+  return indent, key, unquote_yaml_value(rest)
+end
+
 ---@param buf integer
 ---@return AnsibleVaultSelection|nil
 local function get_plain_yaml_value_under_cursor(buf)
   local row = vim.api.nvim_win_get_cursor(0)[1]
   local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
-  local _, key, value = line:match("^(%s*)([%w_.%-]+):%s*(.-)%s*$")
-
-  if not key or value == "" or value:match("^!vault") then
+  local _, key, value = extract_yaml_key_value(line)
+  if not key or not value or value == "" then
     return nil
   end
-
   return get_line_selection(buf, row, row)
 end
 
@@ -1085,7 +1255,7 @@ local function find_vault_block_under_cursor(buf)
   local line_count = vim.api.nvim_buf_line_count(buf)
   local start_row
 
-  for row = cursor_row, math.max(1, cursor_row - 100), -1 do
+  for row = cursor_row, 1, -1 do
     local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
     if line:match("!vault%s*|") then
       start_row = row
@@ -1164,12 +1334,12 @@ local function build_encrypt_string_plan(buf, selection)
   local is_full_line = selection.start_col == 0 and selection.end_col >= #full_line
 
   if is_full_line then
-    local indent, key, value = full_line:match("^(%s*)([%w_.%-]+):%s*(.-)%s*$")
-    if key and value ~= "" and not value:match("^!vault") then
+    local indent, key, value = extract_yaml_key_value(full_line)
+    if key and value and value ~= "" then
       plan.content = value
       plan.name = key
       plan.mode = "full_line"
-      plan.indent = indent
+      plan.indent = indent or ""
     end
     return plan
   end
@@ -1204,6 +1374,41 @@ local function format_encrypt_string_output(output, plan)
   end
 
   return lines
+end
+
+---@param buf integer
+---@param selection AnsibleVaultSelection
+---@param replacement string[]
+local function replace_selection_text(buf, selection, replacement)
+  if not selection.blockwise then
+    return pcall(
+      vim.api.nvim_buf_set_text,
+      buf,
+      selection.start_row,
+      selection.start_col,
+      selection.end_row,
+      selection.end_col,
+      replacement
+    )
+  end
+
+  local selected_row_count = selection.end_row - selection.start_row + 1
+  local original_lines = vim.api.nvim_buf_get_lines(buf, selection.start_row, selection.end_row + 1, false)
+  local new_lines = {}
+  local line_count = math.max(selected_row_count, #replacement)
+
+  for i = 1, line_count do
+    local original = original_lines[i]
+    if original then
+      local prefix = original:sub(1, selection.start_col)
+      local suffix = original:sub(selection.end_col + 1)
+      table.insert(new_lines, prefix .. (replacement[i] or "") .. suffix)
+    else
+      table.insert(new_lines, replacement[i] or "")
+    end
+  end
+
+  return pcall(vim.api.nvim_buf_set_lines, buf, selection.start_row, selection.end_row + 1, false, new_lines)
 end
 
 ---@param buf integer
@@ -1263,15 +1468,7 @@ local function encrypt_string_selection(buf, selection, opts)
         return
       end
 
-      local ok, err = pcall(
-        vim.api.nvim_buf_set_text,
-        buf,
-        plan.start_row,
-        plan.start_col,
-        plan.end_row,
-        plan.end_col,
-        format_encrypt_string_output(output, plan)
-      )
+      local ok, err = replace_selection_text(buf, selection, format_encrypt_string_output(output, plan))
 
       if ok then
         notify("String encrypted successfully", vim.log.levels.INFO, opts)
@@ -1477,6 +1674,7 @@ function M.edit(buf, opts)
     run_vault("decrypt", buffer_content(original_buf), args, function(success, output)
       if not success then
         run_cleanup(cleanup)
+        clear_password_cache()
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
         return
       end
@@ -1503,7 +1701,13 @@ function M.edit(buf, opts)
       vim.bo[edit_buf].swapfile = false
       vim.bo[edit_buf].undofile = false
       vim.bo[edit_buf].modified = false
-      vim.api.nvim_buf_set_name(edit_buf, "ansible-vault://" .. original_file)
+      local set_name_ok, set_name_err = pcall(vim.api.nvim_buf_set_name, edit_buf, "ansible-vault://" .. original_file)
+      if not set_name_ok then
+        run_cleanup(cleanup)
+        pcall(vim.api.nvim_buf_delete, edit_buf, { force = true })
+        vim.notify("VaultEdit: buffer name conflict - " .. (set_name_err or "E95"), vim.log.levels.ERROR)
+        return
+      end
 
       vim.b[edit_buf].vault_original_buf = original_buf
       vim.b[edit_buf].vault_original_file = original_file
@@ -1541,6 +1745,7 @@ function M.edit(buf, opts)
           end
 
           vim.b[cur_buf].vault_write_pending = true
+          vim.bo[cur_buf].modified = false
           local edit_content = table.concat(vim.api.nvim_buf_get_lines(cur_buf, 0, -1, false), "\n")
           local orig_file = vim.b[cur_buf].vault_original_file
           local orig_buf = vim.b[cur_buf].vault_original_buf
@@ -1550,32 +1755,40 @@ function M.edit(buf, opts)
           debug_log("VaultEdit: encrypting to %s", orig_file)
 
           run_vault("encrypt", edit_content, encrypt_args, function(enc_success, enc_output)
-            if not is_valid_buf(cur_buf) then
-              return
-            end
-
-            vim.b[cur_buf].vault_write_pending = false
-
             if not enc_success then
+              if is_valid_buf(cur_buf) then
+                vim.b[cur_buf].vault_write_pending = false
+                vim.bo[cur_buf].modified = true
+              end
               vim.notify("Encryption failed: " .. enc_output, vim.log.levels.ERROR)
               return
             end
 
             if not same_file_signature(orig_signature, file_signature(orig_file)) then
+              if is_valid_buf(cur_buf) then
+                vim.b[cur_buf].vault_write_pending = false
+                vim.bo[cur_buf].modified = true
+              end
               vim.notify("Original file changed on disk; encrypted output was not written", vim.log.levels.ERROR)
               return
             end
 
-            local write_ok, write_err = atomic_write_file(orig_file, enc_output .. "\n")
+            local write_ok, write_err = atomic_write_file(orig_file, enc_output)
             if not write_ok then
+              if is_valid_buf(cur_buf) then
+                vim.b[cur_buf].vault_write_pending = false
+                vim.bo[cur_buf].modified = true
+              end
               vim.notify("Failed to write encrypted file: " .. write_err, vim.log.levels.ERROR)
               return
             end
 
-            cleanup_edit_buffer(cur_buf)
-            close_edit_buffer(cur_buf, orig_buf, orig_file, original_win)
             notify("Encrypted and saved: " .. orig_file, vim.log.levels.INFO, opts)
             emit_event("EditSave", { buf = orig_buf, file = orig_file })
+            if is_valid_buf(cur_buf) then
+              cleanup_edit_buffer(cur_buf)
+              close_edit_buffer(cur_buf, orig_buf, orig_file, original_win)
+            end
           end, opts)
         end,
       })
@@ -1679,8 +1892,8 @@ parse_vault_from_yaml = function(content)
     local min_indent = math.huge
     for _, line in ipairs(vault_lines) do
       if line:match("%S") then
-        local indent = #(line:match("^(%s*)") or "")
-        min_indent = math.min(min_indent, indent)
+        local cur_indent = line_indent(line)
+        min_indent = math.min(min_indent, cur_indent)
       end
     end
 
@@ -1705,8 +1918,8 @@ parse_vault_from_yaml = function(content)
     local min_indent = math.huge
     for _, line in ipairs(lines) do
       if line:match("%S") then
-        local indent = #(line:match("^(%s*)") or "")
-        min_indent = math.min(min_indent, indent)
+        local cur_indent = line_indent(line)
+        min_indent = math.min(min_indent, cur_indent)
       end
     end
 
@@ -1744,8 +1957,64 @@ end
 ---@param output string
 ---@param parsed table
 ---@return string[]
+local YAML_BOOLEAN_WORDS = {
+  yes = true,
+  no = true,
+  ["true"] = true,
+  ["false"] = true,
+  null = true,
+  on = true,
+  off = true,
+  y = true,
+  n = true,
+  Y = true,
+  N = true,
+  YES = true,
+  NO = true,
+  TRUE = true,
+  FALSE = true,
+  NULL = true,
+  ON = true,
+  OFF = true,
+}
+
+---@param value string
+---@return boolean
+local function needs_yaml_quoting(value)
+  if value == "" then
+    return true
+  end
+  local first_char = value:sub(1, 1)
+  if first_char:match("[%[%{%]%}'\"&*!|>%%@`~]") then
+    return true
+  end
+  if value:match("#") or value:match(": ") or value:match("%s$") or value:match("^%s") then
+    return true
+  end
+  if YAML_BOOLEAN_WORDS[value] then
+    return true
+  end
+  return false
+end
+
+---@param value string
+---@return string
+local function yaml_quote_value(value)
+  if not needs_yaml_quoting(value) then
+    return value
+  end
+  local escaped = value:gsub("\\", "\\\\"):gsub('"', '\\"')
+  return '"' .. escaped .. '"'
+end
+
+---@param output string
+---@param parsed table
+---@return string[]
 local function format_decrypt_string_output(output, parsed)
   local lines = output_to_lines(output)
+  while #lines > 0 and lines[#lines] == "" do
+    table.remove(lines, #lines)
+  end
 
   if not parsed.var_name then
     return lines
@@ -1753,7 +2022,7 @@ local function format_decrypt_string_output(output, parsed)
 
   local indent = parsed.indent or ""
   if #lines == 1 then
-    return { indent .. parsed.var_name .. ": " .. lines[1] }
+    return { indent .. parsed.var_name .. ": " .. yaml_quote_value(lines[1]) }
   end
 
   local result = { indent .. parsed.var_name .. ": |" }
@@ -1817,6 +2086,7 @@ local function decrypt_string_selection(target, selection, mode, opts)
       end
 
       if not success then
+        clear_password_cache()
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
         return
       end
@@ -1824,7 +2094,7 @@ local function decrypt_string_selection(target, selection, mode, opts)
       if mode == "view" then
         local title = parsed.var_name and string.format(" %s (read-only) ", parsed.var_name)
           or " Vault String (read-only) "
-        open_output_window(output, title, filetype)
+        open_output_window(output:gsub("\n$", ""), title, filetype)
         return
       end
 
@@ -2015,6 +2285,7 @@ function M.diff(opts)
     decrypt_content_if_needed(current_content, args, opts, function(current_ok, current_plain)
       if not current_ok then
         run_cleanup(cleanup)
+        clear_password_cache()
         vim.notify("VaultDiff failed to decrypt current buffer: " .. current_plain, vim.log.levels.ERROR)
         return
       end
@@ -2022,6 +2293,7 @@ function M.diff(opts)
       decrypt_content_if_needed(target_content, args, opts, function(target_ok, target_plain)
         run_cleanup(cleanup)
         if not target_ok then
+          clear_password_cache()
           vim.notify("VaultDiff failed to decrypt target: " .. target_plain, vim.log.levels.ERROR)
           return
         end
@@ -2246,12 +2518,9 @@ function M.get_info(buf, opts)
     "Credential source: " .. describe_password_source(config),
     "Vault labels: " .. describe_vault_labels(config),
     "Encrypt vault ID: " .. (is_nonempty_string(config.encrypt_vault_id) and config.encrypt_vault_id or "default"),
-    "Rekey target: "
-      .. (
-        is_nonempty_string(config.rekey_password_file) and "password_file"
-        or is_nonempty_string(config.rekey_vault_id) and "vault_id"
-        or "command args"
-      ),
+    "Rekey target: " .. (is_nonempty_string(config.rekey_password_file) and "password_file" or is_nonempty_string(
+      config.rekey_vault_id
+    ) and "vault_id" or "command args"),
     "",
     "Auto detect: " .. yes_no(config.auto_detect ~= false),
     "Auto edit: " .. yes_no(config.auto_edit == true),
@@ -2296,7 +2565,8 @@ end
 ---Setup the plugin.
 ---@param opts? AnsibleVaultConfig
 function M.setup(opts)
-  M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+  M.config = vim.tbl_deep_extend("force", vim.deepcopy(DEFAULT_CONFIG), opts or {})
+  M._configured = true
 
   vim.api.nvim_create_user_command("VaultEncrypt", function(command_opts)
     M.encrypt(nil, parse_operation_options(parse_command_args(command_opts.args)))
@@ -2491,8 +2761,10 @@ function M.setup(opts)
           return
         end
 
-        if suppress_auto_edit_path
-            and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(event.buf), ":p") == suppress_auto_edit_path then
+        if
+          suppress_auto_edit_path
+          and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(event.buf), ":p") == suppress_auto_edit_path
+        then
           suppress_auto_edit_path = nil
           return
         end
@@ -2509,6 +2781,10 @@ function M.setup(opts)
   end
 end
 
+M._parse_command_options = function(args_str, opts)
+  return parse_operation_options(parse_command_args(args_str), opts)
+end
+
 M._private = {
   build_vault_argv = build_vault_argv,
   expand_vault_id = expand_vault_id,
@@ -2516,6 +2792,10 @@ M._private = {
   get_vault_argv = get_vault_argv,
   parse_vault_from_yaml = parse_vault_from_yaml,
   output_to_lines = output_to_lines,
+  complete_operation_args = complete_operation_args,
+  complete_diff_args = complete_diff_args,
+  complete_files_args = complete_files_args,
+  yaml_quote_value = yaml_quote_value,
 }
 
 return M
