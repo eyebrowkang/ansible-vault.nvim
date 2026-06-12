@@ -1060,21 +1060,32 @@ local function get_selection(buf, range_opts)
   start_col = math.max(1, start_col)
   end_col = math.max(0, end_col)
 
-  local lines = vim.api.nvim_buf_get_text(buf, start_row - 1, start_col - 1, end_row - 1, end_col, {})
-  if not lines or #lines == 0 then
-    local fallback = vim.api.nvim_buf_get_lines(buf, start_row - 1, end_row, false)
-    if #fallback == 0 then
-      return nil
-    end
-    lines = fallback
-  end
-
   local visual_mode = vim.fn.visualmode()
   local linewise = range_linewise or visual_mode == "V"
+  local blockwise = visual_mode == "\22"
 
-  if linewise then
-    start_col = 1
-    end_col = #lines[#lines]
+  if blockwise then
+    lines = {}
+    for row = start_row, end_row do
+      local line_text = vim.api.nvim_buf_get_text(buf, row - 1, start_col - 1, row - 1, end_col, {})
+      table.insert(lines, line_text[1] or "")
+    end
+  elseif not linewise then
+    local lines_from_text = vim.api.nvim_buf_get_text(buf, start_row - 1, start_col - 1, end_row - 1, end_col, {})
+    if not lines_from_text or #lines_from_text == 0 then
+      local fallback = vim.api.nvim_buf_get_lines(buf, start_row - 1, end_row, false)
+      if #fallback == 0 then
+        return nil
+      end
+      lines = fallback
+    else
+      lines = lines_from_text
+    end
+  else
+    lines = vim.api.nvim_buf_get_lines(buf, start_row - 1, end_row, false)
+    if #lines == 0 then
+      return nil
+    end
   end
 
   return {
@@ -1123,25 +1134,23 @@ end
 
 ---@param buf integer
 ---@return AnsibleVaultSelection|nil
-local function get_plain_yaml_value_under_cursor(buf)
-  local row = vim.api.nvim_win_get_cursor(0)[1]
-  local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
-  local _, key, rest = line:match("^(%s*)([%w_.%-]+):%s*(.*)$")
+---@param line string
+---@return string|nil indent
+---@return string|nil key
+---@return string|nil value
+local function extract_yaml_key_value(line)
+  local indent, key, rest = line:match("^(%s*)([%w_.%-]+):%s*(.*)$")
   if not key then
-    return nil
+    return nil, nil, nil
   end
-
   if rest == "" or rest:match("^!vault") then
-    return nil
+    return indent, key, nil
   end
-
   rest = rest:gsub("%s*#.*$", "")
   rest = rest:gsub("%s+$", "")
-
   if rest == "" then
-    return nil
+    return indent, key, ""
   end
-
   local quote_char = rest:match("^(['\"])")
   local value
   if quote_char then
@@ -1154,14 +1163,21 @@ local function get_plain_yaml_value_under_cursor(buf)
   else
     value = rest:match("^([^#%s]+)")
     if not value then
-      return nil
+      return indent, key, rest
     end
   end
+  return indent, key, value
+end
 
-  if value == "" then
+---@param buf integer
+---@return AnsibleVaultSelection|nil
+local function get_plain_yaml_value_under_cursor(buf)
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
+  local _, key, value = extract_yaml_key_value(line)
+  if not key or not value or value == "" then
     return nil
   end
-
   return get_line_selection(buf, row, row)
 end
 
@@ -1251,12 +1267,12 @@ local function build_encrypt_string_plan(buf, selection)
   local is_full_line = selection.start_col == 0 and selection.end_col >= #full_line
 
   if is_full_line then
-    local indent, key, value = full_line:match("^(%s*)([%w_.%-]+):%s*(.-)%s*$")
-    if key and value ~= "" and not value:match("^!vault") then
+    local indent, key, value = extract_yaml_key_value(full_line)
+    if key and value and value ~= "" then
       plan.content = value
       plan.name = key
       plan.mode = "full_line"
-      plan.indent = indent
+      plan.indent = indent or ""
     end
     return plan
   end
@@ -1648,6 +1664,7 @@ function M.edit(buf, opts)
             if not enc_success then
               if is_valid_buf(cur_buf) then
                 vim.b[cur_buf].vault_write_pending = false
+                vim.bo[cur_buf].modified = true
               end
               vim.notify("Encryption failed: " .. enc_output, vim.log.levels.ERROR)
               return
@@ -1656,6 +1673,7 @@ function M.edit(buf, opts)
             if not same_file_signature(orig_signature, file_signature(orig_file)) then
               if is_valid_buf(cur_buf) then
                 vim.b[cur_buf].vault_write_pending = false
+                vim.bo[cur_buf].modified = true
               end
               vim.notify("Original file changed on disk; encrypted output was not written", vim.log.levels.ERROR)
               return
@@ -1665,6 +1683,7 @@ function M.edit(buf, opts)
             if not write_ok then
               if is_valid_buf(cur_buf) then
                 vim.b[cur_buf].vault_write_pending = false
+                vim.bo[cur_buf].modified = true
               end
               vim.notify("Failed to write encrypted file: " .. write_err, vim.log.levels.ERROR)
               return
