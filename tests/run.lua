@@ -1036,6 +1036,26 @@ tests["B9 command args support quoted paths with spaces"] = function()
   vim.api.nvim_win_close(0, true)
 end
 
+tests["B9 command args support escaped spaces"] = function()
+  local fake = create_fake_vault()
+  local pass_path = fake.dir .. "/path with spaces/vault pass"
+  vim.fn.mkdir(fake.dir .. "/path with spaces", "p")
+  write_file(pass_path, "secret\n")
+  vim.fn.setfperm(pass_path, "rw-------")
+  reset_config(fake, { password_file = false })
+
+  new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
+  local escaped_path = pass_path:gsub(" ", "\\ ")
+  vim.cmd("VaultView --vault-password-file " .. escaped_path)
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, 1, false)[1] == "plain: old"
+  end, "VaultView with escaped-space path did not finish")
+
+  assert_true(log_contains(fake.log, "ARG:" .. pass_path), "escaped-space path was not passed as one arg")
+  vim.api.nvim_win_close(0, true)
+end
+
 tests["health check runs"] = function()
   local fake = create_fake_vault()
   reset_config(fake)

@@ -476,30 +476,53 @@ local function parse_command_args(args)
   if not is_nonempty_string(args) then
     return {}
   end
+
+  local function is_space(char)
+    return char == " " or char == "\t"
+  end
+
   local result = {}
   local i = 1
   local len = #args
   while i <= len do
     local c = args:sub(i, i)
-    if c == " " or c == "\t" then
+    if is_space(c) then
       i = i + 1
-    elseif c == "'" or c == '"' then
-      local quote = c
-      i = i + 1
-      local start = i
-      while i <= len and args:sub(i, i) ~= quote do
-        i = i + 1
-      end
-      table.insert(result, args:sub(start, i - 1))
-      if i <= len then
-        i = i + 1
-      end
     else
-      local start = i
-      while i <= len and args:sub(i, i) ~= " " and args:sub(i, i) ~= "\t" do
-        i = i + 1
+      local token = {}
+      local quote = nil
+
+      while i <= len do
+        c = args:sub(i, i)
+
+        if quote then
+          if c == quote then
+            quote = nil
+            i = i + 1
+          elseif c == "\\" and i < len then
+            i = i + 1
+            table.insert(token, args:sub(i, i))
+            i = i + 1
+          else
+            table.insert(token, c)
+            i = i + 1
+          end
+        elseif is_space(c) then
+          break
+        elseif c == "'" or c == '"' then
+          quote = c
+          i = i + 1
+        elseif c == "\\" and i < len then
+          i = i + 1
+          table.insert(token, args:sub(i, i))
+          i = i + 1
+        else
+          table.insert(token, c)
+          i = i + 1
+        end
       end
-      table.insert(result, args:sub(start, i - 1))
+
+      table.insert(result, table.concat(token))
     end
   end
   return result
