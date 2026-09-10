@@ -926,7 +926,7 @@ local function enter_plaintext_mode(buf, mode, opts)
   vim.b[buf].ansible_vault_plaintext = mode
   vim.bo[buf].buftype = "acwrite"
 
-  vim.api.nvim_create_autocmd("BufWriteCmd", {
+  vim.b[buf].ansible_vault_write_autocmd = vim.api.nvim_create_autocmd("BufWriteCmd", {
     buffer = buf,
     desc = "Encrypt Ansible Vault content before writing",
     callback = function(event)
@@ -952,7 +952,15 @@ leave_plaintext_mode = function(buf)
   vim.b[buf].ansible_vault_plaintext = nil
   vim.b[buf].ansible_vault_inline = nil
   pcall(vim.api.nvim_buf_clear_namespace, buf, NAMESPACE, 0, -1)
-  pcall(vim.api.nvim_clear_autocmds, { event = "BufWriteCmd", buffer = buf })
+
+  -- Remove only our own handler; other plugins may have their own BufWriteCmd
+  -- registered against this buffer.
+  local autocmd_id = vim.b[buf].ansible_vault_write_autocmd
+  if autocmd_id then
+    pcall(vim.api.nvim_del_autocmd, autocmd_id)
+    vim.b[buf].ansible_vault_write_autocmd = nil
+  end
+
   secure.restore(buf)
 end
 
