@@ -1155,6 +1155,33 @@ tests["writing a decrypted buffer stores ciphertext"] = function()
   )
 end
 
+tests["an unnamed decrypted buffer cannot be written out as plaintext"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local buf = new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "ENC:plain" })
+  vault.decrypt(buf)
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "plain: value"
+  end, "buffer was not decrypted")
+
+  assert_eq(vim.bo[buf].buftype, "acwrite", "an unnamed buffer must be protected too")
+
+  local dir = temp_dir()
+  local path = dir .. "/leak.yml"
+  vim.cmd("silent write " .. vim.fn.fnameescape(path))
+
+  wait_until(function()
+    return vim.fn.filereadable(path) == 1
+  end, ":w {file} on an unnamed buffer did not produce a file")
+
+  assert_true(read_file(path):match("^%$ANSIBLE_VAULT"), "an unnamed buffer must encrypt on :w {file} too")
+
+  -- `:w {file}` names the buffer, so drop it rather than leaving a modified
+  -- buffer for whichever test runs next.
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+end
+
 tests["writing a decrypted buffer to another path also encrypts"] = function()
   local fake = create_fake_vault()
   reset_config(fake)

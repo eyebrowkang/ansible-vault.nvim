@@ -406,7 +406,7 @@ is refused to avoid overwriting someone else's changes.
 
 ### Automatically Edit Encrypted Files
 
-Enable `auto_edit` if you want encrypted files to open directly in the safer
+Enable `auto_edit` if you want encrypted files to open directly in the
 `:VaultEdit` scratch workflow:
 
 ```lua
@@ -421,8 +421,8 @@ automatic edit loop for that reload.
 ### Toggle a Buffer
 
 Run `:VaultToggle` to encrypt a plain buffer or decrypt an encrypted buffer.
-This is convenient for quick checks, but be careful not to save decrypted
-secrets accidentally.
+Decrypting this way enters the same plaintext editing mode as `:VaultDecrypt`,
+so `:w` still re-encrypts.
 
 ### Diff Decrypted Vault Content
 
