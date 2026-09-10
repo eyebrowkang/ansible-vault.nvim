@@ -45,8 +45,14 @@ English documentation: [README.md](README.md)
 
 ## 依赖
 
-- Neovim >= 0.9.0
+- Neovim >= 0.12
 - `ansible-vault` 可执行文件在 `PATH` 中，或通过配置指定路径/Conda 环境
+
+### 版本支持策略
+
+本插件**只跟随 Neovim 当前发行版**。为了把维护精力压到最低，这里不会为旧版本做兼容
+处理，也不会针对旧版本测试。旧版本能不能跑不作保证；`:checkhealth ansible-vault`
+会明确告诉你当前版本是否受支持。
 
 ## 安装
 

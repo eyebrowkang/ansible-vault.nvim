@@ -22,7 +22,14 @@ local yaml = require("ansible-vault.yaml")
 
 local M = {}
 
-local uv = vim.uv or vim.loop
+---Minimum supported Neovim version.
+---
+---The plugin tracks the current Neovim release only. Older versions are not
+---worked around and are not tested; they may happen to work, but that is not a
+---promise. Keeping a single target is what keeps this maintainable.
+M.MIN_NVIM_VERSION = "0.12"
+
+local uv = vim.uv
 local AUGROUP = "AnsibleVault"
 local DEFAULT_FILE_MODE = 384 -- 0600
 local SCAN_FILE_LIMIT = 20000
@@ -157,50 +164,6 @@ local function get_timeout_ms(opts)
   return nil
 end
 
----@param job_id integer
----@param action string
----@param opts? table
----@return boolean ok False when a timeout was requested but could not be armed
----@return fun() stop
----@return fun(): boolean timed_out
-local function start_job_timeout(job_id, action, opts)
-  local noop_stop = function() end
-  local never = function()
-    return false
-  end
-
-  local timeout = get_timeout_ms(opts)
-  if not timeout then
-    return true, noop_stop, never
-  end
-
-  local timed_out = false
-  local timer = uv.new_timer()
-  if not timer then
-    -- A configured timeout that cannot be armed would leave the job running
-    -- unbounded, holding its credentials open. Fail instead.
-    return false, noop_stop, never
-  end
-
-  timer:start(timeout, 0, function()
-    timed_out = true
-    vim.schedule(function()
-      pcall(vim.fn.jobstop, job_id)
-    end)
-  end)
-
-  local stop = function()
-    if timer and not timer:is_closing() then
-      timer:stop()
-      timer:close()
-    end
-  end
-
-  return true, stop, function()
-    return timed_out
-  end
-end
-
 local clear_password_cache = credentials.clear_password_cache
 local expand_path = credentials.expand_path
 local expand_vault_id = credentials.expand_vault_id
@@ -239,27 +202,6 @@ local function build_vault_argv(action, args, target, opts)
     table.insert(argv, tostring(target))
   end
   return argv
-end
-
----@param data string[]
----@param chunk string[]|nil
-local function collect_job_data(data, chunk)
-  if not chunk then
-    return
-  end
-
-  for _, item in ipairs(chunk) do
-    if item ~= nil then
-      table.insert(data, item)
-    end
-  end
-end
-
----@param data string[]
----@return string
-local function join_job_data(data)
-  local lines = vim.deepcopy(data)
-  return table.concat(lines, "\n")
 end
 
 ---@param output string
@@ -381,7 +323,52 @@ local function failure_message(action, exit_code, stderr)
   return string.format("ansible-vault %s exited with status %d", action, exit_code)
 end
 
----Run ansible-vault command.
+---Spawn `ansible-vault` and hand the result to `callback`.
+---
+---`vim.system` enforces the timeout itself and reports exit code 124 when it
+---fires, so there is no timer to arm, cancel or leak. It also merges `env` into
+---the inherited environment rather than replacing it, which is what lets the
+---password be passed through `ANSIBLE_VAULT_NVIM_PASSWORD` without stripping
+---`PATH` from the child.
+---@param action string
+---@param args string[]
+---@param opts table|nil
+---@param creds AnsibleVaultCredentials|nil
+---@param stdin string|nil Content to pipe in, or nil when operating on a file
+---@param file string|nil File to operate on, or nil when piping stdin
+---@param callback fun(success: boolean, output: string)
+local function spawn_vault(action, args, opts, creds, stdin, file, callback)
+  local argv = build_vault_argv(action, args or {}, file or "-", opts)
+  debug_log("running: %s", redact_argv(argv))
+
+  local timeout = get_timeout_ms(opts)
+  local system_opts = {
+    cwd = creds and creds.cwd or nil,
+    env = creds and creds.env or nil,
+    timeout = timeout,
+    stdin = stdin,
+  }
+
+  -- Deliberately not `text = true`: that would normalize CRLF in the output,
+  -- rewriting the line endings of whatever was decrypted.
+  local ok, err = pcall(vim.system, argv, system_opts, function(result)
+    vim.schedule(function()
+      if result.code == 0 then
+        callback(true, result.stdout or "")
+      elseif result.code == 124 then
+        callback(false, string.format("ansible-vault %s timed out after %dms", action, timeout or 0))
+      else
+        callback(false, failure_message(action, result.code, result.stderr or ""))
+      end
+    end)
+  end)
+
+  if not ok then
+    callback(false, "Failed to start ansible-vault: " .. tostring(err))
+  end
+end
+
+---Run ansible-vault over buffer content.
 ---@param action string The vault action (encrypt, decrypt, encrypt_string)
 ---@param input string Input content
 ---@param args string[] Additional arguments
@@ -389,64 +376,7 @@ end
 ---@param opts? table
 ---@param creds? AnsibleVaultCredentials Supplies the child cwd and environment
 local function run_vault(action, input, args, callback, opts, creds)
-  local argv = build_vault_argv(action, args or {}, "-", opts)
-  local stdout_data = {}
-  local stderr_data = {}
-  local stop_timeout = function() end
-  local did_timeout = function()
-    return false
-  end
-
-  debug_log("running: %s", redact_argv(argv))
-
-  local job_id = vim.fn.jobstart(argv, {
-    stdin = "pipe",
-    cwd = creds and creds.cwd or nil,
-    env = creds and creds.env or nil,
-    stdout_buffered = true,
-    stderr_buffered = true,
-    on_stdout = function(_, data)
-      collect_job_data(stdout_data, data)
-    end,
-    on_stderr = function(_, data)
-      collect_job_data(stderr_data, data)
-    end,
-    on_exit = function(_, exit_code)
-      vim.schedule(function()
-        stop_timeout()
-        local stdout = join_job_data(stdout_data)
-        local stderr = join_job_data(stderr_data)
-
-        if exit_code == 0 then
-          callback(true, stdout)
-          return
-        end
-
-        if did_timeout() then
-          callback(false, string.format("ansible-vault %s timed out after %dms", action, get_timeout_ms(opts) or 0))
-          return
-        end
-
-        callback(false, failure_message(action, exit_code, stderr))
-      end)
-    end,
-  })
-
-  if job_id <= 0 then
-    callback(false, "Failed to start ansible-vault")
-    return
-  end
-
-  local ok
-  ok, stop_timeout, did_timeout = start_job_timeout(job_id, action, opts)
-  if not ok then
-    pcall(vim.fn.jobstop, job_id)
-    callback(false, "Failed to arm the ansible-vault timeout; refusing to run unbounded")
-    return
-  end
-
-  vim.fn.chansend(job_id, input)
-  vim.fn.chanclose(job_id, "stdin")
+  spawn_vault(action, args, opts, creds, input, nil, callback)
 end
 
 ---@param args string|nil
@@ -638,59 +568,7 @@ end
 ---@param opts? table
 ---@param creds? AnsibleVaultCredentials
 local function run_vault_file(action, file_path, args, callback, opts, creds)
-  local argv = build_vault_argv(action, args or {}, file_path, opts)
-  local stdout_data = {}
-  local stderr_data = {}
-  local stop_timeout = function() end
-  local did_timeout = function()
-    return false
-  end
-
-  debug_log("running: %s", redact_argv(argv))
-
-  local job_id = vim.fn.jobstart(argv, {
-    cwd = creds and creds.cwd or nil,
-    env = creds and creds.env or nil,
-    stdout_buffered = true,
-    stderr_buffered = true,
-    on_stdout = function(_, data)
-      collect_job_data(stdout_data, data)
-    end,
-    on_stderr = function(_, data)
-      collect_job_data(stderr_data, data)
-    end,
-    on_exit = function(_, exit_code)
-      vim.schedule(function()
-        stop_timeout()
-        local stdout = join_job_data(stdout_data)
-        local stderr = join_job_data(stderr_data)
-
-        if exit_code == 0 then
-          callback(true, stdout)
-          return
-        end
-
-        if did_timeout() then
-          callback(false, string.format("ansible-vault %s timed out after %dms", action, get_timeout_ms(opts) or 0))
-          return
-        end
-
-        callback(false, failure_message(action, exit_code, stderr))
-      end)
-    end,
-  })
-
-  if job_id <= 0 then
-    callback(false, "Failed to start ansible-vault")
-    return
-  end
-
-  local ok
-  ok, stop_timeout, did_timeout = start_job_timeout(job_id, action, opts)
-  if not ok then
-    pcall(vim.fn.jobstop, job_id)
-    callback(false, "Failed to arm the ansible-vault timeout; refusing to run unbounded")
-  end
+  spawn_vault(action, args, opts, creds, nil, file_path, callback)
 end
 
 ---@param buf? integer
@@ -1552,9 +1430,8 @@ end
 local function atomic_write_file(path, data)
   local dir = vim.fn.fnamemodify(path, ":h")
   local tail = vim.fn.fnamemodify(path, ":t")
-  local suffix = uv.random and select(1, uv.random(4)) or nil
-  local nonce = suffix and (suffix:byte(1) * 16777216 + suffix:byte(2) * 65536 + suffix:byte(3) * 256 + suffix:byte(4))
-    or math.random(100000, 999999)
+  local bytes = uv.random(4)
+  local nonce = bytes:byte(1) * 16777216 + bytes:byte(2) * 65536 + bytes:byte(3) * 256 + bytes:byte(4)
   local tmp = string.format("%s/.%s.ansible-vault.nvim.%d.%d", dir, tail, uv.getpid(), nonce)
 
   local mode = DEFAULT_FILE_MODE
@@ -3069,8 +2946,18 @@ local COMMANDS = {
   },
 }
 
+local version_warned = false
+
 ---Apply the plugin's defaults when the user never called `setup()`.
 local function ensure_configured()
+  if not version_warned and vim.fn.has("nvim-" .. M.MIN_NVIM_VERSION) == 0 then
+    version_warned = true
+    vim.notify(
+      string.format("ansible-vault.nvim supports Neovim %s and newer; older versions are untested", M.MIN_NVIM_VERSION),
+      vim.log.levels.WARN
+    )
+  end
+
   if not M._configured then
     M.setup(vim.g.ansible_vault_config or {})
   end
