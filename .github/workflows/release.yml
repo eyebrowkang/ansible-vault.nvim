@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # A broken release is worse than a late one, so the full suite runs against the
+  # tagged commit before anything is published.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Neovim
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run unit tests
+        run: make test
+
+      - name: Run real smoke tests
+        run: make test-real
+
+      - name: Run crash-leak test
+        run: make test-leak
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git-cliff needs the full history and every tag to work out the range.
+          fetch-depth: 0
+
+      - name: Generate release notes
+        id: notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Regenerate the full changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --tag ${{ github.ref_name }}
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.notes.outputs.content }}
+
+      - name: Commit the changelog back to the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # The tag is checked out in detached HEAD; carry the generated file
+          # across the branch switch rather than regenerating it there.
+          cp CHANGELOG.md "$RUNNER_TEMP/CHANGELOG.md"
+          rm -f RELEASE_NOTES.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "$DEFAULT_BRANCH"
+          git checkout -f -B "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH"
+          cp "$RUNNER_TEMP/CHANGELOG.md" CHANGELOG.md
+
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "CHANGELOG.md is already up to date"
+            exit 0
+          fi
+
+          git add CHANGELOG.md
+          git commit -m "chore(release): update changelog for ${{ github.ref_name }} [skip ci]"
+          git push origin "$DEFAULT_BRANCH"
