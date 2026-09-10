@@ -20,17 +20,19 @@ TABLE OF CONTENTS                                   *ansible-vault-contents*
 ==============================================================================
 1. INTRODUCTION                                     *ansible-vault-intro*
 
-ansible-vault.nvim is a Neovim plugin for encrypting and decrypting
-files using the `ansible-vault` command-line tool. It supports:
+ansible-vault.nvim is a Neovim plugin for working with Ansible Vault files
+and inline `!vault` YAML values, built so that decrypted content never
+reaches the disk. See |ansible-vault-security|.
 
-- Encrypt/decrypt entire buffers
-- View encrypted content in floating windows
-- Encrypt selected text as inline YAML vault strings
-- Auto-detect vault-encrypted files
-- Safe editing via scratch buffers (VaultEdit)
+- Encrypt, decrypt, view and edit whole files
+- Create a new encrypted file with |:VaultCreate|
+- Encrypt, view and decrypt inline `!vault` values, by selection or under
+  the cursor
 - Rekey encrypted files
 - Diff decrypted vault content
-- Pick vault files with Telescope or built-in picker
+- Pick vault files with Telescope or the built-in picker
+- Reads `ansible.cfg` and `ANSIBLE_*` variables the way Ansible does
+- Preserves the vault ID label carried by a format 1.2 header
 - Interactive password input with optional in-memory caching
 - Command-line credential overrides with completion
 
@@ -52,7 +54,19 @@ All commands accept optional vault credential overrides as arguments.
 
                                                  *:VaultDecrypt*
 :VaultDecrypt [args]
-    Decrypt the current encrypted buffer in place.
+    Decrypt the current encrypted buffer in place and enter plaintext
+    editing mode. The buffer shows the decrypted content, but `:write`
+    re-encrypts before touching the file, and Neovim's swap file, undo
+    file and backup file are all disabled for it. The buffer stays
+    decrypted after a write so editing can continue; run |:VaultEncrypt|
+    to return it to ciphertext, or `:edit!` to reload the file.
+    See |ansible-vault-security|.
+
+                                                 *:VaultCreate*
+:VaultCreate[!] {file}
+    Create a new Ansible Vault file. Opens an empty, hardened buffer;
+    the file is not created until `:write`, and is only ever written
+    encrypted. Fails if {file} already exists unless `!` is given.
 
                                                  *:VaultView*
 :VaultView [args]
@@ -272,10 +286,58 @@ Call |ansible-vault.setup()| with your settings: >
 
 The plugin resolves credentials in this order:
 
-1. `password_file`                         |ansible-vault-config-password_file|
-2. `vault_ids`                             |ansible-vault-config-vault_ids|
-3. `vault_id`                              |ansible-vault-config-vault_id|
-4. Interactive password prompt
+1. Per-command overrides                   |ansible-vault-command-args|
+2. `password_file`                        |ansible-vault-config-password_file|
+   then `vault_ids`                       |ansible-vault-config-vault_ids|
+   then `vault_id`                        |ansible-vault-config-vault_id|
+3. `ANSIBLE_*` environment variables
+4. `ansible.cfg`
+5. Interactive password prompt
+
+Layers 3 and 4 are Ansible's own. When credentials come from there the
+plugin passes no credential flags at all and simply runs `ansible-vault`
+in the right directory, letting it resolve them. Passing
+`--vault-password-file` on top of an `ansible.cfg` that already sets one
+makes `ansible-vault encrypt` fail with:
+
+    The vault-ids default,default are available to encrypt
+
+                                            *ansible-vault-ansible-cfg*
+ANSIBLE.CFG DISCOVERY
+
+Ansible only looks for `ansible.cfg` in the process working directory and
+does not search upward. In an editor the working directory is rarely the
+playbook directory, so this plugin walks up from the current file:
+
+1. `$ANSIBLE_CONFIG` (a file, or a directory containing `ansible.cfg`)
+2. `ansible.cfg` or `.ansible.cfg`, searching upward from the current file
+3. `~/.ansible.cfg`
+4. `/etc/ansible/ansible.cfg`
+
+`ansible-vault` is then run with its working directory set to wherever the
+config was found, so relative paths inside it resolve exactly as Ansible
+resolves them, which is relative to the config file itself.
+
+These keys are read from `[defaults]`, and the matching environment
+variables override them: `vault_password_file`, `vault_identity_list`,
+`vault_identity`, `vault_encrypt_identity`, `vault_id_match` and
+`ask_vault_pass`.
+
+Run |:VaultInfo| to see which config was found and which credential
+source is actually in effect.
+
+                                            *ansible-vault-vault-id-label*
+VAULT ID LABELS
+
+A file encrypted with a vault ID carries the label in its header:
+
+    $ANSIBLE_VAULT;1.2;AES256;prod
+
+Re-encrypting such a file with a plain `--vault-password-file` would
+rewrite it as `$ANSIBLE_VAULT;1.1;AES256` and drop the label. The plugin
+reads the label before decrypting and names it again on the way back, so
+|:VaultEdit|, |:VaultDecrypt| plus `:write`, and |:VaultRekey| all leave
+the header intact.
 
 Most commands also accept temporary credential overrides via
 command-line arguments. See |ansible-vault-command-args|.
@@ -299,6 +361,18 @@ on the next attempt.
                                      *ansible-vault.is_buffer_encrypted()*
 `is_buffer_encrypted(buf?)` ~
     Check if a buffer is vault encrypted.
+
+                                     *ansible-vault.parse_header()*
+`parse_header(content)` ~
+    Parse a `$ANSIBLE_VAULT` header. Returns
+    `{ version, cipher, label }` or `nil`. See
+    |ansible-vault-vault-id-label|.
+
+                                     *ansible-vault.create()*
+`create(opts?)` ~
+    Create a new Ansible Vault file. The path is taken from
+    `opts.positionals[1]`; set `opts.bang` to overwrite. See
+    |:VaultCreate|.
 
                                      *ansible-vault.encrypt()*
 `encrypt(buf?, opts?)` ~
@@ -349,8 +423,15 @@ on the next attempt.
 
                                      *ansible-vault.status()*
 `status(buf?)` ~
-    Return `"[VAULT]"` if the buffer is encrypted, otherwise
-    `""`. Useful for statusline integration.
+    Statusline string: `"[VAULT]"` for an encrypted buffer,
+    `"[VAULT:prod]"` when the file carries a vault ID label,
+    `"[VAULT:decrypted]"` while it is in plaintext editing mode,
+    and `""` otherwise.
+
+                                     *ansible-vault.cleanup()*
+`cleanup()` ~
+    Drop every secret this process still holds. Runs
+    automatically on |VimLeavePre|.
 
                                      *ansible-vault.encrypt_string()*
 `encrypt_string(range_opts?, opts?)` ~
@@ -385,8 +466,10 @@ The plugin emits |User| autocommands after successful operations:
     `AnsibleVaultEncrypt`
     `AnsibleVaultDecrypt`
     `AnsibleVaultView`
+    `AnsibleVaultCreate`
     `AnsibleVaultEditOpen`
     `AnsibleVaultEditSave`
+    `AnsibleVaultPlaintextSave`
     `AnsibleVaultRekey`
     `AnsibleVaultStringEncrypt`
     `AnsibleVaultStringDecrypt`
@@ -407,22 +490,55 @@ Example: >
 ==============================================================================
 8. SECURITY                                     *ansible-vault-security*
 
-- Commands are executed as argv lists, not shell strings. Configuration
-  values are not evaluated by a shell.
-- Interactive passwords are collected with |inputsecret()| and written
-  to a temporary `0600` password file for the duration of the operation.
+The goal is that decrypted content never reaches the disk, including
+after `kill -9` or a power loss.
+
+WHAT THE PLUGIN GUARANTEES
+
+- No swap file. 'swapfile' is reset before plaintext enters a buffer,
+  which also deletes any swap file that already existed for it.
+- No undo file. 'undofile' is off for decrypted buffers, and the undo
+  history is cleared across every encrypt/decrypt transition.
+- No backup file. Decrypted buffers use 'buftype' `acwrite`, so Neovim
+  skips its own write path entirely and 'backup' and 'writebackup'
+  never apply.
+- No accidental plaintext write. Every form of `:write`, including
+  `:write {other-file}`, goes through the plugin and encrypts first.
+- No password on disk. Interactive passwords are collected with
+  |inputsecret()| and passed to `ansible-vault` through the child
+  process environment, read back by a static helper script in
+  `stdpath("run")` that contains no secret. Where that is not possible
+  the plugin falls back to a `0600` temporary file, removes it on exit,
+  and |:checkhealth| reports which mode is in use.
+- Nothing secret in messages. Process stdout is never echoed into an
+  error, because `ansible-vault decrypt` can write plaintext to stdout
+  and still exit non-zero. Debug logging redacts credential arguments.
+- No plaintext argv. Content goes over stdin and passwords are passed
+  by reference, so neither appears in `ps`.
+- Atomic writes. Encrypted output is written to a sibling temporary
+  file, `fsync`ed, then renamed into place, inheriting the original
+  file's mode.
+- |:VaultEdit| additionally refuses to overwrite the original file if
+  it changed on disk while the scratch buffer was open.
 - `password_cache_ttl` is disabled by default. When enabled, the
-  password is kept in Neovim process memory until expiry or until
-  |:VaultClearPasswordCache| is called.
-- |:VaultEdit| uses a scratch `acwrite` buffer with `swapfile=false`,
-  `undofile=false`, and `bufhidden=wipe`.
-- |:VaultEdit| writes encrypted output through a temporary file and
-  atomically replaces the original file.
-- |:VaultEdit| refuses to overwrite the original file if it changed
-  on disk while the scratch buffer was open.
-- Decrypted text resides in Neovim process memory while viewing or
-  editing. Review your Neovim plugins, clipboard settings, backups,
-  shada, and session recording for highly sensitive secrets.
+  password is held in Neovim process memory until it expires, until
+  |:VaultClearPasswordCache| is called, or until Neovim exits.
+
+WHAT IS STILL UP TO YOU
+
+These are global Neovim settings the plugin deliberately does not
+change. |:VaultInfo| and |:checkhealth| warn when they are enabled.
+
+- 'shada' persists registers, so text you *yank* out of a decrypted
+  buffer or the |:VaultView| window is written to the shada file on
+  exit. Consider `:set shada=` while working with secrets.
+- 'backup' applies to files written outside this plugin.
+- Decrypted content is in Neovim's memory while you view or edit it, so
+  it can reach the OS swap partition or a core dump. Review your other
+  plugins, clipboard settings and terminal or session recording.
+- |:VaultDiff| refuses to run when 'diffexpr' is set or 'diffopt' lacks
+  "internal", because Neovim would then write both sides to temporary
+  files.
 
 ==============================================================================
 9. HEALTH CHECK                                 *ansible-vault-health*
@@ -430,17 +546,24 @@ Example: >
 Run |:checkhealth| to verify your setup: >
     :checkhealth ansible-vault
 <
-The health check validates:
-- `ansible-vault` executable availability
-- Password file readability and 0600 permissions
-- Vault ID label sources
-- `encrypt_vault_id` consistency
+The health check reports:
+- `ansible-vault` executable availability, including a `conda run` wrapper
+- Which credential source is actually in effect, resolved through the
+  same code the real operations use
+- The `ansible.cfg` that was found, how it was found, and the directory
+  `ansible-vault` will run in
+- Password file readability and 0600 permissions, recognising executable
+  password scripts as the supported configuration they are
+- Vault ID label sources and `encrypt_vault_id` consistency
 - |:VaultRekey| target configuration
+- Whether interactive passwords can be kept off disk entirely
+- Global options that could still persist decrypted content
 
 ==============================================================================
 10. STATUSLINE INTEGRATION                  *ansible-vault-statusline*
 
-Use |ansible-vault.status()| in your statusline: >
+Use |ansible-vault.status()| in your statusline. It returns `"[VAULT]"`,
+`"[VAULT:<label>]"`, `"[VAULT:decrypted]"` or `""`: >
 
     -- Manual integration
     if require("ansible-vault").is_buffer_encrypted() then
