@@ -36,6 +36,10 @@ jobs:
   test:
     needs: lint
     runs-on: ubuntu-latest
+    # Stable is what the plugin supports and must stay green. Nightly is an early
+    # warning about upcoming Neovim changes; an upstream change breaking it should
+    # surface without blocking work that has nothing to do with it.
+    continue-on-error: ${{ matrix.neovim_version == 'nightly' }}
     strategy:
       fail-fast: false
       matrix:
