@@ -48,7 +48,9 @@ commit_parsers = [
   { message = "^docs", group = "<!-- 4 -->Documentation" },
   { message = "^test", group = "<!-- 5 -->Testing" },
   { message = "^ci|^build", group = "<!-- 6 -->Build & CI" },
+  # Changelog bookkeeping should not appear in the changelog.
   { message = "^chore\\(release\\)", skip = true },
+  { message = "(?i)^docs.*changelog", skip = true },
   { message = "^chore", group = "<!-- 7 -->Miscellaneous" },
   { message = "^style", skip = true },
   { body = ".*security", group = "<!-- 1 -->Bug Fixes" },
