@@ -1804,7 +1804,13 @@ write_plaintext_buffer = function(buf, target_path, opts)
         return
       end
 
-      local write_ok, write_err = atomic_write_file(path, buffer_content(buf) .. "\n")
+      -- Written as ordinary YAML, so the buffer's own line endings and trailing
+      -- newline have to be reproduced rather than assumed.
+      local eol = vim.bo[buf].fileformat == "dos" and "\r\n" or "\n"
+      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+      local body = table.concat(lines, eol) .. (vim.bo[buf].endofline and eol or "")
+
+      local write_ok, write_err = atomic_write_file(path, body)
       if not write_ok then
         vim.notify("Failed to write file: " .. tostring(write_err), vim.log.levels.ERROR)
         finish(false)
