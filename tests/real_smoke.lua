@@ -252,6 +252,37 @@ wait_until(function()
   return vim.api.nvim_buf_get_lines(cfg_buf, 0, 1, false)[1] == "db_password: fromcfg"
 end, "decrypting with ansible.cfg credentials failed")
 
+-- 3b. The same project, but with a password file configured in the plugin and
+--     the working directory inside the project, which is how people actually
+--     work. Ansible then sees two "default" identities and refuses to encrypt
+--     unless one is named explicitly.
+local original_cwd = vim.fn.getcwd()
+vim.cmd("cd " .. vim.fn.fnameescape(project))
+
+local own_pass = project .. "/own_pass"
+write_file(own_pass, "ownsecret\n")
+vim.fn.setfperm(own_pass, "rw-------")
+
+vault.setup({
+  ansible_vault_path = ansible_vault,
+  password_file = own_pass,
+  auto_detect = false,
+  notify_success = false,
+})
+require("ansible-vault.ansible_cfg").clear_cache()
+
+local clash_file = project .. "/group_vars/prod/clash.yml"
+write_file(clash_file, "")
+vim.cmd("edit " .. vim.fn.fnameescape(clash_file))
+local clash_buf = vim.api.nvim_get_current_buf()
+vim.api.nvim_buf_set_lines(clash_buf, 0, -1, false, { "clash: value" })
+vault.encrypt(clash_buf)
+wait_until(function()
+  return vault.is_buffer_encrypted(clash_buf)
+end, "encrypting alongside an ansible.cfg identity failed (the vault-ids default,default error)")
+
+vim.cmd("cd " .. vim.fn.fnameescape(original_cwd))
+
 -- 4. VaultCreate produces a file that only ever contained ciphertext.
 local created = workdir .. "/created.yml"
 vault.setup({
