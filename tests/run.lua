@@ -1268,6 +1268,82 @@ tests["decrypting an inline string enters inline mode and write restores the blo
   assert_true(written:match("!vault") ~= nil, "the vault block must be restored")
 end
 
+tests["multiple decrypted inline values are all restored on write"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local dir = temp_dir()
+  local buf, path = new_file_buffer(dir, "vars.yml", {
+    "first: !vault |",
+    "          $ANSIBLE_VAULT;1.1;AES256",
+    "          ENCSTR:alpha",
+    "middle: plain",
+    "second: !vault |",
+    "          $ANSIBLE_VAULT;1.1;AES256",
+    "          ENCSTR:beta",
+  })
+
+  vim.api.nvim_win_set_cursor(0, { 5, 0 })
+  vault.decrypt_string_under_cursor()
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 4, 5, false)[1] == "second: beta"
+  end, "second value was not decrypted")
+
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  vault.decrypt_string_under_cursor()
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "first: alpha"
+  end, "first value was not decrypted")
+
+  assert_eq(
+    vim.api.nvim_buf_get_lines(buf, 0, -1, false),
+    { "first: alpha", "middle: plain", "second: beta" },
+    "both values should be decrypted in place"
+  )
+
+  vim.cmd("silent write")
+  wait_until(function()
+    return vim.bo[buf].buftype == ""
+  end, "write did not complete")
+
+  local written = read_file(path)
+  assert_false(written:match("first: alpha") ~= nil, "the first value must be written as a vault block")
+  assert_false(written:match("second: beta") ~= nil, "the second value must be written as a vault block")
+  assert_true(written:match("middle: plain") ~= nil, "untouched lines must be written unchanged")
+  assert_eq(select(2, written:gsub("!vault", "")), 2, "both vault blocks must be restored")
+end
+
+tests["inline restore preserves dos line endings"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local dir = temp_dir()
+  local path = dir .. "/crlf.yml"
+  write_file(
+    path,
+    "keep: me\r\npassword: !vault |\r\n          $ANSIBLE_VAULT;1.1;AES256\r\n          ENCSTR:hunter2\r\n"
+  )
+  vim.cmd("edit " .. vim.fn.fnameescape(path))
+  local buf = vim.api.nvim_get_current_buf()
+  assert_eq(vim.bo[buf].fileformat, "dos", "precondition: the fixture should be detected as dos")
+
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  vault.decrypt_string_under_cursor()
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "password: hunter2"
+  end, "CRLF inline value was not decrypted")
+
+  vim.cmd("silent write")
+  wait_until(function()
+    return vim.bo[buf].buftype == ""
+  end, "write did not complete")
+
+  local written = read_file(path)
+  assert_true(written:match("keep: me\r\n") ~= nil, "dos line endings must be preserved")
+  assert_false(written:match("password: hunter2") ~= nil, "the value must be written as a vault block")
+  assert_true(written:match("!vault") ~= nil, "the vault block must be restored")
+end
+
 tests["failed decryption does not surface process output"] = function()
   local fake = create_fake_vault()
   reset_config(fake)
