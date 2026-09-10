@@ -109,14 +109,24 @@ local function ensure_askpass()
     return nil, "could not restrict permissions on " .. dir
   end
 
+  -- Written through a rename so a second Neovim starting at the same moment
+  -- never observes the script mid-truncation and reads an empty password.
   local path = dir .. "/askpass.sh"
-  local fd, open_err = uv.fs_open(path, "w", DIR_MODE)
+  local tmp = string.format("%s.%d", path, uv.getpid())
+
+  local fd, open_err = uv.fs_open(tmp, "w", DIR_MODE)
   if not fd then
     return nil, open_err or ("could not write " .. path)
   end
   uv.fs_write(fd, ASKPASS_SCRIPT)
   uv.fs_close(fd)
-  uv.fs_chmod(path, DIR_MODE)
+  uv.fs_chmod(tmp, DIR_MODE)
+
+  local renamed, rename_err = uv.fs_rename(tmp, path)
+  if not renamed then
+    os.remove(tmp)
+    return nil, rename_err or ("could not install " .. path)
+  end
 
   askpass_path = path
   return path, nil
