@@ -25,7 +25,7 @@ local ansible_cfg = require("ansible-vault.ansible_cfg")
 
 local M = {}
 
-local uv = vim.uv or vim.loop
+local uv = vim.uv
 
 local PASSWORD_ENV = "ANSIBLE_VAULT_NVIM_PASSWORD"
 local PASSWORD_FILE_MODE = 384 -- 0600
@@ -90,8 +90,8 @@ local function ensure_askpass()
     return nil, "no POSIX uid support"
   end
 
-  local ok, base = pcall(vim.fn.stdpath, "run")
-  if not ok or not is_nonempty_string(base) then
+  local base = vim.fn.stdpath("run")
+  if not is_nonempty_string(base) then
     return nil, "stdpath('run') is unavailable"
   end
 

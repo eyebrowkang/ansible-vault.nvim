@@ -51,8 +51,16 @@ values, built so that decrypted content never reaches the disk.
 
 ## Requirements
 
-- Neovim >= 0.9.0
+- Neovim >= 0.12
 - `ansible-vault` command available in PATH (or via conda environment)
+
+### Version support policy
+
+This plugin tracks the **current Neovim release only**. Older versions are not
+worked around and are not tested; they may happen to work, but that is not a
+promise. Keeping a single target is what keeps the plugin maintainable with the
+effort available. `:checkhealth ansible-vault` tells you whether your version is
+supported.
 
 ## Installation
 

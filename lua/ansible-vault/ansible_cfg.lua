@@ -13,7 +13,7 @@
 ---"The vault-ids default,default are available to encrypt".
 local M = {}
 
-local uv = vim.uv or vim.loop
+local uv = vim.uv
 
 local CONFIG_NAMES = { "ansible.cfg", ".ansible.cfg" }
 

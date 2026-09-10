@@ -96,25 +96,18 @@ local function check_vault_ids(config)
 end
 
 function M.check()
-  local legacy = vim.fn.has("nvim-0.10") == 0
-  if legacy then
-    health = {
-      ok = function(msg)
-        print("  - OK: " .. msg)
-      end,
-      warn = function(msg)
-        print("  - WARN: " .. msg)
-      end,
-      error = function(msg)
-        print("  - ERROR: " .. msg)
-      end,
-      info = function(msg)
-        print("  - INFO: " .. msg)
-      end,
-    }
-    print("ansible-vault.nvim health check:")
+  health.start("ansible-vault.nvim")
+
+  local v = vim.version()
+  if vim.fn.has("nvim-" .. vault.MIN_NVIM_VERSION) == 1 then
+    health.ok(string.format("Neovim %d.%d.%d", v.major, v.minor, v.patch))
   else
-    health.start("ansible-vault.nvim")
+    health.error(
+      string.format(
+        "Neovim %s is required; this plugin tracks the current release only and does not support older ones",
+        vault.MIN_NVIM_VERSION
+      )
+    )
   end
 
   local argv = vault._private.get_vault_argv()

@@ -39,8 +39,15 @@ reaches the disk. See |ansible-vault-security|.
 ==============================================================================
 2. REQUIREMENTS                               *ansible-vault-requirements*
 
-- Neovim >= 0.9.0
+- Neovim >= 0.12
 - `ansible-vault` command available in PATH or via conda environment
+
+                                            *ansible-vault-version-policy*
+This plugin tracks the CURRENT Neovim release only. Older versions are not
+worked around and are not tested; they may happen to work, but that is not a
+promise. Keeping a single target is what keeps the plugin maintainable with
+the effort available. |:checkhealth| reports whether your version is
+supported.
 
 ==============================================================================
 3. COMMANDS                                       *ansible-vault-commands*
