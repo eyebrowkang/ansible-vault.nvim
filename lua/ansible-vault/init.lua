@@ -2342,14 +2342,22 @@ end
 ---plaintext on disk, so refuse instead.
 ---@return boolean ok
 ---@return string|nil reason
+---Read against the raw option string rather than `vim.opt.diffopt:get()`: the
+---structured view of key:value options changed shape between releases, from a
+---list of "key:value" strings to a map, and silently reading the wrong shape
+---here would disable VaultDiff entirely.
 local function diff_stays_in_memory()
   if vim.o.diffexpr ~= "" then
     return false, "'diffexpr' is set, so Neovim would write both sides to temporary files"
   end
-  if not vim.tbl_contains(vim.opt.diffopt:get(), "internal") then
-    return false, "'diffopt' does not include \"internal\", so Neovim would write both sides to temporary files"
+
+  for item in vim.o.diffopt:gmatch("[^,]+") do
+    if item == "internal" then
+      return true, nil
+    end
   end
-  return true, nil
+
+  return false, "'diffopt' does not include \"internal\", so Neovim would write both sides to temporary files"
 end
 
 ---@param left_name string
@@ -3064,6 +3072,7 @@ M._private = {
   complete_diff_args = complete_diff_args,
   complete_files_args = complete_files_args,
   complete_create_args = complete_create_args,
+  diff_stays_in_memory = diff_stays_in_memory,
   needs_yaml_quoting = needs_yaml_quoting,
   yaml_quote_value = yaml_quote_value,
   redact_argv = redact_argv,

@@ -680,6 +680,29 @@ tests["VaultDecryptString replaces selected YAML vault block"] = function()
   assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "password: secret" })
 end
 
+tests["VaultDiff refuses to run when Neovim would use an external diff"] = function()
+  local stays = vault._private.diff_stays_in_memory
+
+  -- Read from the raw option string. `vim.opt.diffopt:get()` returns a list of
+  -- "key:value" strings on some releases and a map on others, and reading the
+  -- wrong shape here silently disables VaultDiff.
+  local diffopt, diffexpr = vim.o.diffopt, vim.o.diffexpr
+
+  vim.o.diffexpr = ""
+  vim.o.diffopt = "internal,filler,closeoff,indent-heuristic,inline:char,linematch:40"
+  assert_true(stays(), "the default diffopt keeps the diff in memory")
+
+  vim.o.diffopt = "filler,closeoff"
+  assert_false(stays(), 'without "internal" Neovim writes both sides to temporary files')
+
+  vim.o.diffopt = "internal,filler"
+  vim.o.diffexpr = "MyDiff()"
+  assert_false(stays(), "a diffexpr makes Neovim write both sides to temporary files")
+
+  vim.o.diffopt = diffopt
+  vim.o.diffexpr = diffexpr
+end
+
 tests["VaultDiff opens decrypted diff buffers"] = function()
   local fake = create_fake_vault()
   reset_config(fake)
