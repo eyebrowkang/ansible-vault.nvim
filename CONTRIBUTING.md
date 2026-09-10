@@ -16,8 +16,20 @@ Types in use: `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `ci`, `build`,
 `chore`, `style`, `revert`. Append `!` or add a `BREAKING CHANGE:` footer for
 incompatible changes.
 
-Pull requests are squash-merged, so the **pull request title** becomes the
-commit subject. CI checks it against the same pattern.
+### Merge strategy
+
+The changelog has one entry per commit on the default branch, so how a pull
+request is merged decides how it appears:
+
+- **Squash** collapses the branch into one commit and the pull request title
+  becomes its subject. Right for a PR that is one logical change. CI checks the
+  title against the pattern above for exactly this reason.
+- **Rebase** keeps every commit. Right for a branch that carries several
+  independent, individually meaningful changes — squashing one of those throws
+  away release notes you already wrote.
+
+Do not use a merge commit: the merge itself is unconventional and gets filtered
+out, and it adds nothing.
 
 ## Running the tests
 
