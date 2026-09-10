@@ -281,7 +281,7 @@ buffer 的常规行为，或者用 `:edit!` 重新载入加密文件。
 
 ### 自动安全编辑加密文件
 
-如果希望打开加密文件时直接进入更安全的 `:VaultEdit` scratch 流程：
+如果希望打开加密文件时直接进入 `:VaultEdit` scratch 流程：
 
 ```lua
 require("ansible-vault").setup({
@@ -293,8 +293,8 @@ require("ansible-vault").setup({
 
 ### 切换当前 buffer 状态
 
-执行 `:VaultToggle` 可以在普通内容和 vault 密文之间切换。这个命令适合快速
-查看，但要小心不要把解密后的 secret 误保存到磁盘。
+执行 `:VaultToggle` 可以在普通内容和 vault 密文之间切换。用它解密同样会进入
+`:VaultDecrypt` 的明文编辑态，所以 `:w` 依然会先重新加密。
 
 ### 对解密后的内容做 diff
 

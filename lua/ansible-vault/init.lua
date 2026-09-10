@@ -920,11 +920,9 @@ local function enter_plaintext_mode(buf, mode, opts)
     return
   end
 
-  if vim.api.nvim_buf_get_name(buf) == "" then
-    -- Nothing to write back to; hardening the buffer is all that applies.
-    return
-  end
-
+  -- Unnamed buffers get the same treatment: `:w some-file` on one would
+  -- otherwise write the plaintext straight out. BufWriteCmd receives the
+  -- requested path, so it encrypts to wherever the user asked.
   vim.b[buf].ansible_vault_plaintext = mode
   vim.bo[buf].buftype = "acwrite"
 
