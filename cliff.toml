@@ -41,6 +41,11 @@ commit_preprocessors = [
 ]
 
 commit_parsers = [
+  # Skips first: parsers are evaluated in order and the first match wins.
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "(?i)^docs.*changelog", skip = true },
+  { message = "^style", skip = true },
+
   { message = "^feat", group = "<!-- 0 -->Features" },
   { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
   { message = "^perf", group = "<!-- 2 -->Performance" },
@@ -48,11 +53,7 @@ commit_parsers = [
   { message = "^docs", group = "<!-- 4 -->Documentation" },
   { message = "^test", group = "<!-- 5 -->Testing" },
   { message = "^ci|^build", group = "<!-- 6 -->Build & CI" },
-  # Changelog bookkeeping should not appear in the changelog.
-  { message = "^chore\\(release\\)", skip = true },
-  { message = "(?i)^docs.*changelog", skip = true },
   { message = "^chore", group = "<!-- 7 -->Miscellaneous" },
-  { message = "^style", skip = true },
   { body = ".*security", group = "<!-- 1 -->Bug Fixes" },
 ]
 
