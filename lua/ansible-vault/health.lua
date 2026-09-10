@@ -1,5 +1,7 @@
 local M = {}
 
+local credentials = require("ansible-vault.credentials")
+local secure = require("ansible-vault.secure")
 local vault = require("ansible-vault")
 local health = vim.health
 
@@ -7,9 +9,7 @@ local function is_nonempty_string(value)
   return type(value) == "string" and value ~= ""
 end
 
-local function expand_path(path)
-  return vim.fn.expand(path)
-end
+local expand_path = credentials.expand_path
 
 local function path_exists(path)
   return vim.fn.filereadable(path) == 1 or vim.fn.isdirectory(path) == 1
@@ -23,6 +23,18 @@ local function check_password_file(path, label)
   end
 
   local perm = vim.fn.getfperm(expanded)
+
+  -- Ansible runs an executable password file and takes its stdout as the
+  -- password, so the execute bit is a supported configuration, not a mistake.
+  if vim.fn.executable(expanded) == 1 then
+    if perm:sub(4) ~= "------" then
+      health.warn(string.format("%s is an executable script readable by group/other: %s (%s)", label, expanded, perm))
+    else
+      health.ok(string.format("%s is an executable password script: %s", label, expanded))
+    end
+    return
+  end
+
   if perm:sub(4) ~= "------" then
     health.warn(string.format("%s is readable by group/other: %s (%s)", label, expanded, perm))
     return
@@ -121,6 +133,28 @@ function M.check()
   end
 
   local config = vault.config
+
+  -- Resolved through the same code path the real operations use, so this cannot
+  -- report a credential source that is not the one in effect.
+  local resolved = credentials.describe(config, { file_path = vim.api.nvim_buf_get_name(0) })
+
+  health.info("Credential source: " .. resolved.source)
+  if resolved.cfg_path then
+    health.info(string.format("ansible.cfg: %s (found via %s)", resolved.cfg_path, resolved.cfg_source))
+    health.info("ansible-vault will run in: " .. (resolved.cwd or "the current directory"))
+  else
+    health.info("No ansible.cfg found")
+  end
+
+  if resolved.needs_disambiguation then
+    health.info(
+      string.format(
+        "Ansible's own config supplies a second identity; encryption will name '%s' explicitly",
+        resolved.encrypt_label or "default"
+      )
+    )
+  end
+
   if is_nonempty_string(config.password_file) then
     check_password_file(config.password_file, "password_file")
     if is_nonempty_string(config.vault_id) or (type(config.vault_ids) == "table" and #config.vault_ids > 0) then
@@ -128,10 +162,8 @@ function M.check()
     end
   else
     check_vault_ids(config)
-    if
-      not is_nonempty_string(config.vault_id) and not (type(config.vault_ids) == "table" and #config.vault_ids > 0)
-    then
-      health.warn("No password_file or vault_id configured; commands will prompt for a password")
+    if resolved.source == "interactive" then
+      health.warn("No password_file, vault_id, ANSIBLE_* variable or ansible.cfg found; commands will prompt")
     end
   end
 
@@ -141,6 +173,27 @@ function M.check()
     health.info("VaultRekey new vault ID configured: " .. config.rekey_vault_id)
   else
     health.info("VaultRekey requires --new-vault-* command args when no rekey target is configured")
+  end
+
+  -- Global options the plugin deliberately leaves alone.
+  local warnings = secure.global_warnings()
+  if #warnings == 0 then
+    health.ok("No global options that could persist decrypted content are enabled")
+  else
+    for _, warning in ipairs(warnings) do
+      health.warn(warning)
+    end
+  end
+
+  local askpass, askpass_err = credentials._private.ensure_askpass()
+  if askpass then
+    health.ok("Interactive passwords are passed via the environment; nothing secret is written to disk")
+  else
+    health.warn(
+      "Falling back to a 0600 temporary password file ("
+        .. (askpass_err or "unknown reason")
+        .. "); it is removed on exit but would survive a crash"
+    )
   end
 end
 
