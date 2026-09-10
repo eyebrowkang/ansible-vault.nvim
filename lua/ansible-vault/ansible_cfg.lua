@@ -157,7 +157,7 @@ local function find_config(start_dir)
   if start_dir and start_dir ~= "" then
     local found = vim.fs.find(CONFIG_NAMES, { upward = true, path = start_dir, type = "file" })
     if found and found[1] then
-      return found[1], "upward"
+      return vim.fn.fnamemodify(found[1], ":p"), "upward"
     end
   end
 
@@ -234,12 +234,19 @@ end
 ---@param file_path string|nil Buffer path; its directory starts the upward walk
 ---@return AnsibleVaultCfg
 function M.resolve(file_path)
+  -- Buffers with a scheme-style name, such as the `health://` report or the
+  -- plugin's own `ansible-vault://` scratch buffers, do not expand to a real
+  -- directory. Fall back to the working directory rather than searching upward
+  -- from something that does not exist.
   local start_dir
   if file_path and file_path ~= "" then
-    start_dir = vim.fn.fnamemodify(file_path, ":p:h")
-  else
-    start_dir = vim.fn.getcwd()
+    local candidate = vim.fn.fnamemodify(file_path, ":p:h")
+    local stat = uv.fs_stat(candidate)
+    if stat and stat.type == "directory" then
+      start_dir = candidate
+    end
   end
+  start_dir = start_dir or vim.fn.getcwd()
 
   local cfg_path, cfg_source = find_config(start_dir)
 

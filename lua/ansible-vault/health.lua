@@ -135,8 +135,9 @@ function M.check()
   local config = vault.config
 
   -- Resolved through the same code path the real operations use, so this cannot
-  -- report a credential source that is not the one in effect.
-  local resolved = credentials.describe(config, { file_path = vim.api.nvim_buf_get_name(0) })
+  -- report a credential source that is not the one in effect. The report runs in
+  -- its own buffer, so resolution starts from the working directory.
+  local resolved = credentials.describe(config, {})
 
   health.info("Credential source: " .. resolved.source)
   if resolved.cfg_path then
