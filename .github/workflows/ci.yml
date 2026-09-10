@@ -69,3 +69,27 @@ jobs:
 
       - name: Run real smoke tests
         run: make test-real
+
+      # Kills Neovim with a vault file decrypted and greps Neovim's swap, undo
+      # and runtime directories for the plaintext.
+      - name: Run crash-leak test
+        run: make test-leak
+
+  # Release notes are generated from the commit history, so the subject line has
+  # to parse. Squash merges take the pull request title as the subject.
+  commit-convention:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the pull request title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          pattern='^(feat|fix|perf|refactor|docs|test|ci|build|chore|style|revert)(\([a-z0-9._/-]+\))?!?: .+'
+          if ! printf '%s' "$TITLE" | grep -Eq "$pattern"; then
+            echo "::error::Pull request title must follow Conventional Commits, for example 'fix: stop leaking plaintext'."
+            echo "Got: $TITLE"
+            exit 1
+          fi
+          echo "OK: $TITLE"

@@ -90,8 +90,8 @@ local function ensure_askpass()
     return nil, "no POSIX uid support"
   end
 
-  local base = vim.fn.stdpath("run")
-  if not is_nonempty_string(base) then
+  local ok, base = pcall(vim.fn.stdpath, "run")
+  if not ok or not is_nonempty_string(base) then
     return nil, "stdpath('run') is unavailable"
   end
 
