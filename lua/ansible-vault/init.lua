@@ -278,6 +278,11 @@ end
 local function buffer_context(buf)
   local context = {}
   if buf and vim.api.nvim_buf_is_valid(buf) then
+    -- Read the header while the buffer still holds ciphertext. Once it has been
+    -- decrypted there is nothing left to recover the vault id label from, and
+    -- re-encrypting without it silently rewrites the file as format 1.1.
+    remember_header(buf)
+
     local name = vim.api.nvim_buf_get_name(buf)
     if name ~= "" then
       context.file_path = name
@@ -1768,12 +1773,27 @@ write_plaintext_buffer = function(buf, target_path, opts)
   local mode = vim.b[buf].ansible_vault_plaintext
   vim.b[buf].ansible_vault_write_pending = true
 
+  local done = false
+
   local function finish(ok)
+    done = true
     if is_valid_buf(buf) then
       vim.b[buf].ansible_vault_write_pending = nil
       if ok then
         vim.bo[buf].modified = false
       end
+    end
+  end
+
+  -- `:w` has to have finished by the time it returns, or `:wq` would try to quit
+  -- while the encryption is still in flight. The event loop keeps running, so
+  -- this waits without freezing the job that does the work.
+  local function await()
+    local budget = get_timeout_ms(opts) or 30000
+    if not vim.wait(budget + 1000, function()
+      return done
+    end, 20) then
+      vim.notify("Timed out waiting for the vault write to finish", vim.log.levels.ERROR)
     end
   end
 
@@ -1798,6 +1818,7 @@ write_plaintext_buffer = function(buf, target_path, opts)
       emit_event("PlaintextSave", { buf = buf, file = path })
       finish(true)
     end)
+    await()
     return
   end
 
@@ -1833,6 +1854,8 @@ write_plaintext_buffer = function(buf, target_path, opts)
       finish(true)
     end, opts, creds)
   end, opts, context)
+
+  await()
 end
 
 ---@param path string

@@ -155,4 +155,119 @@ wait_until(function()
   return vim.api.nvim_buf_get_lines(file_buf, 0, -1, false)[1] == "plain: edited"
 end, "real VaultEdit ciphertext did not decrypt to saved content")
 
+--- The four behaviours that only the real binary can prove -----------------
+
+-- 1. A decrypted, file-backed buffer writes ciphertext and nothing else.
+local live_file = workdir .. "/live.yml"
+write_file(live_file, "")
+vim.cmd("edit " .. vim.fn.fnameescape(live_file))
+local live_buf = vim.api.nvim_get_current_buf()
+vim.api.nvim_buf_set_lines(live_buf, 0, -1, false, { "api_key: SUPERSECRET" })
+vault.encrypt(live_buf)
+wait_until(function()
+  return vault.is_buffer_encrypted(live_buf)
+end, "real encrypt of the live buffer did not finish")
+vim.cmd("silent write")
+
+vault.decrypt(live_buf)
+wait_until(function()
+  return vim.api.nvim_buf_get_lines(live_buf, 0, 1, false)[1] == "api_key: SUPERSECRET"
+end, "real decrypt of the live buffer did not finish")
+
+assert_true(vim.bo[live_buf].swapfile == false, "decrypted buffer still has 'swapfile' on")
+assert_true(vim.bo[live_buf].undofile == false, "decrypted buffer still has 'undofile' on")
+assert_eq(vim.bo[live_buf].buftype, "acwrite", "decrypted buffer does not route writes through the plugin")
+assert_eq(vim.fn.swapname(live_buf), "", "decrypted buffer has a swap file")
+
+vim.api.nvim_buf_set_lines(live_buf, 0, -1, false, { "api_key: EVENMORESECRET" })
+vim.cmd("silent write")
+
+local live_contents = read_file(live_file)
+assert_true(live_contents:match("^%$ANSIBLE_VAULT"), "writing a decrypted buffer did not produce ciphertext")
+assert_true(
+  live_contents:find("EVENMORESECRET", 1, true) == nil,
+  "plaintext reached disk when writing a decrypted buffer"
+)
+
+-- 2. A 1.2 header keeps its vault id label across a decrypt/encrypt round trip.
+local labelled = workdir .. "/labelled.yml"
+local label_pass = workdir .. "/prod-pass"
+write_file(label_pass, "prodsecret\n")
+vim.fn.setfperm(label_pass, "rw-------")
+write_file(labelled, "plain: labelled\n")
+vim.fn.system({ ansible_vault, "encrypt", "--vault-id", "prod@" .. label_pass, labelled })
+assert_true(
+  read_file(labelled):match("^%$ANSIBLE_VAULT;1%.2;AES256;prod") ~= nil,
+  "fixture was not encrypted with a 1.2 vault id label"
+)
+
+vault.setup({
+  ansible_vault_path = ansible_vault,
+  vault_ids = { "prod@" .. label_pass },
+  auto_detect = false,
+  notify_success = false,
+})
+
+vim.cmd("edit " .. vim.fn.fnameescape(labelled))
+local label_buf = vim.api.nvim_get_current_buf()
+vault.decrypt(label_buf)
+wait_until(function()
+  return vim.api.nvim_buf_get_lines(label_buf, 0, 1, false)[1] == "plain: labelled"
+end, "real decrypt of the labelled file did not finish")
+
+vim.cmd("silent write")
+assert_eq(
+  read_file(labelled):match("^[^\n]*"),
+  "$ANSIBLE_VAULT;1.2;AES256;prod",
+  "re-encrypting downgraded the file to 1.1 and dropped its vault id label"
+)
+
+-- 3. ansible.cfg alone is enough; adding our own flag on top is what breaks
+--    encryption with "The vault-ids default,default are available to encrypt".
+local project = workdir .. "/project"
+vim.fn.mkdir(project .. "/group_vars/prod", "p")
+write_file(project .. "/.vault_pass", "cfgsecret\n")
+vim.fn.setfperm(project .. "/.vault_pass", "rw-------")
+write_file(project .. "/ansible.cfg", "[defaults]\nvault_password_file = .vault_pass\n")
+
+vault.setup({
+  ansible_vault_path = ansible_vault,
+  auto_detect = false,
+  notify_success = false,
+})
+require("ansible-vault.ansible_cfg").clear_cache()
+
+local cfg_file = project .. "/group_vars/prod/vault.yml"
+write_file(cfg_file, "")
+vim.cmd("edit " .. vim.fn.fnameescape(cfg_file))
+local cfg_buf = vim.api.nvim_get_current_buf()
+vim.api.nvim_buf_set_lines(cfg_buf, 0, -1, false, { "db_password: fromcfg" })
+vault.encrypt(cfg_buf)
+wait_until(function()
+  return vault.is_buffer_encrypted(cfg_buf)
+end, "encrypting with ansible.cfg credentials failed")
+
+vault.decrypt(cfg_buf)
+wait_until(function()
+  return vim.api.nvim_buf_get_lines(cfg_buf, 0, 1, false)[1] == "db_password: fromcfg"
+end, "decrypting with ansible.cfg credentials failed")
+
+-- 4. VaultCreate produces a file that only ever contained ciphertext.
+local created = workdir .. "/created.yml"
+vault.setup({
+  ansible_vault_path = ansible_vault,
+  password_file = password_file,
+  auto_detect = false,
+  notify_success = false,
+})
+vim.cmd("VaultCreate " .. vim.fn.fnameescape(created))
+local created_buf = vim.api.nvim_get_current_buf()
+assert_eq(vim.fn.filereadable(created), 0, "VaultCreate created the file before it was written")
+vim.api.nvim_buf_set_lines(created_buf, 0, -1, false, { "brand: new" })
+vim.cmd("silent write")
+wait_until(function()
+  return vim.fn.filereadable(created) == 1
+end, "VaultCreate write did not produce a file")
+assert_true(read_file(created):match("^%$ANSIBLE_VAULT"), "VaultCreate did not write ciphertext")
+
 io.stdout:write("REAL_SMOKE_OK\n")
