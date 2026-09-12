@@ -5,8 +5,6 @@
 ---@field encrypt_vault_id? string Vault ID label to use for encryption
 ---@field rekey_password_file? string New vault password file for VaultRekey
 ---@field rekey_vault_id? string New vault ID for VaultRekey, for example "prod@~/.ansible/new-pass"
----@field auto_detect? boolean Auto detect vault encrypted files (default: true)
----@field auto_edit? boolean Automatically open encrypted files with VaultEdit (default: false)
 ---@field ansible_vault_path? string Custom path to ansible-vault executable
 
 local ansible_cfg = require("ansible-vault.ansible_cfg")
@@ -42,8 +40,6 @@ local DEFAULT_CONFIG = {
   encrypt_vault_id = nil,
   rekey_password_file = nil,
   rekey_vault_id = nil,
-  auto_detect = true,
-  auto_edit = false,
   ansible_vault_path = nil,
 }
 
@@ -1706,7 +1702,6 @@ end
 ---@param preferred_win integer
 local function close_edit_buffer(edit_buf, original_buf, original_file, preferred_win)
   if is_valid_buf(original_buf) then
-    vim.b[original_buf].ansible_vault_skip_auto_edit_once = true
     pcall(vim.api.nvim_buf_call, original_buf, function()
       vim.cmd("silent! edit!")
     end)
@@ -2419,32 +2414,6 @@ function M.setup(opts)
       end
     end,
   })
-
-  if M.config.auto_detect or M.config.auto_edit then
-    vim.api.nvim_create_autocmd("BufReadPost", {
-      group = group,
-      pattern = "*",
-      callback = function(event)
-        local encrypted = M.is_buffer_encrypted(event.buf)
-        if M.config.auto_detect then
-          remember_header(event.buf)
-        end
-
-        if vim.b[event.buf].ansible_vault_skip_auto_edit_once then
-          vim.b[event.buf].ansible_vault_skip_auto_edit_once = nil
-          return
-        end
-
-        if encrypted and M.config.auto_edit then
-          vim.schedule(function()
-            if is_valid_buf(event.buf) and M.is_buffer_encrypted(event.buf) then
-              M.edit(event.buf)
-            end
-          end)
-        end
-      end,
-    })
-  end
 end
 
 M._private = {

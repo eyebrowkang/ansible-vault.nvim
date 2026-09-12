@@ -73,10 +73,6 @@ supported.
       vault_ids = nil,
       -- Optional: vault ID label to use when encrypting
       encrypt_vault_id = nil,
-      -- Optional: automatically open encrypted files with VaultEdit
-      auto_edit = false,
-      -- Optional: auto detect encrypted files (default: true)
-      auto_detect = true,
       -- Optional: custom ansible-vault path
       ansible_vault_path = nil,
     })
@@ -117,12 +113,6 @@ require("ansible-vault").setup({
 
   -- New vault ID for :VaultRekey, for example "prod@~/.ansible/new-pass"
   rekey_vault_id = nil,
-
-  -- Auto detect vault encrypted files on BufReadPost
-  auto_detect = true,
-
-  -- Automatically open encrypted files with :VaultEdit after BufReadPost
-  auto_edit = false,
 
   -- Custom path to ansible-vault executable
   ansible_vault_path = nil,
@@ -355,20 +345,6 @@ closed and the original encrypted file is reloaded.
 
 If the original file changed on disk while the scratch buffer was open, the save
 is refused to avoid overwriting someone else's changes.
-
-### Automatically Edit Encrypted Files
-
-Enable `auto_edit` if you want encrypted files to open directly in the
-`:VaultEdit` scratch workflow:
-
-```lua
-require("ansible-vault").setup({
-  auto_edit = true,
-})
-```
-
-The original encrypted buffer is reloaded after save. The plugin suppresses the
-automatic edit loop for that reload.
 
 ### Encrypt an Inline YAML String
 
