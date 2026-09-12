@@ -315,8 +315,6 @@ The cache is disabled by default. Clear it manually with
 | `:VaultView` | View decrypted content in floating window |
 | `:VaultEdit` | Edit encrypted file in a scratch buffer, encrypt on save |
 | `:VaultClearPasswordCache` | Clear the in-memory interactive password cache |
-| `:VaultDiff {file}` | Diff decrypted current buffer against another file |
-| `:VaultDiff --git [ref]` | Diff decrypted current buffer against a Git revision |
 | `:VaultFiles [view\|edit\|rekey]` | Pick a vault file and view, edit, or rekey it |
 | `:VaultInfo [args]` | Show current buffer and plugin configuration diagnostics |
 | `:VaultRekey [args]` | Rekey the current encrypted file |
@@ -431,25 +429,6 @@ automatic edit loop for that reload.
 Run `:VaultToggle` to encrypt a plain buffer or decrypt an encrypted buffer.
 Decrypting this way enters the same plaintext editing mode as `:VaultDecrypt`,
 so `:w` still re-encrypts.
-
-### Diff Decrypted Vault Content
-
-Compare the current buffer with another vault file:
-
-```vim
-:VaultDiff ../group_vars/prod/vault.yml
-```
-
-Compare the current file with a Git revision:
-
-```vim
-:VaultDiff --git HEAD
-:VaultDiff --git main
-```
-
-Both sides are decrypted into temporary nofile buffers before Neovim diff mode
-is enabled. Plain files also work, so you can compare encrypted and decrypted
-versions during migrations.
 
 ### Pick Vault Files
 
@@ -612,7 +591,6 @@ vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decry
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
 vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
-vim.keymap.set("n", "<leader>vD", "<cmd>VaultDiff --git HEAD<cr>", { desc = "Vault Diff" })
 vim.keymap.set("n", "<leader>vf", "<cmd>VaultFiles view<cr>", { desc = "Vault Files" })
 vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>", { desc = "Vault Toggle" })
 vim.keymap.set("v", "<leader>vs", ":VaultEncryptString<cr>", { silent = true, desc = "Vault Encrypt String" })
@@ -679,8 +657,6 @@ vault.edit()
 vault.rekey()
 
 -- Diff decrypted current buffer against a file or Git revision
-vault.diff({ positionals = { "../other-vault.yml" } })
-vault.diff({ git_ref = "HEAD" })
 
 -- Pick vault files from the current working directory
 vault.files({ positionals = { "view" } })
@@ -735,8 +711,7 @@ vim.api.nvim_create_autocmd("User", {
 Current events are `AnsibleVaultEncrypt`, `AnsibleVaultDecrypt`,
 `AnsibleVaultView`, `AnsibleVaultCreate`, `AnsibleVaultEditOpen`,
 `AnsibleVaultEditSave`, `AnsibleVaultPlaintextSave`, `AnsibleVaultRekey`,
-`AnsibleVaultStringEncrypt`, `AnsibleVaultStringDecrypt`, and
-`AnsibleVaultDiff`.
+`AnsibleVaultStringEncrypt`, and `AnsibleVaultStringDecrypt`.
 
 ## Inline YAML Strings
 
@@ -801,8 +776,6 @@ These are global Neovim settings the plugin deliberately does not change. Both
 - **Decrypted content is in Neovim's memory** while you view or edit it, so it
   can reach the OS swap partition or a core dump. Review your other plugins,
   clipboard settings and terminal or session recording if that matters to you.
-- **`:VaultDiff`** refuses to run when `'diffexpr'` is set or `'diffopt'` lacks
-  `internal`, because Neovim would then write both sides to temporary files.
 
 ## Development
 

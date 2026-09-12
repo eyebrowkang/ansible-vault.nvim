@@ -680,58 +680,6 @@ tests["VaultDecryptString replaces selected YAML vault block"] = function()
   assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "password: secret" })
 end
 
-tests["VaultDiff refuses to run when Neovim would use an external diff"] = function()
-  local stays = vault._private.diff_stays_in_memory
-
-  -- Read from the raw option string. `vim.opt.diffopt:get()` returns a list of
-  -- "key:value" strings on some releases and a map on others, and reading the
-  -- wrong shape here silently disables VaultDiff.
-  local diffopt, diffexpr = vim.o.diffopt, vim.o.diffexpr
-
-  vim.o.diffexpr = ""
-  vim.o.diffopt = "internal,filler,closeoff,indent-heuristic,inline:char,linematch:40"
-  assert_true(stays(), "the default diffopt keeps the diff in memory")
-
-  vim.o.diffopt = "filler,closeoff"
-  assert_false(stays(), 'without "internal" Neovim writes both sides to temporary files')
-
-  vim.o.diffopt = "internal,filler"
-  vim.o.diffexpr = "MyDiff()"
-  assert_false(stays(), "a diffexpr makes Neovim write both sides to temporary files")
-
-  vim.o.diffopt = diffopt
-  vim.o.diffexpr = diffexpr
-end
-
-tests["VaultDiff opens decrypted diff buffers"] = function()
-  local fake = create_fake_vault()
-  reset_config(fake)
-
-  local target_file = fake.dir .. "/target.yml"
-  write_file(target_file, "$ANSIBLE_VAULT;1.1;AES256\nTARGET\n")
-
-  local buf = new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
-  vim.bo[buf].filetype = "yaml"
-  local tab_count = #vim.api.nvim_list_tabpages()
-
-  vault.diff({ positionals = { target_file } })
-
-  wait_until(function()
-    return #vim.api.nvim_list_tabpages() > tab_count
-  end, "VaultDiff did not open a diff tab")
-
-  local tab = vim.api.nvim_get_current_tabpage()
-  local contents = {}
-  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
-    local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)
-    table.insert(contents, table.concat(lines, "\n"))
-  end
-
-  assert_true(vim.tbl_contains(contents, "plain: old"), "current decrypted content was not in diff")
-  assert_true(vim.tbl_contains(contents, "plain: target"), "target decrypted content was not in diff")
-  vim.cmd("tabclose!")
-end
-
 tests["auto_edit opens encrypted files in a scratch buffer"] = function()
   local fake = create_fake_vault()
   reset_config(fake, { auto_edit = true })
