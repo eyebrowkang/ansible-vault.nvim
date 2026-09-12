@@ -1,0 +1,71 @@
+---The plumbing every vault operation shares.
+---
+---Each operation does the same three things around its actual work: resolve
+---credentials for the file it applies to, decide which identity to encrypt with,
+---and announce itself when it lands. Those were open-coded at nine call sites,
+---which is how `--encrypt-vault-id` ended up on `rekey`, where it means something
+---different and silently re-encrypts with the old password.
+---
+---Credential *policy* still lives in `credentials.lua`. This module only threads
+---the effective configuration through to it.
+local M = {}
+
+local config = require("ansible-vault.config")
+local credentials = require("ansible-vault.credentials")
+
+---Resolve credentials for an operation, prompting only if nothing supplies them.
+---@param callback fun(creds: AnsibleVaultCredentials|nil)
+---@param opts? table
+---@param context? table
+function M.credentials(callback, opts, context)
+  credentials.resolve(config.effective(opts), context or {}, callback)
+end
+
+---Append `--encrypt-vault-id` when a specific identity must be named: because the
+---user configured one, because the file's own 1.2 header records one that would
+---otherwise be lost, or because Ansible's config contributes a second identity and
+---leaving the choice implicit is an error.
+---
+---Correct for `encrypt` and `encrypt_string`, whose secret pool is built from the
+---ids actually passed to them. NOT correct for `rekey` — see
+---`credentials.rekey_args`.
+---@param args string[]
+---@param opts? table
+---@param creds? AnsibleVaultCredentials
+---@param context? table
+---@return string[]
+function M.with_encrypt_vault_id(args, opts, creds, context)
+  local effective = config.effective(opts)
+  local result = vim.deepcopy(args or {})
+
+  local label
+  if creds and creds.plan then
+    label = credentials.encrypt_label(effective, creds.plan, context)
+  elseif config.is_nonempty_string(effective.encrypt_vault_id) then
+    label = effective.encrypt_vault_id
+  end
+
+  if config.is_nonempty_string(label) then
+    table.insert(result, "--encrypt-vault-id")
+    table.insert(result, label)
+  end
+  return result
+end
+
+---Announce a completed operation on the one `User` pattern the plugin emits.
+---
+---A single pattern with the operation in `data` is what a listener actually
+---wants: one autocmd can act on everything, and filtering on `op`/`scope` is a
+---comparison rather than a dozen registrations to keep in sync.
+---@param op "encrypt"|"decrypt"|"view"|"edit"|"save"|"rekey"|"create"
+---@param scope "file"|"inline"
+---@param data? table
+function M.emit(op, scope, data)
+  local payload = vim.tbl_deep_extend("force", { op = op, scope = scope }, data or {})
+  pcall(vim.api.nvim_exec_autocmds, "User", {
+    pattern = "AnsibleVaultOperation",
+    data = payload,
+  })
+end
+
+return M
