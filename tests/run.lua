@@ -193,21 +193,10 @@ local function reset_config(fake, opts)
   vim.env.ANSIBLE_VAULT_ENCRYPT_IDENTITY = nil
   vim.env.ANSIBLE_VAULT_ID_MATCH = nil
 
-  vault.config.password_file = nil
-  vault.config.vault_id = nil
-  vault.config.vault_ids = nil
-  vault.config.encrypt_vault_id = nil
-  vault.config.rekey_password_file = nil
-  vault.config.rekey_vault_id = nil
-  vault.config.auto_detect = true
-  vault.config.auto_edit = false
-  vault.config.password_cache_ttl = 0
-  vault.config.timeout_ms = 30000
-  vault.config.notify_success = true
-  vault.config.conda_env = nil
-  vault.config.ansible_vault_path = nil
-  vault.config.debug = false
-  vault.clear_password_cache()
+  -- `setup()` below replaces the whole table, so there is nothing to clear by
+  -- hand. Listing every key here is what made this drift out of sync with the
+  -- schema every time one was added or removed.
+  vault.timeout_ms = 30000
   notifications = {}
 
   local config = {
@@ -573,9 +562,9 @@ tests["command completion exposes override flags and inline labels"] = function(
   assert_true(vim.tbl_contains(flag_completion, "--vault-password-file"), "vault-password-file flag was not completed")
 end
 
-tests["interactive password cache avoids repeated prompts"] = function()
+tests["an interactive password is never reused across operations"] = function()
   local fake = create_fake_vault()
-  reset_config(fake, { password_file = false, password_cache_ttl = 60 })
+  reset_config(fake, { password_file = false })
 
   local original_inputsecret = vim.fn.inputsecret
   local prompt_count = 0
@@ -588,35 +577,24 @@ tests["interactive password cache avoids repeated prompts"] = function()
   vault.encrypt(first)
   wait_until(function()
     return vim.api.nvim_buf_get_lines(first, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
-  end, "first cached-password encrypt did not finish")
+  end, "first encrypt did not finish")
 
   local second = new_buffer({ "second" })
   vault.encrypt(second)
   wait_until(function()
     return vim.api.nvim_buf_get_lines(second, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
-  end, "second cached-password encrypt did not finish")
+  end, "second encrypt did not finish")
 
   vim.fn.inputsecret = original_inputsecret
-  assert_eq(prompt_count, 1, "password prompt should have been cached")
-end
-
-tests["notify_success false suppresses success notifications"] = function()
-  local fake = create_fake_vault()
-  reset_config(fake, { notify_success = false })
-
-  local buf = new_buffer({ "plain: value" })
-  vault.encrypt(buf)
-
-  wait_until(function()
-    return vault.is_buffer_encrypted(buf)
-  end, "encrypt did not finish with notify_success disabled")
-
-  assert_false(notification_contains("Buffer encrypted successfully"), "success notification was not suppressed")
+  -- No cache means no window in which a secret sits in the Lua heap between
+  -- operations, so each one must ask again.
+  assert_eq(prompt_count, 2, "each operation must prompt for its own password")
 end
 
 tests["slow vault operations time out"] = function()
   local fake = create_fake_vault()
-  reset_config(fake, { timeout_ms = 50 })
+  reset_config(fake)
+  vault.timeout_ms = 50
   vim.env.FAKE_VAULT_SLEEP = "1"
 
   local buf = new_buffer({ "plain: value" })
@@ -628,6 +606,7 @@ tests["slow vault operations time out"] = function()
 
   assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "plain: value" }, "timed out operation changed buffer")
   vim.env.FAKE_VAULT_SLEEP = nil
+  vault.timeout_ms = 30000
 end
 
 tests["operations announce themselves on AnsibleVaultOperation"] = function()
@@ -817,9 +796,9 @@ tests["B4 encrypt decrypt roundtrip preserves content structure"] = function()
   assert_false(vault.is_buffer_encrypted(buf), "buffer should not be encrypted after decrypt")
 end
 
-tests["B5 wrong password clears cache"] = function()
+tests["B5 a failed password is re-prompted"] = function()
   local fake = create_fake_vault()
-  reset_config(fake, { password_file = false, password_cache_ttl = 60 })
+  reset_config(fake, { password_file = false })
 
   local original_inputsecret = vim.fn.inputsecret
   local prompt_count = 0
@@ -947,7 +926,7 @@ tests["B8 re-setup clears previous config"] = function()
 
   vault.setup({})
   assert_eq(vault.config.encrypt_vault_id, nil, "encrypt_vault_id should reset to nil on re-setup")
-  assert_eq(vault.config.notify_success, true, "default value should be restored")
+  assert_eq(vault.config.auto_detect, true, "default value should be restored")
 end
 
 tests["B9 command args support quoted paths with spaces"] = function()

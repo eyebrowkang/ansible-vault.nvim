@@ -31,14 +31,14 @@ reaches the disk. See |ansible-vault-security|.
 - Rekey encrypted files
 - Reads `ansible.cfg` and `ANSIBLE_*` variables the way Ansible does
 - Preserves the vault ID label carried by a format 1.2 header
-- Interactive password input with optional in-memory caching
+- Interactive password input, never cached to disk or memory
 - Command-line credential overrides with completion
 
 ==============================================================================
 2. REQUIREMENTS                               *ansible-vault-requirements*
 
 - Neovim >= 0.12
-- `ansible-vault` command available in PATH or via conda environment
+- `ansible-vault` command available in PATH, or its path given to `setup()`
 
                                             *ansible-vault-version-policy*
 This plugin tracks the CURRENT Neovim release only. Older versions are not
@@ -84,10 +84,6 @@ All commands accept optional vault credential overrides as arguments.
     buffer has `swapfile` and `undofile` disabled. On `:write`, the
     content is encrypted and atomically written back to the original
     file.
-
-                                                 *:VaultClearPasswordCache*
-:VaultClearPasswordCache
-    Clear the in-memory interactive password cache.
 
                                                  *:VaultRekey*
 :VaultRekey [args]
@@ -177,12 +173,7 @@ Call |ansible-vault.setup()| with your settings: >
       rekey_vault_id = nil,
       auto_detect = true,
       auto_edit = false,
-      password_cache_ttl = 0,
-      timeout_ms = 30000,
-      notify_success = true,
-      conda_env = nil,
       ansible_vault_path = nil,
-      debug = false,
     })
 <
                                                  *ansible-vault-config-password_file*
@@ -224,38 +215,11 @@ Call |ansible-vault.setup()| with your settings: >
     Automatically open encrypted files with |:VaultEdit| after
     |BufReadPost|.
 
-                                                 *ansible-vault-config-password_cache_ttl*
-`password_cache_ttl` ~
-    (number, default `0`)
-    Cache interactive passwords in Neovim memory for N seconds.
-    Set to `0` to prompt for every operation. Clear with
-    |:VaultClearPasswordCache|.
-
-                                                 *ansible-vault-config-timeout_ms*
-`timeout_ms` ~
-    (number, default `30000`)
-    Timeout in milliseconds for `ansible-vault` jobs. Set
-    to `0` to disable.
-
-                                                 *ansible-vault-config-notify_success*
-`notify_success` ~
-    (boolean, default `true`)
-    Show success/info notifications. Errors and warnings are
-    always shown.
-
-                                                 *ansible-vault-config-conda_env*
-`conda_env` ~
-    Conda environment name where `ansible-vault` is installed.
-    The plugin runs `conda run -n <env> ansible-vault ...`.
-
                                                  *ansible-vault-config-ansible_vault_path*
 `ansible_vault_path` ~
-    Custom path to the `ansible-vault` executable.
-
-                                                 *ansible-vault-config-debug*
-`debug` ~
-    (boolean, default `false`)
-    Enable debug logging to `:messages`.
+    Custom path to the `ansible-vault` executable. This is also how
+    to use a conda environment: point it at
+    `<env>/bin/ansible-vault`.
 
 ==============================================================================
 5. PASSWORD SOURCES                             *ansible-vault-passwords*
@@ -371,10 +335,6 @@ on the next attempt.
 `rekey(opts?)` ~
     Rekey the current file-backed encrypted buffer.
 
-                                     *ansible-vault.clear_password_cache()*
-`clear_password_cache()` ~
-    Clear the in-memory interactive password cache.
-
                                      *ansible-vault.cleanup()*
 `cleanup()` ~
     Drop every secret this process still holds. Runs
@@ -455,7 +415,8 @@ WHAT THE PLUGIN GUARANTEES
   and |:checkhealth| reports which mode is in use.
 - Nothing secret in messages. Process stdout is never echoed into an
   error, because `ansible-vault decrypt` can write plaintext to stdout
-  and still exit non-zero. Debug logging redacts credential arguments.
+  and still exit non-zero. Any argv the plugin does surface has its
+  credential values redacted.
 - No plaintext argv. Content goes over stdin and passwords are passed
   by reference, so neither appears in `ps`.
 - Atomic writes. Encrypted output is written to a sibling temporary
@@ -463,9 +424,8 @@ WHAT THE PLUGIN GUARANTEES
   file's mode.
 - |:VaultEdit| additionally refuses to overwrite the original file if
   it changed on disk while the scratch buffer was open.
-- `password_cache_ttl` is disabled by default. When enabled, the
-  password is held in Neovim process memory until it expires, until
-  |:VaultClearPasswordCache| is called, or until Neovim exits.
+- Interactive passwords are never cached. Each operation prompts for
+  its own, so no secret sits in Neovim's heap between operations.
 
 WHAT IS STILL UP TO YOU
 
@@ -487,7 +447,7 @@ Run |:checkhealth| to verify your setup: >
     :checkhealth ansible-vault
 <
 The health check reports:
-- `ansible-vault` executable availability, including a `conda run` wrapper
+- `ansible-vault` executable availability
 - Which credential source is actually in effect, resolved through the
   same code the real operations use
 - The `ansible.cfg` that was found, how it was found, and the directory

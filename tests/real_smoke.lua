@@ -68,7 +68,6 @@ vault.setup({
   ansible_vault_path = ansible_vault,
   password_file = password_file,
   auto_detect = false,
-  notify_success = false,
 })
 
 local buf = vim.api.nvim_create_buf(true, false)
@@ -176,7 +175,6 @@ vault.setup({
   ansible_vault_path = ansible_vault,
   vault_ids = { "prod@" .. label_pass },
   auto_detect = false,
-  notify_success = false,
 })
 
 vim.cmd("edit " .. vim.fn.fnameescape(labelled))
@@ -204,7 +202,6 @@ write_file(project .. "/ansible.cfg", "[defaults]\nvault_password_file = .vault_
 vault.setup({
   ansible_vault_path = ansible_vault,
   auto_detect = false,
-  notify_success = false,
 })
 require("ansible-vault.ansible_cfg").clear_cache()
 
@@ -238,7 +235,6 @@ vault.setup({
   ansible_vault_path = ansible_vault,
   password_file = own_pass,
   auto_detect = false,
-  notify_success = false,
 })
 require("ansible-vault.ansible_cfg").clear_cache()
 
@@ -260,7 +256,6 @@ vault.setup({
   ansible_vault_path = ansible_vault,
   password_file = password_file,
   auto_detect = false,
-  notify_success = false,
 })
 vim.cmd("VaultCreate " .. vim.fn.fnameescape(created))
 local created_buf = vim.api.nvim_get_current_buf()

@@ -7,12 +7,7 @@
 ---@field rekey_vault_id? string New vault ID for VaultRekey, for example "prod@~/.ansible/new-pass"
 ---@field auto_detect? boolean Auto detect vault encrypted files (default: true)
 ---@field auto_edit? boolean Automatically open encrypted files with VaultEdit (default: false)
----@field password_cache_ttl? number Cache interactive passwords in memory for N seconds (default: 0)
----@field timeout_ms? number ansible-vault job timeout in milliseconds (default: 30000, set 0 to disable)
----@field notify_success? boolean Show success/info notifications (default: true)
----@field conda_env? string Conda environment name where ansible-vault is installed
 ---@field ansible_vault_path? string Custom path to ansible-vault executable
----@field debug? boolean Enable debug logging (default: false)
 
 local ansible_cfg = require("ansible-vault.ansible_cfg")
 local credentials = require("ansible-vault.credentials")
@@ -49,30 +44,16 @@ local DEFAULT_CONFIG = {
   rekey_vault_id = nil,
   auto_detect = true,
   auto_edit = false,
-  password_cache_ttl = 0,
-  timeout_ms = 30000,
-  notify_success = true,
-  conda_env = nil,
   ansible_vault_path = nil,
-  debug = false,
 }
 
 ---@type AnsibleVaultConfig
 M.config = vim.deepcopy(DEFAULT_CONFIG)
 
----Debug log helper.
+---Render an argv with credential values replaced.
 ---
----Only ever goes to `vim.notify`. Printing to stdout as well would put whatever
----is logged into the terminal scrollback, where it outlives the session.
----@param msg string
----@param ... any
-local function debug_log(msg, ...)
-  if M.config.debug then
-    vim.notify("[ansible-vault DEBUG] " .. string.format(msg, ...), vim.log.levels.DEBUG)
-  end
-end
-
----Render an argv for logging with credential values replaced.
+---Used wherever an argv could reach the user: a vault id carries a password file
+---path, and the askpass helper path is just as sensitive.
 ---@param argv string[]
 ---@return string
 local function redact_argv(argv)
@@ -118,12 +99,7 @@ end
 
 ---@param message string
 ---@param level integer
----@param opts? table
-local function notify(message, level, opts)
-  local config = effective_config(opts)
-  if level == vim.log.levels.INFO and config.notify_success == false then
-    return
-  end
+local function notify(message, level)
   vim.notify(message, level)
 end
 
@@ -143,17 +119,21 @@ local function emit_event(op, scope, data)
   })
 end
 
----@param opts? table
+---How long to let `ansible-vault` run before giving up.
+---
+---Not configuration: a vault operation that takes longer than this is broken,
+---not slow, and a user-facing knob only invites tuning a symptom. Tests lower it
+---to keep the suite fast.
+M.timeout_ms = 30000
+
 ---@return integer|nil
-local function get_timeout_ms(opts)
-  local timeout = effective_config(opts).timeout_ms
-  if type(timeout) == "number" and timeout > 0 then
-    return math.floor(timeout)
+local function get_timeout_ms()
+  if type(M.timeout_ms) == "number" and M.timeout_ms > 0 then
+    return math.floor(M.timeout_ms)
   end
   return nil
 end
 
-local clear_password_cache = credentials.clear_password_cache
 local expand_path = credentials.expand_path
 local expand_vault_id = credentials.expand_vault_id
 
@@ -168,10 +148,6 @@ function M.executable_argv(opts)
   local executable = "ansible-vault"
   if is_nonempty_string(config.ansible_vault_path) then
     executable = expand_path(config.ansible_vault_path)
-  end
-
-  if is_nonempty_string(config.conda_env) then
-    return { "conda", "run", "-n", config.conda_env, executable }
   end
 
   return { executable }
@@ -332,9 +308,8 @@ end
 ---@param callback fun(success: boolean, output: string)
 local function spawn_vault(action, args, opts, creds, stdin, file, callback)
   local argv = build_vault_argv(action, args or {}, file or "-", opts)
-  debug_log("running: %s", redact_argv(argv))
 
-  local timeout = get_timeout_ms(opts)
+  local timeout = get_timeout_ms()
   local system_opts = {
     cwd = creds and creds.cwd or nil,
     env = creds and creds.env or nil,
@@ -357,7 +332,9 @@ local function spawn_vault(action, args, opts, creds, stdin, file, callback)
   end)
 
   if not ok then
-    callback(false, "Failed to start ansible-vault: " .. tostring(err))
+    -- `err` can quote the argv back, which carries vault ids and the askpass
+    -- helper path, so it goes through the same redaction as everything else.
+    callback(false, "Failed to start ansible-vault: " .. redact_argv({ tostring(err) }))
   end
 end
 
@@ -623,7 +600,7 @@ local function replace_buffer_lines(buf, expected_changedtick, output, success_m
   end
 
   remember_header(buf, lines)
-  notify(success_message, vim.log.levels.INFO, opts)
+  notify(success_message, vim.log.levels.INFO)
   return true
 end
 
@@ -899,7 +876,6 @@ function M.decrypt(buf, opts)
           emit_event("decrypt", "file", { buf = target })
         end
       else
-        clear_password_cache()
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
       end
     end, opts, creds)
@@ -942,7 +918,6 @@ function M.view(buf, opts)
         open_output_window(output, " Vault View (read-only) ", filetype)
         emit_event("view", "file", { buf = target })
       else
-        clear_password_cache()
         vim.notify("View failed: " .. output, vim.log.levels.ERROR)
       end
     end, opts, creds)
@@ -1323,7 +1298,7 @@ local function encrypt_string_selection(buf, selection, opts)
       local ok, err = replace_selection_text(buf, selection, format_encrypt_string_output(output, plan))
 
       if ok then
-        notify("String encrypted successfully", vim.log.levels.INFO, opts)
+        notify("String encrypted successfully", vim.log.levels.INFO)
         emit_event("encrypt", "inline", { buf = buf, name = plan.name })
       else
         vim.notify("Failed to update selection: " .. err, vim.log.levels.ERROR)
@@ -1605,7 +1580,7 @@ write_plaintext_buffer = function(buf, target_path, opts)
   -- while the encryption is still in flight. The event loop keeps running, so
   -- this waits without freezing the job that does the work.
   local function await()
-    local budget = get_timeout_ms(opts) or 30000
+    local budget = get_timeout_ms() or 30000
     if not vim.wait(budget + 1000, function()
       return done
     end, 20) then
@@ -1636,7 +1611,7 @@ write_plaintext_buffer = function(buf, target_path, opts)
       end
 
       leave_plaintext_mode(buf)
-      notify("Vault values restored and saved: " .. path, vim.log.levels.INFO, opts)
+      notify("Vault values restored and saved: " .. path, vim.log.levels.INFO)
       emit_event("save", "inline", { buf = buf, file = path })
       finish(true)
     end)
@@ -1671,7 +1646,7 @@ write_plaintext_buffer = function(buf, target_path, opts)
         return
       end
 
-      notify("Encrypted and saved: " .. path, vim.log.levels.INFO, opts)
+      notify("Encrypted and saved: " .. path, vim.log.levels.INFO)
       emit_event("save", "file", { buf = buf, file = path })
       finish(true)
     end, opts, creds)
@@ -1785,8 +1760,6 @@ function M.edit(buf, opts)
   local original_tick = changedtick(original_buf)
   local original_signature = file_signature(original_file)
 
-  debug_log("VaultEdit: original_buf=%d", original_buf)
-
   local context = buffer_context(original_buf)
 
   get_credentials(function(creds)
@@ -1803,7 +1776,6 @@ function M.edit(buf, opts)
     run_vault("decrypt", buffer_content(original_buf), creds.args, function(success, output)
       if not success then
         run_cleanup(creds.cleanup)
-        clear_password_cache()
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
         return
       end
@@ -1884,8 +1856,6 @@ function M.edit(buf, opts)
           local edit_creds = vim.b[cur_buf].vault_creds
           local encrypt_args = with_encrypt_vault_id(edit_creds.args, opts, edit_creds, vim.b[cur_buf].vault_context)
 
-          debug_log("VaultEdit: encrypting buffer %d", cur_buf)
-
           -- 'modified' stays set until the write actually lands. Clearing it up
           -- front would let `:q` wipe the buffer, and its plaintext, while the
           -- encryption is still in flight.
@@ -1919,7 +1889,7 @@ function M.edit(buf, opts)
               vim.bo[cur_buf].modified = false
             end
 
-            notify("Encrypted and saved: " .. orig_file, vim.log.levels.INFO, opts)
+            notify("Encrypted and saved: " .. orig_file, vim.log.levels.INFO)
             emit_event("save", "file", { buf = orig_buf, file = orig_file })
             if is_valid_buf(cur_buf) then
               cleanup_edit_buffer(cur_buf)
@@ -1933,11 +1903,10 @@ function M.edit(buf, opts)
         buffer = edit_buf,
         callback = function(event)
           cleanup_edit_buffer(event.buf)
-          debug_log("VaultEdit: buffer closed")
         end,
       })
 
-      notify("Editing decrypted content. :w encrypts and saves.", vim.log.levels.INFO, opts)
+      notify("Editing decrypted content. :w encrypts and saves.", vim.log.levels.INFO)
       emit_event("edit", "file", { buf = edit_buf, original_buf = original_buf, file = original_file })
     end, opts, creds)
   end, opts, context)
@@ -2008,7 +1977,7 @@ function M.rekey(opts)
         remember_header(target)
       end
 
-      notify("Vault file rekeyed successfully", vim.log.levels.INFO, opts)
+      notify("Vault file rekeyed successfully", vim.log.levels.INFO)
       emit_event("rekey", "file", { buf = target, file = file_path })
     end, opts, creds)
   end, opts, context)
@@ -2018,7 +1987,6 @@ end
 ---@param content string
 ---@return table|nil
 parse_vault_from_yaml = function(content)
-  debug_log("parsing inline vault block (%d bytes)", #content)
   return yaml.parse_block(content)
 end
 
@@ -2111,7 +2079,6 @@ local function decrypt_string_selection(target, selection, mode, opts)
       end
 
       if not success then
-        clear_password_cache()
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
         return
       end
@@ -2153,7 +2120,7 @@ local function decrypt_string_selection(target, selection, mode, opts)
       if ok then
         track_inline_region(target, selection.start_row, selection.start_row + #replacement - 1, parsed)
         enter_plaintext_mode(target, "inline", opts)
-        notify("String decrypted successfully", vim.log.levels.INFO, opts)
+        notify("String decrypted successfully", vim.log.levels.INFO)
         emit_event("decrypt", "inline", { buf = target, name = parsed.var_name })
       else
         vim.notify("Failed to update selection: " .. tostring(err), vim.log.levels.ERROR)
@@ -2239,15 +2206,11 @@ function M.create(opts)
   emit_event("create", "file", { buf = buf, file = path })
 end
 
----Clear the in-memory interactive password cache.
-function M.clear_password_cache()
-  clear_password_cache()
-  notify("Ansible Vault password cache cleared", vim.log.levels.INFO)
-end
-
 ---Drop every secret this process is still holding. Runs on exit.
+---
+---Interactive passwords are not cached, so this sweeps the temp password files
+---the askpass fallback may have written.
 function M.cleanup()
-  clear_password_cache()
   credentials.cleanup_all()
 end
 
@@ -2324,14 +2287,6 @@ local COMMANDS = {
     run = function(cmd_opts, parsed)
       parsed.bang = cmd_opts.bang
       M.create(parsed)
-    end,
-  },
-  {
-    name = "VaultClearPasswordCache",
-    desc = "Clear cached Ansible Vault password",
-    nargs = 0,
-    run = function()
-      M.clear_password_cache()
     end,
   },
   {

@@ -110,16 +110,8 @@ function M.check()
     )
   end
 
-  local argv = vault.executable_argv()
-  local executable = argv[1]
-  if executable == "conda" then
-    if vim.fn.executable("conda") == 1 then
-      health.ok("conda executable found")
-    else
-      health.error("conda executable not found")
-    end
-    health.info("ansible-vault will run through: " .. table.concat(argv, " "))
-  elseif vim.fn.executable(executable) == 1 then
+  local executable = vault.executable_argv()[1]
+  if vim.fn.executable(executable) == 1 then
     health.ok("ansible-vault executable found: " .. executable)
   else
     health.error("ansible-vault executable not found: " .. executable)

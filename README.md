@@ -30,7 +30,6 @@ values, built so that decrypted content never reaches the disk.
   does, searching upward from the current file
 - Password file, one or more vault IDs, or an interactive prompt
 - Per-command credential overrides with command-line completion
-- Optional in-memory cache for interactive passwords
 
 **Fidelity**
 
@@ -43,12 +42,11 @@ values, built so that decrypted content never reaches the disk.
 
 - `:checkhealth ansible-vault`
 - A `User` autocmd event for statuslines and other plugins
-- Conda environment support via `conda run`
 
 ## Requirements
 
 - Neovim >= 0.12
-- `ansible-vault` command available in PATH (or via conda environment)
+- `ansible-vault` command available in PATH, or its path given to `setup()`
 
 ### Version support policy
 
@@ -77,16 +75,8 @@ supported.
       encrypt_vault_id = nil,
       -- Optional: automatically open encrypted files with VaultEdit
       auto_edit = false,
-      -- Optional: cache interactive passwords in memory for N seconds
-      password_cache_ttl = 0,
-      -- Optional: ansible-vault job timeout in milliseconds (0 disables it)
-      timeout_ms = 30000,
-      -- Optional: suppress success/info notifications
-      notify_success = true,
       -- Optional: auto detect encrypted files (default: true)
       auto_detect = true,
-      -- Optional: conda environment name
-      conda_env = "ansible-dev",
       -- Optional: custom ansible-vault path
       ansible_vault_path = nil,
     })
@@ -134,25 +124,8 @@ require("ansible-vault").setup({
   -- Automatically open encrypted files with :VaultEdit after BufReadPost
   auto_edit = false,
 
-  -- Cache interactive passwords in memory for N seconds.
-  -- Set to 0 to prompt for every operation.
-  password_cache_ttl = 0,
-
-  -- ansible-vault job timeout in milliseconds. Set 0 to disable.
-  timeout_ms = 30000,
-
-  -- Show success/info notifications after completed operations
-  notify_success = true,
-
-  -- Conda environment name where ansible-vault is installed.
-  -- The plugin runs: conda run -n <env> ansible-vault ...
-  conda_env = nil,
-
   -- Custom path to ansible-vault executable
   ansible_vault_path = nil,
-
-  -- Enable debug logging (prints to :messages)
-  debug = false,
 })
 ```
 
@@ -276,25 +249,11 @@ require("ansible-vault").setup({
 })
 ```
 
-If `ansible-vault` is installed inside a Conda environment:
+The same option covers a Conda environment — point it at
+`<env>/bin/ansible-vault`.
 
-```lua
-require("ansible-vault").setup({
-  conda_env = "ansible-dev",
-  password_file = "~/.ansible/vault-pass",
-})
-```
-
-Interactive passwords can be cached in Neovim memory for a short period:
-
-```lua
-require("ansible-vault").setup({
-  password_cache_ttl = 300,
-})
-```
-
-The cache is disabled by default. Clear it manually with
-`:VaultClearPasswordCache`.
+Interactive passwords are never cached. Each operation prompts for its own, so
+no secret sits in Neovim's memory between operations.
 
 ## Commands
 
@@ -305,7 +264,6 @@ The cache is disabled by default. Clear it manually with
 | `:VaultCreate {file}` | Create a new encrypted file (`!` overwrites) |
 | `:VaultView` | View decrypted content in floating window |
 | `:VaultEdit` | Edit encrypted file in a scratch buffer, encrypt on save |
-| `:VaultClearPasswordCache` | Clear the in-memory interactive password cache |
 | `:VaultRekey [args]` | Rekey the current encrypted file |
 | `:VaultEncryptString` | Encrypt selected text (visual mode) |
 | `:VaultDecryptString` | Decrypt selected inline vault string in place; `:w` restores it |
@@ -411,21 +369,6 @@ require("ansible-vault").setup({
 
 The original encrypted buffer is reloaded after save. The plugin suppresses the
 automatic edit loop for that reload.
-
-### Tune Notifications and Timeouts
-
-By default, vault jobs time out after 30 seconds. Set `timeout_ms = 0` to
-disable the timeout, or lower it for tighter feedback:
-
-```lua
-require("ansible-vault").setup({
-  timeout_ms = 10000,
-  notify_success = false,
-})
-```
-
-Errors and warnings are still shown when `notify_success = false`; only
-successful informational messages are suppressed.
 
 ### Encrypt an Inline YAML String
 
@@ -610,9 +553,6 @@ vault.edit()
 -- Rekey current encrypted file
 vault.rekey()
 
--- Clear the optional in-memory password cache
-vault.clear_password_cache()
-
 -- Encrypt selected text
 vault.encrypt_string()
 
@@ -690,8 +630,8 @@ The goal is that decrypted content never reaches the disk, including after
   and `:checkhealth` tells you which mode is in use.
 - **Nothing secret in messages.** Process stdout is never echoed into an error,
   because `ansible-vault decrypt` can write plaintext to stdout and still exit
-  non-zero. Debug logging redacts credential arguments and goes to `vim.notify`
-  only, never to stdout.
+  non-zero. Any argv the plugin does surface has its credential values
+  redacted.
 - **No plaintext argv.** Content goes over stdin and passwords are passed by
   reference, so neither appears in `ps`.
 - **Atomic writes.** Encrypted output is written to a sibling temporary file,
