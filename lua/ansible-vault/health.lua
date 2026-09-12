@@ -110,7 +110,7 @@ function M.check()
     )
   end
 
-  local argv = vault._private.get_vault_argv()
+  local argv = vault.executable_argv()
   local executable = argv[1]
   if executable == "conda" then
     if vim.fn.executable("conda") == 1 then
