@@ -44,6 +44,17 @@ make format      # stylua
 `make test` is the fast loop. `make test-real` and `make test-leak` create
 `.venv/` on first run.
 
+The unit suite is a thin driver (`tests/run.lua`) over a shared harness
+(`tests/helpers.lua`) and three spec files. To run one test, match on its name:
+
+```sh
+TEST_FILTER=rekey make test
+```
+
+Tests run in sorted order rather than `pairs()` order, so a failure is
+reproducible: a test that only fails after some other test has run is a leak
+between them, not luck.
+
 ## Working on the privacy guarantees
 
 Decrypted content must never reach the disk, including after a crash. A few
