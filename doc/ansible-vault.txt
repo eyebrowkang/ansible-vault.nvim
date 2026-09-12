@@ -52,19 +52,46 @@ supported.
 
 All commands accept optional vault credential overrides as arguments.
 
+There are six, and each works on a whole vault file OR on a single inline
+`!vault` value. Which one is decided per invocation:
+
+                                                  *ansible-vault-scope*
+    1. an explicit `[range]`    -> those lines, as an inline value
+    2. the buffer is mid-edit   -> whatever it was decrypted as
+    3. line 1 is a vault header -> the whole file
+    4. looking for ciphertext   -> the `!vault` block under the cursor
+    5. looking for plaintext    -> the whole buffer
+
+Step 5 is why encrypting one value asks for a range: in a YAML file almost
+every line is a `key: value` pair, so guessing from the cursor would
+silently encrypt one line when you meant the file. Use `:.VaultEncrypt`
+for the current line.
+
+None of this reads the `'<`/`'>` marks, so a command run from normal mode
+cannot act on a visual selection made earlier elsewhere in the buffer.
+
                                                  *:VaultEncrypt*
-:VaultEncrypt [args]
-    Encrypt the current buffer with ansible-vault. The buffer content
-    is replaced with ciphertext. Use `:write` to persist.
+:[range]VaultEncrypt [args]
+    Without a range: encrypt the whole buffer. The buffer content is
+    replaced with ciphertext; use `:write` to persist.
+
+    With a range: turn those lines into an inline `!vault` value. A
+    `key: value` line keeps its key and only the value is encrypted.
+
+    On a buffer holding decrypted inline values, fold them back into
+    `!vault` blocks — the inverse of |:VaultDecrypt| — without writing.
 
                                                  *:VaultDecrypt*
-:VaultDecrypt [args]
-    Decrypt the current encrypted buffer in place and enter plaintext
-    editing mode. The buffer shows the decrypted content, but `:write`
-    re-encrypts before touching the file, and Neovim's swap file, undo
-    file and backup file are all disabled for it. The buffer stays
-    decrypted after a write so editing can continue; run |:VaultEncrypt|
-    to return it to ciphertext, or `:edit!` to reload the file.
+:[range]VaultDecrypt [args]
+    Decrypt the whole buffer, or one inline `!vault` value, in place and
+    enter plaintext editing mode. The buffer shows the decrypted content,
+    but `:write` re-encrypts before touching the file, and Neovim's swap
+    file, undo file and backup file are all disabled for it. The buffer
+    stays decrypted after a write so editing can continue; run
+    |:VaultEncrypt| to return it to ciphertext, or `:edit!` to reload.
+
+    Inline values are tracked individually, so other values in the same
+    file stay encrypted and can be decrypted too.
     See |ansible-vault-security|.
 
                                                  *:VaultCreate*
@@ -74,9 +101,10 @@ All commands accept optional vault credential overrides as arguments.
     encrypted. Fails if {file} already exists unless `!` is given.
 
                                                  *:VaultView*
-:VaultView [args]
-    View the decrypted content of an encrypted buffer in a read-only
-    floating window. Press `q` or `<Esc>` to close.
+:[range]VaultView [args]
+    Show the decrypted content of the buffer, or of one inline `!vault`
+    value, in a read-only floating window. Press `q` or `<Esc>` to close.
+    The buffer is never modified and never enters plaintext mode.
 
                                                  *:VaultEdit*
 :VaultEdit [args]
@@ -85,8 +113,12 @@ All commands accept optional vault credential overrides as arguments.
     content is encrypted and atomically written back to the original
     file.
 
+    Whole files only, because it depends on comparing the original file
+    on disk before saving. A range is an error pointing at
+    |:VaultDecrypt|.
+
                                                  *:VaultRekey*
-:VaultRekey [args]
+:[range]VaultRekey [args]
     Rekey the current file-backed encrypted buffer. Requires
     `new_vault_id`, `new_password_file`, or a `--new-vault-*` argument.
     The buffer must be encrypted and unmodified.
@@ -98,36 +130,15 @@ All commands accept optional vault credential overrides as arguments.
     from `ansible.cfg`, which either fails or re-encrypts with the old
     password while reporting success.
 
-                                                 *:VaultEncryptString*
-:[range]VaultEncryptString [args]
-    Encrypt the selected text as an inline YAML vault string. When
-    a full YAML key/value line is selected, the key is preserved.
+    An inline value is rekeyed by decrypting with the old credentials
+    and re-encrypting with the new ones, because `ansible-vault rekey`
+    only accepts file paths. The plaintext exists only as a local
+    variable: it never reaches a buffer, a buffer variable, a
+    notification or an event.
 
-                                                 *:VaultDecryptString*
-:[range]VaultDecryptString [args]
-    Decrypt a selected inline YAML vault string in place.
-
-                                                 *:VaultViewString*
-:[range]VaultViewString [args]
-    View a selected inline YAML vault string in a floating window.
-
-                                             *:VaultEncryptStringUnderCursor*
-:VaultEncryptStringUnderCursor [args]
-    Encrypt the YAML value under the cursor without making a visual
-    selection.
-
-                                             *:VaultViewStringUnderCursor*
-:VaultViewStringUnderCursor [args]
-    View the inline vault block under the cursor.
-
-                                           *:VaultDecryptStringUnderCursor*
-:VaultDecryptStringUnderCursor [args]
-    Decrypt the inline vault block under the cursor in place.
-
-> Note: For visual mode keymaps mapping to the range-accepting commands,
-  use `:` (colon) form, e.g. `:VaultEncryptString<cr>`, not `<cmd>`
-  form. This ensures the correct visual range is passed. See
-  |ansible-vault-keymaps|.
+> Note: For visual mode keymaps, use the `:` (colon) form, e.g.
+  `:VaultEncrypt<cr>`, not `<cmd>` form. This is what passes the visual
+  range. See |ansible-vault-keymaps|.
 
                                                 *ansible-vault-command-args*
 Supported command-line arguments (can be passed to any vault command):
@@ -167,12 +178,13 @@ Suggested keymaps (not set by the plugin): >
     vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>")
     vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>")
     vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>")
-    vim.keymap.set("v", "<leader>vs", ":VaultEncryptString<cr>", {silent=true})
-    vim.keymap.set("v", "<leader>vS", ":VaultDecryptString<cr>", {silent=true})
-    vim.keymap.set("v", "<leader>vv", ":VaultViewString<cr>", {silent=true})
-    vim.keymap.set("n", "<leader>vs", "<cmd>VaultEncryptStringUnderCursor<cr>")
-    vim.keymap.set("n", "<leader>vS", "<cmd>VaultDecryptStringUnderCursor<cr>")
+
+    vim.keymap.set("x", "<leader>ve", ":VaultEncrypt<cr>", {silent=true})
+    vim.keymap.set("x", "<leader>vd", ":VaultDecrypt<cr>", {silent=true})
+    vim.keymap.set("x", "<leader>vv", ":VaultView<cr>", {silent=true})
 <
+The same six commands serve both scopes, so one keymap per verb covers
+whole files from normal mode and inline values from visual mode.
 Note: Visual mode mappings use `:` form (not `<cmd>`) so that the
 current visual range is correctly passed to the command.
 
@@ -326,17 +338,26 @@ on the next attempt.
     `opts.positionals[1]`; set `opts.bang` to overwrite. See
     |:VaultCreate|.
 
+Each verb resolves its target the same way the commands do (see
+|ansible-vault-scope|). Pass `range`, `line1` and `line2` in `opts` to act
+on an inline value; omit them for the whole buffer, or for the `!vault`
+block under the cursor. >
+
+    vault.encrypt(nil, { range = 1, line1 = 7, line2 = 7 })
+    vault.decrypt()  -- the !vault block under the cursor
+<
                                      *ansible-vault.encrypt()*
 `encrypt(buf?, opts?)` ~
-    Encrypt the current or specified buffer.
+    Encrypt the buffer, or one inline `!vault` value. On a buffer holding
+    decrypted inline values, fold them back.
 
                                      *ansible-vault.decrypt()*
 `decrypt(buf?, opts?)` ~
-    Decrypt the current or specified buffer.
+    Decrypt the buffer, or one inline `!vault` value, in place.
 
                                      *ansible-vault.view()*
 `view(buf?, opts?)` ~
-    View decrypted buffer content in a floating window.
+    Show decrypted content in a read-only floating window.
 
                                      *ansible-vault.edit()*
 `edit(buf?, opts?)` ~
@@ -345,42 +366,15 @@ on the next attempt.
 
                                      *ansible-vault.rekey()*
 `rekey(opts?)` ~
-    Rekey the current file-backed encrypted buffer.
+    Rekey the vault file, or one inline `!vault` value.
 
                                      *ansible-vault.cleanup()*
 `cleanup()` ~
     Drop every secret this process still holds. Runs
     automatically on |VimLeavePre|.
 
-                                     *ansible-vault.encrypt_string()*
-`encrypt_string(range_opts?, opts?)` ~
-    Encrypt visually selected text as an inline YAML vault
-    string.
-
-                                     *ansible-vault.decrypt_string()*
-`decrypt_string(range_opts?, opts?)` ~
-    Decrypt a selected inline YAML vault string in place.
-
-                                     *ansible-vault.view_string()*
-`view_string(range_opts?, opts?)` ~
-    View a selected inline YAML vault string.
-
-                                     *ansible-vault.encrypt_string_under_cursor()*
-`encrypt_string_under_cursor(opts?)` ~
-    Encrypt the YAML value under the cursor.
-
-                                     *ansible-vault.decrypt_string_under_cursor()*
-`decrypt_string_under_cursor(opts?)` ~
-    Decrypt the inline vault block under the cursor.
-
-                                     *ansible-vault.view_string_under_cursor()*
-`view_string_under_cursor(opts?)` ~
-    View the inline vault block under the cursor.
-
 ==============================================================================
 7. USER EVENTS                                   *ansible-vault-events*
-
-The plugin emits |User| autocommands after successful operations:
 
 The plugin emits exactly one pattern, `AnsibleVaultOperation`, so a
 single autocommand can react to everything and filter on the payload.

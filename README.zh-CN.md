@@ -170,18 +170,34 @@ header。
 
 | 命令 | 说明 |
 |------|------|
-| `:VaultEncrypt` | 加密当前 buffer |
-| `:VaultDecrypt` | 解密当前 buffer 进入编辑态，`:w` 会重新加密 |
-| `:VaultCreate {file}` | 新建加密文件（`!` 覆盖已有文件）|
-| `:VaultView` | 在只读浮窗中查看解密内容 |
-| `:VaultEdit` | 在 scratch buffer 中编辑解密内容，`:write` 时重新加密保存 |
-| `:VaultRekey [args]` | 对当前加密文件执行 rekey |
-| `:VaultEncryptString` | 加密视觉选择的文本 |
-| `:VaultDecryptString` | 原地解密选中的 inline vault 字符串，`:w` 会还原 |
-| `:VaultViewString` | 查看视觉选择中的 inline vault 字符串 |
-| `:VaultEncryptStringUnderCursor` | 加密光标所在 YAML value |
-| `:VaultViewStringUnderCursor` | 查看光标所在 inline vault block |
-| `:VaultDecryptStringUnderCursor` | 原地解密光标所在 inline vault block |
+一共六个命令。每个命令既能作用于整个 vault 文件，也能作用于单个 inline
+`!vault` 值；具体作用于哪一个，由 buffer、range 和光标位置共同决定。
+
+| 命令 | 整文件 | inline `!vault` 值 |
+|------|--------|--------------------|
+| `:VaultEncrypt` | 加密当前 buffer | 给定 `[range]` 时，把这些行转成 `!vault` 值 |
+| `:VaultDecrypt` | 解密进入编辑态，`:w` 重新加密 | 原地解密单个值，`:w` 会折回 |
+| `:VaultView` | 只读浮窗查看解密内容 | 只读浮窗查看单个解密值 |
+| `:VaultEdit` | 在 scratch buffer 中编辑，保存时加密 | — |
+| `:VaultRekey` | 对文件执行 `ansible-vault rekey` | 用新凭据重新加密单个值 |
+| `:VaultCreate[!] {file}` | 新建加密文件 | — |
+
+### 作用目标的判定顺序
+
+按顺序匹配，命中即停止：
+
+1. 显式 `[range]` → 这些行，按 inline 值处理
+2. buffer 正处于解密编辑态 → 沿用它当时的解密形态
+3. 第一行是 `$ANSIBLE_VAULT` header → 整个文件
+4. 要找「已加密的内容」→ 光标所在的 `!vault` block
+5. 要找「待加密的内容」→ 整个 buffer
+
+第 5 条解释了为什么用 `:VaultEncrypt` 加密单个值必须给 range：YAML 文件里几乎
+每一行都是 `key: value`，靠光标猜测会在你想加密整个文件时悄悄只加密一行。
+加密当前行用 `:.VaultEncrypt`。
+
+以上判定完全不读 `'<`/`'>` 这两个 mark，因此在普通模式下执行命令，绝不会误用
+你之前在 buffer 别处留下的视觉选区。
 
 ## 健康检查
 
@@ -259,15 +275,16 @@ buffer 的常规行为，或者用 `:edit!` 重新载入加密文件。
 如果 scratch buffer 打开期间原文件在磁盘上发生了变化，插件会拒绝保存，
 避免覆盖外部修改。
 
-### 加密 YAML inline 字符串
+### 加密 YAML inline 值
 
-在视觉模式中选中文本后执行：
+把要加密的行作为 range 传入——当前行，或一个视觉选区：
 
 ```vim
-:VaultEncryptString
+:.VaultEncrypt
+:'<,'>VaultEncrypt
 ```
 
-如果选中的是完整 YAML 行：
+如果是 `key: value` 行：
 
 ```yaml
 password: secret
@@ -281,57 +298,28 @@ password: !vault |
           ...
 ```
 
-你也可以只选中 `password: secret` 里的 `secret`，插件同样会把加密结果插入
-到 `password` 这个 key 下。
+### 查看、编辑、rekey inline vault 值
 
-### 查看 YAML inline vault 字符串
-
-选中 YAML vault block 后执行：
+把光标放在 `!vault` block 内的任意位置即可，不需要选中整块内容——插件会自动
+找到光标所在的 block：
 
 ```vim
-:VaultViewString
+:VaultView     " 只读浮窗
+:VaultDecrypt  " 原地解密以便编辑
+:VaultRekey    " 用新凭据重新加密这一个值
 ```
 
-解密后的值会显示在只读浮窗中。按 `q` 或 `<Esc>` 关闭。
+执行 `:VaultDecrypt` 后，buffer 进入 **inline 明文态**：解密区域用 extmark 跟踪，
+buffer 的加固方式与整文件解密完全一致，`:w` 会先把该值折回 `!vault` block 再写盘。
+周围的行原样写出，所以部分加密的文件也能正常处理。同一文件中的其他值仍保持加密，
+也可以继续解密。
 
-### 原地解密 YAML inline vault 字符串
+不带 range 执行 `:VaultEncrypt` 会把已解密的值折回密文，但不写盘——它是
+`:VaultDecrypt` 的逆操作，和整文件的情况一样，`:w` 仍然由你决定。
 
-选中 YAML vault block 后执行：
-
-```vim
-:VaultDecryptString
-```
-
-例如：
-
-```yaml
-password: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          ...
-```
-
-会被替换为：
-
-```yaml
-password: secret
-```
-
-### 在光标下处理 inline vault 字符串
-
-当光标位于普通 YAML key/value 行时，执行：
-
-```vim
-:VaultEncryptStringUnderCursor
-```
-
-当光标位于 YAML `!vault |` block 上时，执行：
-
-```vim
-:VaultViewStringUnderCursor
-:VaultDecryptStringUnderCursor
-```
-
-插件会自动找到光标周围的 vault block，不需要手动选择整块内容。
+对 inline 值执行 `:VaultRekey` 必须「用旧凭据解密、再用新凭据加密」，因为
+`ansible-vault rekey` 只接受文件路径。明文在整个过程中只存在于一个局部变量里：
+不会进入 buffer、buffer 变量、通知消息或事件数据。
 
 ### Rekey 加密文件
 
@@ -376,12 +364,16 @@ vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decry
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
 vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
-vim.keymap.set("v", "<leader>vs", ":VaultEncryptString<cr>", { silent = true, desc = "Vault Encrypt String" })
-vim.keymap.set("v", "<leader>vS", ":VaultDecryptString<cr>", { silent = true, desc = "Vault Decrypt String" })
-vim.keymap.set("v", "<leader>vv", ":VaultViewString<cr>", { silent = true, desc = "Vault View String" })
-vim.keymap.set("n", "<leader>vs", "<cmd>VaultEncryptStringUnderCursor<cr>", { desc = "Vault Encrypt String" })
-vim.keymap.set("n", "<leader>vS", "<cmd>VaultDecryptStringUnderCursor<cr>", { desc = "Vault Decrypt String" })
+
+-- 视觉模式是通过 range 把选区传给命令的，所以这里必须用 `:` 形式，
+-- 用 `<cmd>` 不会带上 range。
+vim.keymap.set("x", "<leader>ve", ":VaultEncrypt<cr>", { silent = true, desc = "Vault Encrypt" })
+vim.keymap.set("x", "<leader>vd", ":VaultDecrypt<cr>", { silent = true, desc = "Vault Decrypt" })
+vim.keymap.set("x", "<leader>vv", ":VaultView<cr>", { silent = true, desc = "Vault View" })
 ```
+
+六个命令同时覆盖两种作用域，所以每个动作一个快捷键就够了：普通模式下作用于整个
+文件，视觉模式下作用于 inline 值。
 
 ## Statusline 集成
 
@@ -424,9 +416,10 @@ vault.decrypt()
 vault.view()
 vault.edit()
 vault.rekey()
-vault.encrypt_string()
-vault.decrypt_string()
-vault.view_string()
+-- 每个动作都接受与命令相同的作用域提示：传 range 作用于 inline 值，
+-- 不传则作用于整个 buffer 或光标所在的 block。
+vault.encrypt(nil, { range = 1, line1 = 7, line2 = 7 })
+vault.decrypt()
 vault.encrypt_string_under_cursor()
 vault.view_string_under_cursor()
 vault.decrypt_string_under_cursor()

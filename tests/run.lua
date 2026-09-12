@@ -478,15 +478,13 @@ tests["VaultEdit refuses to overwrite externally changed files"] = function()
   vim.api.nvim_buf_delete(edit_buf, { force = true })
 end
 
-tests["VaultEncryptString preserves YAML keys for full-line selections"] = function()
+tests["VaultEncrypt on a key: value line keeps the key"] = function()
   local fake = create_fake_vault()
   reset_config(fake)
 
   local buf = new_buffer({ "password: secret" })
-  vim.fn.setpos("'<", { 0, 1, 1, 0 })
-  vim.fn.setpos("'>", { 0, 1, #"password: secret", 0 })
 
-  vault.encrypt_string()
+  vault.encrypt(nil, { range = 1, line1 = 1, line2 = 1 })
 
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
@@ -495,26 +493,6 @@ tests["VaultEncryptString preserves YAML keys for full-line selections"] = funct
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   assert_eq(lines[1], "password: !vault |", "full-line YAML output has wrong first line")
   assert_eq(lines[2], "          $ANSIBLE_VAULT;1.1;AES256", "full-line YAML output has wrong vault header")
-end
-
-tests["VaultEncryptString can replace only a YAML value"] = function()
-  local fake = create_fake_vault()
-  reset_config(fake)
-
-  local line = "password: secret"
-  local buf = new_buffer({ line })
-  vim.fn.setpos("'<", { 0, 1, 11, 0 })
-  vim.fn.setpos("'>", { 0, 1, #line, 0 })
-
-  vault.encrypt_string()
-
-  wait_until(function()
-    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
-  end, "YAML value-only encryption did not produce a vault scalar")
-
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  assert_eq(lines[1], "password: !vault |", "value-only YAML output has wrong first line")
-  assert_eq(lines[2], "          $ANSIBLE_VAULT;1.1;AES256", "value-only YAML output has wrong vault header")
 end
 
 tests["command args can override encrypt vault id"] = function()
@@ -528,14 +506,12 @@ tests["command args can override encrypt vault id"] = function()
 
   local line = "password: secret"
   local buf = new_buffer({ line })
-  vim.fn.setpos("'<", { 0, 1, 1, 0 })
-  vim.fn.setpos("'>", { 0, 1, #line, 0 })
 
-  vim.cmd("VaultEncryptString --encrypt-vault-id prod")
+  vim.cmd("1VaultEncrypt --encrypt-vault-id prod")
 
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
-  end, "VaultEncryptString command arg did not encrypt")
+  end, "VaultEncrypt command arg did not encrypt")
 
   assert_true(log_contains(fake.log, "ARG:--encrypt-vault-id"), "encrypt vault id flag was not passed")
   assert_true(log_has_line(fake.log, "ARG:prod"), "encrypt vault id value was not passed")
@@ -706,7 +682,7 @@ tests["command completion exposes override flags and inline labels"] = function(
     vault_ids = { "prod@" .. prod_pass },
   })
 
-  local label_completion = vim.fn.getcompletion("VaultEncryptString p", "cmdline")
+  local label_completion = vim.fn.getcompletion("VaultEncrypt p", "cmdline")
   assert_true(vim.tbl_contains(label_completion, "prod"), "inline encrypt label was not completed")
 
   local flag_completion = vim.fn.getcompletion("VaultEdit --vault", "cmdline")
@@ -786,7 +762,7 @@ tests["operations announce themselves on AnsibleVaultOperation"] = function()
   assert_eq(seen.buf, buf, "the event should carry the buffer it applied to")
 end
 
-tests["VaultDecryptString replaces selected YAML vault block"] = function()
+tests["VaultDecrypt over a range replaces the YAML vault block"] = function()
   local fake = create_fake_vault()
   reset_config(fake)
 
@@ -795,32 +771,30 @@ tests["VaultDecryptString replaces selected YAML vault block"] = function()
     "          $ANSIBLE_VAULT;1.1;AES256",
     "          ENCSTR:secret",
   })
-  vim.fn.setpos("'<", { 0, 1, 1, 0 })
-  vim.fn.setpos("'>", { 0, 3, #"          ENCSTR:secret", 0 })
 
-  vault.decrypt_string()
+  vault.decrypt(nil, { range = 3, line1 = 1, line2 = 3 })
 
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: secret"
-  end, "selected YAML vault block was not decrypted")
+  end, "the YAML vault block in the range was not decrypted")
 
   assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "password: secret" })
 end
 
-tests["under cursor commands encrypt view and decrypt YAML vault strings"] = function()
+tests["the cursor resolves inline view and decrypt without a range"] = function()
   local fake = create_fake_vault()
   reset_config(fake)
 
   local buf = new_buffer({ "password: secret" })
   vim.api.nvim_win_set_cursor(0, { 1, 0 })
-  vault.encrypt_string_under_cursor()
+  vault.encrypt(nil, { range = 1, line1 = 1, line2 = 1 })
 
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
   end, "under-cursor YAML value was not encrypted")
 
   vim.api.nvim_win_set_cursor(0, { 2, 10 })
-  vault.view_string_under_cursor()
+  vault.view()
 
   wait_until(function()
     return vim.api.nvim_get_current_buf() ~= buf
@@ -830,7 +804,7 @@ tests["under cursor commands encrypt view and decrypt YAML vault strings"] = fun
 
   vim.api.nvim_set_current_buf(buf)
   vim.api.nvim_win_set_cursor(0, { 2, 10 })
-  vault.decrypt_string_under_cursor()
+  vault.decrypt()
 
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: secret"
@@ -851,10 +825,180 @@ tests["under cursor vault lookup does not select a previous block"] = function()
   })
 
   vim.api.nvim_win_set_cursor(0, { 4, 0 })
-  vault.view_string_under_cursor()
+  vault.view()
 
   assert_eq(vim.api.nvim_get_current_buf(), buf, "view should not open for a cursor outside the vault block")
-  assert_true(notification_contains("No text selected"), "missing warning for cursor outside a vault block")
+  assert_true(notification_contains("nothing encrypted here"), "missing error for cursor outside a vault block")
+end
+
+tests["scope: a vault file wins over a !vault block at the cursor"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  -- yaml.find_block treats a bare $ANSIBLE_VAULT line as the start of an inline
+  -- block, so a whole-file vault must be recognised first or :VaultDecrypt would
+  -- try to splice the file into itself as a YAML value.
+  local buf = new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+
+  vault.decrypt(buf)
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "plain: old"
+  end, "a whole-file vault was not decrypted as a file")
+
+  assert_eq(vim.b[buf].ansible_vault_plaintext, "file", "the file scope should have won")
+end
+
+tests["scope: VaultEncrypt with no range encrypts the whole buffer"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  -- Every line here is a `key: value` pair. Resolving the cursor line as an
+  -- inline value would silently encrypt one line instead of the file.
+  local buf = new_buffer({ "alpha: one", "beta: two" })
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+
+  vault.encrypt(buf)
+  wait_until(function()
+    return vault.is_buffer_encrypted(buf)
+  end, "VaultEncrypt with no range did not encrypt the buffer")
+
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  assert_eq(lines[1], "$ANSIBLE_VAULT;1.1;AES256", "the whole buffer should have been encrypted")
+  assert_true(lines[2]:find("alpha: one", 1, true) ~= nil, "the whole buffer content should have been the input")
+end
+
+tests["scope: VaultDecrypt refuses when there is nothing encrypted"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local buf = new_buffer({ "alpha: one" })
+  vault.decrypt(buf)
+
+  assert_true(notification_contains("nothing encrypted here"), "the refusal should name what it looked for")
+  assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "alpha: one" }, "the buffer must be untouched")
+end
+
+tests["scope: VaultEdit refuses a range"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local buf = new_buffer({ "password: !vault |", "          $ANSIBLE_VAULT;1.1;AES256", "          ENCSTR:x" })
+  vault.edit(buf, { range = 3, line1 = 1, line2 = 3 })
+
+  assert_true(notification_contains("whole vault file"), "VaultEdit should point at :VaultDecrypt for inline values")
+end
+
+tests["VaultEncrypt folds a decrypted inline value back without writing"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local dir = temp_dir()
+  local buf, path = new_file_buffer(dir, "inline.yml", {
+    "password: !vault |",
+    "          $ANSIBLE_VAULT;1.1;AES256",
+    "          ENCSTR:secret",
+  })
+  local before = read_file(path)
+
+  vault.decrypt(buf, { range = 3, line1 = 1, line2 = 3 })
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: secret"
+  end, "inline decrypt did not finish")
+  assert_eq(vim.b[buf].ansible_vault_plaintext, "inline", "the buffer should be in inline plaintext mode")
+
+  -- The inverse of decrypting in place, and like whole-file :VaultEncrypt it
+  -- leaves the file alone: `:w` stays the user's decision.
+  vault.encrypt(buf)
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
+  end, "VaultEncrypt did not fold the inline value back")
+
+  assert_eq(vim.b[buf].ansible_vault_plaintext, nil, "the buffer should have left plaintext mode")
+  assert_eq(read_file(path), before, "folding back must not write the file")
+end
+
+tests["a second inline value can be decrypted while the first is open"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local buf = new_buffer({
+    "first: !vault |",
+    "          $ANSIBLE_VAULT;1.1;AES256",
+    "          ENCSTR:alpha",
+    "second: !vault |",
+    "          $ANSIBLE_VAULT;1.1;AES256",
+    "          ENCSTR:beta",
+  })
+
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  vault.decrypt()
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "first: alpha"
+  end, "the first value was not decrypted")
+
+  -- Inline plaintext mode must not make the buffer look wholly decrypted: it is
+  -- ordinary YAML, and the other values are still encrypted and still addressable.
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  vault.decrypt()
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "second: beta"
+  end, "a second value could not be decrypted while the first was open")
+
+  assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "first: alpha", "second: beta" })
+end
+
+tests["VaultRekey rotates a single inline value"] = function()
+  local fake = create_fake_vault()
+  local old_pass = make_password_file(fake.dir)
+  local new_pass = fake.dir .. "/inline-new-pass"
+  write_file(new_pass, "new\n")
+  reset_config(fake, { password_files = old_pass, new_password_file = new_pass })
+
+  local buf = new_buffer({
+    "password: !vault |",
+    "          $ANSIBLE_VAULT;1.1;AES256",
+    "          ENCSTR:secret",
+    "other: plain",
+  })
+
+  vault.rekey({ range = 3, line1 = 1, line2 = 3 })
+
+  wait_until(function()
+    return notification_contains("Inline value rekeyed successfully")
+  end, "inline rekey did not finish")
+
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  assert_eq(lines[1], "password: !vault |", "the key should be preserved")
+  assert_eq(lines[#lines], "other: plain", "unrelated lines must be left alone")
+  assert_true(log_has_line(fake.log, "ARG:" .. new_pass), "the new credential should be used to re-encrypt")
+  assert_true(log_has_line(fake.log, "ARG:--stdin-name"), "the value must be re-encrypted under its own key")
+  assert_true(log_has_line(fake.log, "ARG:password"), "the key name should be passed as --stdin-name")
+
+  -- Plaintext must never land in the buffer on the way through. (The fake echoes
+  -- its input back inside the ciphertext, so look for the decrypted *shape*.)
+  assert_false(vim.tbl_contains(lines, "password: secret"), "the decrypted value must not be left in the buffer")
+end
+
+tests["VaultRekey refuses an inline value while it is decrypted"] = function()
+  local fake = create_fake_vault()
+  local new_pass = fake.dir .. "/refuse-new-pass"
+  write_file(new_pass, "new\n")
+  reset_config(fake, { new_password_file = new_pass })
+
+  local buf = new_buffer({
+    "password: !vault |",
+    "          $ANSIBLE_VAULT;1.1;AES256",
+    "          ENCSTR:secret",
+  })
+
+  vault.decrypt(buf, { range = 3, line1 = 1, line2 = 3 })
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: secret"
+  end, "inline decrypt did not finish")
+
+  vault.rekey()
+  assert_true(notification_contains("Write or discard the decrypted content"), "rekey should refuse decrypted content")
 end
 
 tests["VaultRekey never passes --encrypt-vault-id"] = function()
@@ -1013,43 +1157,14 @@ tests["B6 encrypt string ignores YAML comments"] = function()
   vim.env.FAKE_VAULT_STDIN_LOG = stdin_log
 
   local buf = new_buffer({ 'password: "sec#ret" # prod' })
-  vim.fn.setpos("'<", { 0, 1, 1, 0 })
-  vim.fn.setpos("'>", { 0, 1, #'password: "sec#ret" # prod', 0 })
 
-  vault.encrypt_string()
+  vault.encrypt(nil, { range = 1, line1 = 1, line2 = 1 })
 
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
   end, "YAML value with comment was not encrypted")
 
   assert_eq(read_file(stdin_log), "sec#ret", "YAML comments or quoted # were included in the encrypted value")
-end
-
-tests["B11 blockwise string encryption preserves unselected columns"] = function()
-  local fake = create_fake_vault()
-  reset_config(fake)
-  local stdin_log = fake.dir .. "/stdin.log"
-  vim.env.FAKE_VAULT_STDIN_LOG = stdin_log
-
-  local buf = new_buffer({ "abcdef", "ghijkl", "mnopqr" })
-  local ctrl_v = vim.api.nvim_replace_termcodes("<C-v>", true, false, true)
-  vim.cmd("normal! gg0l" .. ctrl_v .. "jjll")
-  vim.cmd("normal! \27")
-  vim.fn.setpos("'<", { 0, 1, 2, 0 })
-  vim.fn.setpos("'>", { 0, 3, 4, 0 })
-
-  vault.encrypt_string({ line1 = 1, line2 = 3, range = 3 })
-
-  wait_until(function()
-    return vim.b[buf].ansible_vault_pending == nil
-  end, "blockwise string encryption did not finish")
-
-  assert_eq(read_file(stdin_log), "bcd\nhij\nnop", "blockwise selection did not send the selected rectangle")
-
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  assert_eq(lines[1], "aencrypted_string: !vault |ef", "first blockwise line did not preserve outside columns")
-  assert_eq(lines[2], "g          $ANSIBLE_VAULT;1.1;AES256kl", "middle blockwise line lost outside columns")
-  assert_eq(lines[3], "m          ENCSTR:bcdqr", "last selected blockwise line lost outside columns")
 end
 
 tests["B6 decrypt string quotes YAML special values"] = function()
@@ -1090,7 +1205,7 @@ tests["B7 find vault block beyond 100 lines"] = function()
   local cursor_row = #lines - 1
   vim.api.nvim_win_set_cursor(0, { cursor_row, 30 })
 
-  vault.view_string_under_cursor()
+  vault.view()
 
   wait_until(function()
     return vim.api.nvim_get_current_buf() ~= buf
@@ -1303,7 +1418,7 @@ tests["decrypting an inline string enters inline mode and write restores the blo
   })
 
   vim.api.nvim_win_set_cursor(0, { 2, 0 })
-  vault.decrypt_string_under_cursor()
+  vault.decrypt()
 
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "password: hunter2"
@@ -1348,13 +1463,13 @@ tests["multiple decrypted inline values are all restored on write"] = function()
   })
 
   vim.api.nvim_win_set_cursor(0, { 5, 0 })
-  vault.decrypt_string_under_cursor()
+  vault.decrypt()
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 4, 5, false)[1] == "second: beta"
   end, "second value was not decrypted")
 
   vim.api.nvim_win_set_cursor(0, { 1, 0 })
-  vault.decrypt_string_under_cursor()
+  vault.decrypt()
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "first: alpha"
   end, "first value was not decrypted")
@@ -1392,7 +1507,7 @@ tests["inline restore preserves dos line endings"] = function()
   assert_eq(vim.bo[buf].fileformat, "dos", "precondition: the fixture should be detected as dos")
 
   vim.api.nvim_win_set_cursor(0, { 2, 0 })
-  vault.decrypt_string_under_cursor()
+  vault.decrypt()
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "password: hunter2"
   end, "CRLF inline value was not decrypted")
@@ -1504,7 +1619,7 @@ tests["a trailing blank line is not swallowed by an inline block"] = function()
   })
 
   vim.api.nvim_win_set_cursor(0, { 2, 0 })
-  vault.decrypt_string_under_cursor()
+  vault.decrypt()
 
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: hunter2"

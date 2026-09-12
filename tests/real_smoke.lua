@@ -83,16 +83,54 @@ wait_until(function()
   return vim.api.nvim_buf_get_lines(buf, 0, -1, false)[1] == "plain: value"
 end, "real decrypt did not restore plaintext")
 
-vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "password: secret" })
-vault.encrypt_string({ line1 = 1, line2 = 1, range = 1 })
-wait_until(function()
-  return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
-end, "real encrypt_string did not produce inline vault YAML")
+-- Inline values, in their own buffer: the one above is in file-plaintext mode,
+-- and an inline value inside a wholly decrypted file is a contradiction.
+local inline_buf = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_set_current_buf(inline_buf)
+vim.api.nvim_buf_set_lines(inline_buf, 0, -1, false, { "password: secret" })
 
-vault.decrypt_string({ line1 = 1, line2 = vim.api.nvim_buf_line_count(buf), range = 1 })
+vault.encrypt(nil, { line1 = 1, line2 = 1, range = 1 })
 wait_until(function()
-  return vim.api.nvim_buf_get_lines(buf, 0, -1, false)[1] == "password: secret"
-end, "real decrypt_string did not restore inline plaintext")
+  return vim.api.nvim_buf_get_lines(inline_buf, 0, 1, false)[1] == "password: !vault |"
+end, "real inline encrypt did not produce inline vault YAML")
+
+-- No range: the cursor sits inside the block, which is how this is used.
+vim.api.nvim_win_set_cursor(0, { 1, 0 })
+vault.decrypt()
+wait_until(function()
+  return vim.api.nvim_buf_get_lines(inline_buf, 0, -1, false)[1] == "password: secret"
+end, "real inline decrypt did not restore inline plaintext")
+
+-- Fold it back, then rekey that one value with a different password.
+vault.encrypt(inline_buf)
+wait_until(function()
+  return vim.api.nvim_buf_get_lines(inline_buf, 0, 1, false)[1] == "password: !vault |"
+end, "real inline fold-back did not re-encrypt the value")
+
+local inline_new = workdir .. "/inline-new-pass"
+write_file(inline_new, "inline-rotated\n")
+vim.fn.setfperm(inline_new, "rw-------")
+vault.setup({
+  ansible_vault_path = ansible_vault,
+  password_files = password_file,
+  new_password_file = inline_new,
+})
+vim.api.nvim_win_set_cursor(0, { 1, 0 })
+local before_inline_rekey = table.concat(vim.api.nvim_buf_get_lines(inline_buf, 0, -1, false), "\n")
+vault.rekey()
+wait_until(function()
+  return table.concat(vim.api.nvim_buf_get_lines(inline_buf, 0, -1, false), "\n") ~= before_inline_rekey
+end, "real inline rekey did not rewrite the value")
+
+vault.setup({ ansible_vault_path = ansible_vault, password_files = inline_new })
+vim.api.nvim_win_set_cursor(0, { 1, 0 })
+vault.decrypt()
+wait_until(function()
+  return vim.api.nvim_buf_get_lines(inline_buf, 0, -1, false)[1] == "password: secret"
+end, "the rekeyed inline value should open with the NEW password")
+
+vault.setup({ ansible_vault_path = ansible_vault, password_files = password_file })
+vim.api.nvim_set_current_buf(buf)
 
 local edit_file = workdir .. "/edit.yml"
 vim.cmd("edit " .. vim.fn.fnameescape(edit_file))

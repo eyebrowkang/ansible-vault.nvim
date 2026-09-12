@@ -482,10 +482,14 @@ end
 ---only the tracked `!vault` values were decrypted, so `:w` folds them back into
 ---the buffer and the file is written as ordinary YAML.
 
+---Which kind of plaintext a buffer is currently holding, if any.
 ---@param buf integer
----@return boolean
-local function is_plaintext_mode(buf)
-  return is_valid_buf(buf) and vim.b[buf].ansible_vault_plaintext ~= nil
+---@return "file"|"inline"|nil
+local function plaintext_mode(buf)
+  if not is_valid_buf(buf) then
+    return nil
+  end
+  return vim.b[buf].ansible_vault_plaintext
 end
 
 ---@param buf integer
@@ -498,7 +502,7 @@ local function enter_plaintext_mode(buf, mode, opts)
 
   secure.protect(buf)
 
-  if is_plaintext_mode(buf) then
+  if plaintext_mode(buf) then
     return
   end
 
@@ -546,21 +550,9 @@ leave_plaintext_mode = function(buf)
   secure.restore(buf)
 end
 
----Encrypt current buffer.
----@param buf? integer
+---@param target integer
 ---@param opts? table
-function M.encrypt(buf, opts)
-  local target = normalize_buf(buf)
-  if not is_valid_buf(target) then
-    vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
-    return
-  end
-
-  if M.is_buffer_encrypted(target) then
-    vim.notify("Buffer is already encrypted", vim.log.levels.WARN)
-    return
-  end
-
+local function encrypt_file(target, opts)
   local context = buffer_context(target)
 
   get_credentials(function(creds)
@@ -599,21 +591,9 @@ function M.encrypt(buf, opts)
   end, opts, context)
 end
 
----Decrypt current buffer.
----@param buf? integer
+---@param target integer
 ---@param opts? table
-function M.decrypt(buf, opts)
-  local target = normalize_buf(buf)
-  if not is_valid_buf(target) then
-    vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
-    return
-  end
-
-  if not M.is_buffer_encrypted(target) then
-    vim.notify("Buffer is not encrypted", vim.log.levels.WARN)
-    return
-  end
-
+local function decrypt_file(target, opts)
   local context = buffer_context(target)
 
   get_credentials(function(creds)
@@ -651,21 +631,9 @@ function M.decrypt(buf, opts)
   end, opts, context)
 end
 
----View encrypted buffer in a floating window.
----@param buf? integer
+---@param target integer
 ---@param opts? table
-function M.view(buf, opts)
-  local target = normalize_buf(buf)
-  if not is_valid_buf(target) then
-    vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
-    return
-  end
-
-  if not M.is_buffer_encrypted(target) then
-    vim.notify("Buffer is not encrypted", vim.log.levels.WARN)
-    return
-  end
-
+local function view_file(target, opts)
   local filetype = vim.bo[target].filetype
   local context = buffer_context(target)
 
@@ -700,125 +668,14 @@ end
 ---@field end_col integer
 ---@field lines string[]
 ---@field linewise boolean
----@field blockwise boolean
 
----@param buf integer
----@param range_opts? table
----@return AnsibleVaultSelection|nil
-local function get_selection(buf, range_opts)
-  local start_row, start_col, end_row, end_col
-  local range_linewise = false
-
-  local has_range = range_opts and range_opts.range and range_opts.range > 0
-  if has_range then
-    local start_pos = vim.fn.getpos("'<")
-    local end_pos = vim.fn.getpos("'>")
-    local mark_start_row = start_pos[2]
-    local mark_end_row = end_pos[2]
-    local marks_match = mark_start_row == range_opts.line1 and mark_end_row == range_opts.line2
-    if marks_match then
-      start_row = mark_start_row
-      start_col = start_pos[3]
-      end_row = mark_end_row
-      end_col = end_pos[3]
-    else
-      start_row = range_opts.line1
-      end_row = range_opts.line2
-      start_col = 1
-      local last_line = vim.api.nvim_buf_get_lines(buf, end_row - 1, end_row, false)[1] or ""
-      end_col = #last_line
-      range_linewise = true
-    end
-  else
-    local current_mode = vim.api.nvim_get_mode().mode
-    local in_visual = current_mode == "v" or current_mode == "V" or current_mode == "\22"
-    if in_visual then
-      local v_start = vim.fn.getpos("v")
-      local v_end = vim.fn.getpos(".")
-      if v_start[2] > 0 and v_end[2] > 0 then
-        start_row = v_start[2]
-        start_col = v_start[3]
-        end_row = v_end[2]
-        end_col = v_end[3]
-        range_linewise = current_mode == "V"
-      end
-    end
-
-    if not start_row then
-      local start_pos = vim.fn.getpos("'<")
-      local end_pos = vim.fn.getpos("'>")
-      start_row = start_pos[2]
-      start_col = start_pos[3]
-      end_row = end_pos[2]
-      end_col = end_pos[3]
-    end
-
-    if start_row == 0 or end_row == 0 then
-      if not range_opts or not range_opts.line1 or not range_opts.line2 then
-        return nil
-      end
-      start_row = range_opts.line1
-      end_row = range_opts.line2
-      start_col = 1
-      local last_line = vim.api.nvim_buf_get_lines(buf, end_row - 1, end_row, false)[1] or ""
-      end_col = #last_line
-      range_linewise = true
-    end
-  end
-
-  if start_row > end_row or (start_row == end_row and start_col > end_col) then
-    start_row, end_row = end_row, start_row
-    start_col, end_col = end_col, start_col
-  end
-
-  local line_count = vim.api.nvim_buf_line_count(buf)
-  start_row = math.max(1, math.min(start_row, line_count))
-  end_row = math.max(1, math.min(end_row, line_count))
-  start_col = math.max(1, start_col)
-  end_col = math.max(0, end_col)
-
-  local visual_mode = vim.fn.visualmode()
-  local linewise = range_linewise or visual_mode == "V"
-  local blockwise = visual_mode == "\22"
-  local lines
-
-  if blockwise then
-    lines = {}
-    for row = start_row, end_row do
-      local line_text = vim.api.nvim_buf_get_text(buf, row - 1, start_col - 1, row - 1, end_col, {})
-      table.insert(lines, line_text[1] or "")
-    end
-  elseif not linewise then
-    local lines_from_text = vim.api.nvim_buf_get_text(buf, start_row - 1, start_col - 1, end_row - 1, end_col, {})
-    if not lines_from_text or #lines_from_text == 0 then
-      local fallback = vim.api.nvim_buf_get_lines(buf, start_row - 1, end_row, false)
-      if #fallback == 0 then
-        return nil
-      end
-      lines = fallback
-    else
-      lines = lines_from_text
-    end
-  else
-    lines = vim.api.nvim_buf_get_lines(buf, start_row - 1, end_row, false)
-    if #lines == 0 then
-      return nil
-    end
-    start_col = 1
-    end_col = #lines[#lines]
-  end
-
-  return {
-    start_row = start_row - 1,
-    start_col = start_col - 1,
-    end_row = end_row - 1,
-    end_col = end_col,
-    lines = lines,
-    linewise = linewise,
-    blockwise = blockwise,
-  }
-end
-
+---A whole-line region of a buffer.
+---
+---Line-based on purpose. The previous charwise and blockwise handling read the
+---`'<`/`'>` marks when no range was given, which meant a command run from normal
+---mode silently operated on the last visual selection anywhere in the buffer.
+---A `[range]` is always supplied by Neovim for the command forms, so the marks are
+---never needed.
 ---@param buf integer
 ---@param start_row integer 1-based
 ---@param end_row integer 1-based
@@ -851,18 +708,6 @@ local extract_yaml_key_value = yaml.extract_key_value
 
 ---@param buf integer
 ---@return AnsibleVaultSelection|nil
-local function get_plain_yaml_value_under_cursor(buf)
-  local row = vim.api.nvim_win_get_cursor(0)[1]
-  local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
-  local _, key, value = extract_yaml_key_value(line)
-  if not key or not value or value == "" then
-    return nil
-  end
-  return get_line_selection(buf, row, row)
-end
-
----@param buf integer
----@return AnsibleVaultSelection|nil
 local function find_vault_block_under_cursor(buf)
   local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
@@ -884,11 +729,73 @@ local function find_vault_block_under_cursor(buf)
   return selection
 end
 
----@param text string
----@return string
-local function escape_pattern(text)
-  local escaped = text:gsub("([^%w])", "%%%1")
-  return escaped
+---Work out what a command should act on.
+---
+---One rule, applied in order, so the answer never depends on editor state the
+---user cannot see — in particular it never reads the `'<`/`'>` marks, which made
+---the old no-range commands act on a stale selection elsewhere in the buffer:
+---
+---  1. an explicit `[range]`    -> those lines, as an inline value
+---  2. the buffer is mid-edit   -> whatever it was decrypted as
+---  3. line 1 is a vault header -> the whole file
+---  4. looking for ciphertext   -> the `!vault` block under the cursor
+---  5. looking for plaintext    -> the whole buffer
+---
+---Step 3 must come before step 4: `yaml.find_block` accepts a bare
+---`$ANSIBLE_VAULT` line as the start of a block, so a whole-file vault would
+---otherwise resolve as an inline value.
+---
+---`want` is why steps 4 and 5 differ. Hunting for a `!vault` block under the
+---cursor is safe, because the shape is unmistakable. Hunting for a plain
+---`key: value` line is not: in a YAML file almost every line is one, so
+---`:VaultEncrypt` would encrypt whichever line the cursor happened to be on
+---instead of the file. Encrypting one value therefore asks for a range —
+---`:.VaultEncrypt` for the current line.
+---@param buf integer
+---@param range_opts? table
+---@param want "ciphertext"|"plain"
+---@return { scope: "file"|"inline", state: "ciphertext"|"plaintext"|"plain", selection?: AnsibleVaultSelection }|nil
+---@return string|nil err
+local function resolve_scope(buf, range_opts, want)
+  if range_opts and range_opts.range and range_opts.range > 0 then
+    local selection = get_line_selection(buf, range_opts.line1, range_opts.line2)
+    if not selection then
+      return nil, "the given range is empty"
+    end
+    local state = parse_vault_from_yaml(table.concat(selection.lines, "\n")) and "ciphertext" or "plain"
+    return { scope = "inline", state = state, selection = selection }, nil
+  end
+
+  -- "file" mode means the whole buffer is plaintext, so there is nothing else to
+  -- look for. "inline" mode does not: the buffer is ordinary YAML with some values
+  -- decrypted, and the others are still encrypted and still addressable.
+  local mode = plaintext_mode(buf)
+  if mode == "file" then
+    return { scope = "file", state = "plaintext" }, nil
+  end
+
+  if M.is_buffer_encrypted(buf) then
+    return { scope = "file", state = "ciphertext" }, nil
+  end
+
+  if want == "ciphertext" then
+    local block = find_vault_block_under_cursor(buf)
+    if block then
+      return { scope = "inline", state = "ciphertext", selection = block }, nil
+    end
+    if mode == "inline" then
+      return { scope = "inline", state = "plaintext" }, nil
+    end
+    return nil,
+      "nothing encrypted here: this buffer is not an Ansible Vault file, and the cursor "
+        .. "is not inside a !vault block. Give a [range] to name one."
+  end
+
+  if mode == "inline" then
+    return { scope = "inline", state = "plaintext" }, nil
+  end
+
+  return { scope = "file", state = "plain" }, nil
 end
 
 ---@param buf integer
@@ -910,27 +817,16 @@ local function build_encrypt_string_plan(buf, selection)
     return plan
   end
 
+  -- A single line that is a `key: value` pair keeps its key, and only the value
+  -- is encrypted. That is what makes `:VaultEncrypt` on such a line produce
+  -- valid YAML rather than encrypting the key along with it.
   local full_line = vim.api.nvim_buf_get_lines(buf, selection.start_row, selection.start_row + 1, false)[1] or ""
-  local is_full_line = selection.start_col == 0 and selection.end_col >= #full_line
-
-  if is_full_line then
-    local indent, key, value = extract_yaml_key_value(full_line)
-    if key and value and value ~= "" then
-      plan.content = value
-      plan.name = key
-      plan.mode = "full_line"
-      plan.indent = indent or ""
-    end
-    return plan
-  end
-
-  -- A partial selection that starts exactly where the value begins: keep the key
-  -- and replace only the value.
-  local key_line = yaml.parse_key_line(full_line)
-  if key_line and key_line.value_col == selection.start_col then
-    plan.name = key_line.key
-    plan.mode = "value_only"
-    plan.indent = key_line.indent
+  local indent, key, value = extract_yaml_key_value(full_line)
+  if key and value and value ~= "" then
+    plan.content = value
+    plan.name = key
+    plan.mode = "full_line"
+    plan.indent = indent or ""
   end
 
   return plan
@@ -948,21 +844,7 @@ local function format_encrypt_string_output(output, plan)
     table.remove(lines, #lines)
   end
 
-  if plan.mode == "value_only" then
-    local key_pattern = "^%s*" .. escape_pattern(plan.name) .. ":%s*(.*)$"
-    local first_value = lines[1] and lines[1]:match(key_pattern)
-    if first_value then
-      lines[1] = first_value
-    end
-    -- The first line is spliced in at the value column, but the ciphertext lines
-    -- below it are still at ansible-vault's fixed indentation. Shift them to sit
-    -- under the key, matching what full-line encryption produces.
-    if plan.indent ~= "" then
-      for i = 2, #lines do
-        lines[i] = plan.indent .. lines[i]
-      end
-    end
-  elseif plan.mode == "full_line" and plan.indent ~= "" then
+  if plan.mode == "full_line" and plan.indent ~= "" then
     for i, line in ipairs(lines) do
       lines[i] = plan.indent .. line
     end
@@ -975,35 +857,15 @@ end
 ---@param selection AnsibleVaultSelection
 ---@param replacement string[]
 local function replace_selection_text(buf, selection, replacement)
-  if not selection.blockwise then
-    return pcall(
-      vim.api.nvim_buf_set_text,
-      buf,
-      selection.start_row,
-      selection.start_col,
-      selection.end_row,
-      selection.end_col,
-      replacement
-    )
-  end
-
-  local selected_row_count = selection.end_row - selection.start_row + 1
-  local original_lines = vim.api.nvim_buf_get_lines(buf, selection.start_row, selection.end_row + 1, false)
-  local new_lines = {}
-  local line_count = math.max(selected_row_count, #replacement)
-
-  for i = 1, line_count do
-    local original = original_lines[i]
-    if original then
-      local prefix = original:sub(1, selection.start_col)
-      local suffix = original:sub(selection.end_col + 1)
-      table.insert(new_lines, prefix .. (replacement[i] or "") .. suffix)
-    else
-      table.insert(new_lines, replacement[i] or "")
-    end
-  end
-
-  return pcall(vim.api.nvim_buf_set_lines, buf, selection.start_row, selection.end_row + 1, false, new_lines)
+  return pcall(
+    vim.api.nvim_buf_set_text,
+    buf,
+    selection.start_row,
+    selection.start_col,
+    selection.end_row,
+    selection.end_col,
+    replacement
+  )
 end
 
 ---@param buf integer
@@ -1076,33 +938,9 @@ local function encrypt_string_selection(buf, selection, opts)
   end, opts, context)
 end
 
----Encrypt selected text.
----@param range_opts? table
----@param opts? table
-function M.encrypt_string(range_opts, opts)
-  local target = vim.api.nvim_get_current_buf()
-  local selection = get_selection(target, range_opts)
-
-  encrypt_string_selection(target, selection, opts)
-end
-
----Encrypt the plain YAML value under the cursor.
----@param opts? table
-function M.encrypt_string_under_cursor(opts)
-  local target = vim.api.nvim_get_current_buf()
-  local selection = get_plain_yaml_value_under_cursor(target)
-
-  if not selection then
-    vim.notify("No plain YAML key/value found under cursor", vim.log.levels.WARN)
-    return
-  end
-
-  encrypt_string_selection(target, selection, opts)
-end
-
 --- Inline region tracking -------------------------------------------------
 ---
----After `:VaultDecryptString` the buffer holds one decrypted value inside an
+---After decrypting one inline value, the buffer holds that plaintext inside an
 ---otherwise ordinary YAML file. An extmark follows that region through
 ---subsequent edits so `:w` can fold exactly it back into a `!vault` block.
 
@@ -1420,6 +1258,10 @@ end
 ---@param opts? table
 function M.edit(buf, opts)
   local original_buf = normalize_buf(buf)
+  if opts and opts.range and opts.range > 0 then
+    vim.notify("VaultEdit works on a whole vault file; use :VaultDecrypt on an inline value", vim.log.levels.ERROR)
+    return
+  end
   if not is_valid_buf(original_buf) then
     vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
     return
@@ -1598,20 +1440,9 @@ function M.edit(buf, opts)
   end, opts, context)
 end
 
----Rekey the current encrypted file.
----@param opts? { overrides?: table }
-function M.rekey(opts)
-  local target = vim.api.nvim_get_current_buf()
-  if not is_valid_buf(target) then
-    vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
-    return
-  end
-
-  if not M.is_buffer_encrypted(target) then
-    vim.notify("Buffer is not encrypted", vim.log.levels.WARN)
-    return
-  end
-
+---@param target integer
+---@param opts? table
+local function rekey_file(target, opts)
   if vim.bo[target].modified then
     vim.notify("Write or discard changes before VaultRekey", vim.log.levels.ERROR)
     return
@@ -1824,38 +1655,258 @@ local function decrypt_string_selection(target, selection, mode, opts)
   end, opts, context)
 end
 
----View selected encrypted string in floating window.
----@param range_opts? table
+---Rekey a single inline `!vault` value.
+---
+---`ansible-vault rekey` only takes file paths, so the only way to rotate one
+---inline value is decrypt-with-old then encrypt_string-with-new. That means the
+---plaintext does briefly exist in this process — but only as a local in this
+---function. It is never put in a buffer, a buffer variable, a notification or an
+---event payload, so none of the paths that could persist it are involved.
+---
+---Unlike whole-file rekey, `--encrypt-vault-id` IS correct on the encrypt side:
+---`encrypt_string` builds its secret pool from the vault ids actually passed to
+---it, so naming the label there selects the new identity rather than an old one.
+---@param target integer
+---@param selection AnsibleVaultSelection
 ---@param opts? table
-function M.view_string(range_opts, opts)
-  local target = vim.api.nvim_get_current_buf()
-  local selection = get_selection(target, range_opts)
-  decrypt_string_selection(target, selection, "view", opts)
+local function rekey_inline(target, selection, opts)
+  local parsed = parse_vault_selection(selection)
+  if not parsed then
+    return
+  end
+
+  if not parsed.var_name then
+    vim.notify("Cannot rekey a vault block with no YAML key to put it back under", vim.log.levels.ERROR)
+    return
+  end
+
+  local config = effective_config(opts)
+  local new_args, new_err = credentials.rekey_args(config, { header_label = parsed.header and parsed.header.label })
+  if new_err then
+    vim.notify("VaultRekey: " .. new_err, vim.log.levels.ERROR)
+    return
+  end
+  if not new_args then
+    vim.notify("VaultRekey requires new_vault_id, new_password_file, or a --new-vault-* argument", vim.log.levels.ERROR)
+    return
+  end
+
+  -- `credentials.rekey_args` speaks rekey's flag names; encrypt_string wants the
+  -- same identity as a plain --vault-id, plus the label to encrypt with.
+  local new_identity = new_args[1] == "--new-vault-id" and new_args[2] or nil
+  local encrypt_args = {}
+  if new_identity then
+    local label = new_identity:match("^([^@]+)@")
+    vim.list_extend(encrypt_args, { "--vault-id", new_identity })
+    if label then
+      vim.list_extend(encrypt_args, { "--encrypt-vault-id", label })
+    end
+  else
+    vim.list_extend(encrypt_args, { "--vault-password-file", new_args[2] })
+  end
+
+  local planned_tick = changedtick(target)
+  local context = buffer_context(target)
+  if parsed.header and parsed.header.label then
+    context.header_label = parsed.header.label
+  end
+
+  get_credentials(function(creds)
+    if not creds then
+      return
+    end
+
+    if not start_buffer_operation(target, "rekey") then
+      run_cleanup(creds.cleanup)
+      return
+    end
+
+    local function finish()
+      run_cleanup(creds.cleanup)
+      finish_buffer_operation(target, "rekey")
+    end
+
+    cli.run("decrypt", parsed.vault_content, creds.args, function(ok, plaintext)
+      if not ok then
+        finish()
+        vim.notify("Rekey failed to decrypt the value: " .. plaintext, vim.log.levels.ERROR)
+        return
+      end
+
+      -- Strip the trailing newline ansible-vault adds, so re-encrypting does not
+      -- grow the value by a blank line on every rekey.
+      local content = plaintext:gsub("\n$", "")
+
+      local args = vim.deepcopy(encrypt_args)
+      vim.list_extend(args, { "--stdin-name", parsed.var_name })
+
+      cli.run("encrypt_string", content, args, function(enc_ok, enc_output)
+        finish()
+
+        if not enc_ok then
+          -- Nothing was written, so the block is still there under its old key.
+          vim.notify("Rekey failed to re-encrypt the value: " .. enc_output, vim.log.levels.ERROR)
+          return
+        end
+
+        if not is_valid_buf(target) or changedtick(target) ~= planned_tick then
+          vim.notify("Buffer changed during rekey; the value was left alone", vim.log.levels.ERROR)
+          return
+        end
+
+        local replacement = format_encrypt_string_output(enc_output, {
+          mode = "full_line",
+          name = parsed.var_name,
+          indent = (parsed.indent or "") .. (parsed.dash and parsed.dash:gsub(".", " ") or ""),
+        })
+
+        local replaced, err = replace_selection_text(target, selection, replacement)
+        if not replaced then
+          vim.notify("Failed to update the value: " .. tostring(err), vim.log.levels.ERROR)
+          return
+        end
+
+        notify("Inline value rekeyed successfully", vim.log.levels.INFO)
+        emit_event("rekey", "inline", { buf = target, name = parsed.var_name })
+      end, opts, creds)
+    end, opts, creds)
+  end, opts, context)
 end
 
----Decrypt selected encrypted string in place.
----@param range_opts? table
+--- Scope-aware verbs -------------------------------------------------------
+---
+---One command per verb, acting on whatever the buffer, the range and the cursor
+---say it should act on. The alternative — a separate command per verb for the
+---selection and for the cursor — meant three commands for one idea, and made the
+---no-range forms read the `'<`/`'>` marks, which silently pointed at an old
+---selection somewhere else in the buffer.
+
+---@param buf? integer
 ---@param opts? table
-function M.decrypt_string(range_opts, opts)
-  local target = vim.api.nvim_get_current_buf()
-  local selection = get_selection(target, range_opts)
-  decrypt_string_selection(target, selection, "replace", opts)
+---@param want "ciphertext"|"plain"
+---@return integer|nil target, table|nil scope
+local function target_and_scope(buf, opts, want)
+  local target = normalize_buf(buf)
+  if not is_valid_buf(target) then
+    vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
+    return nil, nil
+  end
+
+  local scope, err = resolve_scope(target, opts, want)
+  if not scope then
+    vim.notify(err, vim.log.levels.ERROR)
+    return nil, nil
+  end
+
+  return target, scope
 end
 
----View encrypted string under cursor in a floating window.
+---Encrypt the whole buffer, or one inline YAML value.
+---@param buf? integer
 ---@param opts? table
-function M.view_string_under_cursor(opts)
-  local target = vim.api.nvim_get_current_buf()
-  local selection = find_vault_block_under_cursor(target)
-  decrypt_string_selection(target, selection, "view", opts)
+function M.encrypt(buf, opts)
+  local target, scope = target_and_scope(buf, opts, "plain")
+  if not target then
+    return
+  end
+
+  if scope.state == "ciphertext" then
+    vim.notify(
+      scope.scope == "file" and "Buffer is already encrypted" or "That value is already encrypted",
+      vim.log.levels.WARN
+    )
+    return
+  end
+
+  if scope.scope == "file" then
+    encrypt_file(target, opts)
+    return
+  end
+
+  if scope.state == "plaintext" then
+    -- The inverse of decrypting in place: fold the tracked regions back into
+    -- `!vault` blocks without touching the file. `:w` remains the user's call.
+    restore_inline_regions(target, opts, function(ok)
+      if not ok then
+        return
+      end
+      leave_plaintext_mode(target)
+      notify("Vault values restored", vim.log.levels.INFO)
+      emit_event("encrypt", "inline", { buf = target })
+    end)
+    return
+  end
+
+  encrypt_string_selection(target, scope.selection, opts)
 end
 
----Decrypt encrypted string under cursor in place.
+---Decrypt the whole buffer, or one inline YAML value, in place.
+---@param buf? integer
 ---@param opts? table
-function M.decrypt_string_under_cursor(opts)
-  local target = vim.api.nvim_get_current_buf()
-  local selection = find_vault_block_under_cursor(target)
-  decrypt_string_selection(target, selection, "replace", opts)
+function M.decrypt(buf, opts)
+  local target, scope = target_and_scope(buf, opts, "ciphertext")
+  if not target then
+    return
+  end
+
+  if scope.state ~= "ciphertext" then
+    vim.notify(
+      scope.state == "plaintext" and "Already decrypted" or "Nothing encrypted here to decrypt",
+      vim.log.levels.WARN
+    )
+    return
+  end
+
+  if scope.scope == "file" then
+    decrypt_file(target, opts)
+  else
+    decrypt_string_selection(target, scope.selection, "replace", opts)
+  end
+end
+
+---Show the decrypted content of the buffer, or of one inline value, read-only.
+---@param buf? integer
+---@param opts? table
+function M.view(buf, opts)
+  local target, scope = target_and_scope(buf, opts, "ciphertext")
+  if not target then
+    return
+  end
+
+  if scope.state ~= "ciphertext" then
+    vim.notify("Nothing encrypted here to view", vim.log.levels.WARN)
+    return
+  end
+
+  if scope.scope == "file" then
+    view_file(target, opts)
+  else
+    decrypt_string_selection(target, scope.selection, "view", opts)
+  end
+end
+
+---Rekey the vault file, or one inline `!vault` value.
+---@param opts? table
+function M.rekey(opts)
+  local target, scope = target_and_scope(nil, opts, "ciphertext")
+  if not target then
+    return
+  end
+
+  if scope.state ~= "ciphertext" then
+    vim.notify(
+      scope.state == "plaintext" and "Write or discard the decrypted content before rekeying"
+        or "Nothing encrypted here to rekey",
+      vim.log.levels.ERROR
+    )
+    return
+  end
+
+  if scope.scope == "file" then
+    rekey_file(target, opts)
+  else
+    rekey_inline(target, scope.selection, opts)
+  end
 end
 
 ---Create a new Ansible Vault file.
@@ -1944,31 +1995,34 @@ local COMPLETERS = {
 local COMMANDS = {
   {
     name = "VaultEncrypt",
-    desc = "Encrypt current buffer with ansible-vault",
-    complete = "operation",
+    desc = "Encrypt the buffer, or the inline !vault value in [range] or under the cursor",
+    complete = "labels",
+    range = true,
     run = function(_, parsed)
       M.encrypt(nil, parsed)
     end,
   },
   {
     name = "VaultDecrypt",
-    desc = "Decrypt current buffer with ansible-vault",
+    desc = "Decrypt the buffer, or one inline !vault value, in place",
     complete = "operation",
+    range = true,
     run = function(_, parsed)
       M.decrypt(nil, parsed)
     end,
   },
   {
     name = "VaultView",
-    desc = "View encrypted buffer in floating window",
+    desc = "Show decrypted content read-only, for the buffer or one inline value",
     complete = "operation",
+    range = true,
     run = function(_, parsed)
       M.view(nil, parsed)
     end,
   },
   {
     name = "VaultEdit",
-    desc = "Edit encrypted buffer in a secure scratch buffer",
+    desc = "Edit an encrypted file in a secure scratch buffer",
     complete = "operation",
     run = function(_, parsed)
       M.edit(nil, parsed)
@@ -1987,61 +2041,11 @@ local COMMANDS = {
   },
   {
     name = "VaultRekey",
-    desc = "Rekey encrypted file with ansible-vault",
+    desc = "Rekey the vault file, or one inline !vault value",
     complete = "rekey",
+    range = true,
     run = function(_, parsed)
       M.rekey(parsed)
-    end,
-  },
-  {
-    name = "VaultEncryptString",
-    desc = "Encrypt selected string",
-    complete = "labels",
-    range = true,
-    run = function(cmd_opts, parsed)
-      M.encrypt_string(cmd_opts, parsed)
-    end,
-  },
-  {
-    name = "VaultDecryptString",
-    desc = "Decrypt selected string",
-    complete = "operation",
-    range = true,
-    run = function(cmd_opts, parsed)
-      M.decrypt_string(cmd_opts, parsed)
-    end,
-  },
-  {
-    name = "VaultViewString",
-    desc = "View selected encrypted string",
-    complete = "operation",
-    range = true,
-    run = function(cmd_opts, parsed)
-      M.view_string(cmd_opts, parsed)
-    end,
-  },
-  {
-    name = "VaultEncryptStringUnderCursor",
-    desc = "Encrypt YAML value under cursor",
-    complete = "labels",
-    run = function(_, parsed)
-      M.encrypt_string_under_cursor(parsed)
-    end,
-  },
-  {
-    name = "VaultViewStringUnderCursor",
-    desc = "View vault string under cursor",
-    complete = "operation",
-    run = function(_, parsed)
-      M.view_string_under_cursor(parsed)
-    end,
-  },
-  {
-    name = "VaultDecryptStringUnderCursor",
-    desc = "Decrypt vault string under cursor",
-    complete = "operation",
-    run = function(_, parsed)
-      M.decrypt_string_under_cursor(parsed)
     end,
   },
 }
@@ -2073,6 +2077,11 @@ function M.register_commands()
         vim.notify(string.format(":%s: %s", command.name, err), vim.log.levels.ERROR)
         return
       end
+      -- Scope resolution reads these, so they travel with the overrides rather
+      -- than being recovered from editor state later.
+      parsed.range = cmd_opts.range
+      parsed.line1 = cmd_opts.line1
+      parsed.line2 = cmd_opts.line2
       command.run(cmd_opts, parsed)
     end, {
       nargs = command.nargs or "*",
