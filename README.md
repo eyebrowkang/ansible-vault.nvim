@@ -600,6 +600,68 @@ These are global Neovim settings the plugin deliberately does not change.
   can reach the OS swap partition or a core dump. Review your other plugins,
   clipboard settings and terminal or session recording if that matters to you.
 
+## Migrating from v0.1.0
+
+v0.2.0 is a deliberate break: it removes peripheral integrations and collapses
+overlapping surface, rather than carrying aliases forward. Nothing is deprecated —
+removed names are gone.
+
+### Commands
+
+| v0.1.0 | v0.2.0 |
+|--------|--------|
+| `:VaultEncryptString` | `:'<,'>VaultEncrypt` |
+| `:VaultEncryptStringUnderCursor` | `:.VaultEncrypt` |
+| `:VaultViewString`, `:VaultViewStringUnderCursor` | `:VaultView` (cursor in the block) |
+| `:VaultDecryptString`, `:VaultDecryptStringUnderCursor` | `:VaultDecrypt` (cursor in the block) |
+| `:VaultToggle` | `:VaultEncrypt` or `:VaultDecrypt` |
+| `:VaultClearPasswordCache` | removed — passwords are never cached |
+| `:VaultInfo` | `:checkhealth ansible-vault` |
+| `:VaultDiff` | removed — use a diff tool on decrypted copies |
+| `:VaultFiles` | removed — use your fuzzy finder |
+
+### Configuration
+
+| v0.1.0 | v0.2.0 |
+|--------|--------|
+| `password_file = "p"` | `password_files = "p"` (also takes a list) |
+| `vault_id = "prod@p"` | `vault_ids = "prod@p"` (also takes a list) |
+| `rekey_password_file` | `new_password_file` |
+| `rekey_vault_id` | `new_vault_id` |
+| `conda_env = "env"` | `ansible_vault_path = "<env>/bin/ansible-vault"` |
+| `password_cache_ttl` | removed — every operation prompts |
+| `timeout_ms` | removed — fixed internally |
+| `notify_success` | removed |
+| `auto_detect`, `auto_edit` | removed — run a command explicitly |
+| `picker` | removed with `:VaultFiles` |
+| `debug` | removed |
+| `vim.g.ansible_vault_config` | call `setup()` |
+
+An unknown key is now an error rather than being ignored, so a leftover option
+tells you instead of looking like it still works.
+
+### Arguments
+
+`--vault-pass-file` and `--password-file` are gone; use `--vault-password-file`,
+which can now be repeated. The bare label shortcut (`:VaultEncryptString prod`) is
+gone; write `--encrypt-vault-id prod`. `--ask-vault-password` is new. An
+unrecognised argument is an error.
+
+### API and events
+
+`toggle`, `diff`, `files`, `info`, `get_info`, `status`, `clear_password_cache`
+and every `*_string*` / `*_under_cursor` function are removed; the six verbs take
+`range`/`line1`/`line2` in `opts` instead. The eleven `AnsibleVault*` events
+collapse to `AnsibleVaultOperation`, with `op` and `scope` in `event.data`. For a
+statusline, use `is_buffer_encrypted()` in place of `status()`.
+
+### Behaviour worth knowing
+
+- Charwise and blockwise inline encryption are gone; a range is whole lines.
+- `:VaultRekey` no longer passes `--encrypt-vault-id`. If you relied on the old
+  behaviour, check your labelled files actually rotated — the old code could
+  re-encrypt with the *old* password and report success.
+
 ## Development
 
 ```sh
