@@ -1046,6 +1046,22 @@ restore_inline_regions = function(buf, opts, callback)
       local lines = vim.api.nvim_buf_get_lines(buf, entry.start_row, entry.end_row + 1, false)
       local name, content = inline_region_value(lines, region)
 
+      -- The extmark is left-gravity, so deleting the decrypted lines collapses it
+      -- onto whatever follows. Without this check the next value down would be
+      -- read as the region's content and replaced with a !vault block — encrypting
+      -- something the user never decrypted. Skip instead, and say so.
+      if #lines == 0 or (region.name and name ~= region.name) then
+        vim.notify(
+          string.format(
+            "The decrypted value for '%s' is no longer there; it was not re-encrypted",
+            region.name or "an inline value"
+          ),
+          vim.log.levels.WARN
+        )
+        step()
+        return
+      end
+
       local args = with_encrypt_vault_id(
         creds.args,
         opts,
@@ -1212,16 +1228,25 @@ write_plaintext_buffer = function(buf, target_path, opts)
   await()
 end
 
+---Credentials held for the lifetime of a `:VaultEdit` scratch buffer.
+---
+---Module-local rather than in `vim.b`. An interactive password reaches the child
+---through `creds.env`, so putting `creds` in a buffer variable made it readable
+---with `:echo b:vault_creds` for as long as the buffer was open. It also meant
+---round-tripping `creds.cleanup`, a closure, through Neovim's variable store.
+---@type table<integer, { creds: table, context: table }>
+local edit_sessions = {}
+
 ---@param edit_buf integer
 local function cleanup_edit_buffer(edit_buf)
-  if not is_valid_buf(edit_buf) then
+  local session = edit_sessions[edit_buf]
+  if not session then
     return
   end
+  edit_sessions[edit_buf] = nil
 
-  local cleanup = vim.b[edit_buf].vault_cleanup
-  if cleanup then
-    cleanup()
-    vim.b[edit_buf].vault_cleanup = nil
+  if session.creds and session.creds.cleanup then
+    session.creds.cleanup()
   end
 end
 
@@ -1343,9 +1368,7 @@ function M.edit(buf, opts)
       vim.b[edit_buf].vault_original_buf = original_buf
       vim.b[edit_buf].vault_original_file = original_file
       vim.b[edit_buf].vault_original_signature = original_signature
-      vim.b[edit_buf].vault_creds = creds
-      vim.b[edit_buf].vault_context = context
-      vim.b[edit_buf].vault_cleanup = creds.cleanup
+      edit_sessions[edit_buf] = { creds = creds, context = context }
       vim.b[edit_buf].vault_write_pending = false
 
       local placed = false
@@ -1381,8 +1404,14 @@ function M.edit(buf, opts)
           local orig_file = vim.b[cur_buf].vault_original_file
           local orig_buf = vim.b[cur_buf].vault_original_buf
           local orig_signature = vim.b[cur_buf].vault_original_signature
-          local edit_creds = vim.b[cur_buf].vault_creds
-          local encrypt_args = with_encrypt_vault_id(edit_creds.args, opts, edit_creds, vim.b[cur_buf].vault_context)
+          local session = edit_sessions[cur_buf]
+          if not session then
+            vim.b[cur_buf].vault_write_pending = false
+            vim.notify("No vault session for this buffer; reopen it with :VaultEdit", vim.log.levels.ERROR)
+            return
+          end
+          local edit_creds = session.creds
+          local encrypt_args = with_encrypt_vault_id(edit_creds.args, opts, edit_creds, session.context)
 
           -- 'modified' stays set until the write actually lands. Clearing it up
           -- front would let `:q` wipe the buffer, and its plaintext, while the
