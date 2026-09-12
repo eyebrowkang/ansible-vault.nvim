@@ -343,10 +343,14 @@ vim.cmd("edit " .. vim.fn.fnameescape(rekey_file))
 -- here: the only honest signal that the rekey landed is the ciphertext changing.
 local before_rekey = read_file(rekey_file)
 vault.rekey()
+
+-- `ansible-vault rekey` truncates and rewrites in place, so "the content changed"
+-- is observable mid-write. Wait for a complete new envelope, not just a different
+-- one, or this reads a half-written file.
 wait_until(function()
-  return read_file(rekey_file) ~= before_rekey
-end, "real VaultRekey did not rewrite the file")
-assert_true(read_file(rekey_file):match("^%$ANSIBLE_VAULT"), "real VaultRekey left the file unencrypted")
+  local now = read_file(rekey_file)
+  return now ~= before_rekey and now:match("^%$ANSIBLE_VAULT") ~= nil
+end, "real VaultRekey did not rewrite the file as a complete vault envelope")
 
 assert_true(
   read_file(rekey_file):match("^%$ANSIBLE_VAULT;1%.2;AES256;prod"),
