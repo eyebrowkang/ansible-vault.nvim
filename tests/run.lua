@@ -1047,9 +1047,15 @@ tests["B8 re-setup clears previous config"] = function()
   reset_config(fake, { encrypt_vault_id = "prod" })
   assert_eq(vault.config.encrypt_vault_id, "prod")
 
+  local table_before = vault.config
+
   vault.setup({})
   assert_eq(vault.config.encrypt_vault_id, nil, "encrypt_vault_id should reset to nil on re-setup")
   assert_eq(vault.config.ansible_vault_path, nil, "the executable set by the previous setup should be cleared")
+
+  -- Filled in place, not replaced: :checkhealth and anything else holding
+  -- `vault.config` would otherwise keep reading a detached table after setup().
+  assert_true(table_before == vault.config, "setup() must not swap the config table out from under its holders")
 end
 
 tests["B9 command args support quoted paths with spaces"] = function()

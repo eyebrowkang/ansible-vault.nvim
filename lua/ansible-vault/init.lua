@@ -1,20 +1,7 @@
----Plugin configuration.
----
----One key per `ansible-vault` flag, named after it, so there is nothing to learn
----twice: whatever the Ansible documentation tells you to pass, the key is here
----under the same name. `vault_ids` and `password_files` accept a single string or
----a list, because the flags they stand for are repeatable.
----@class AnsibleVaultConfig
----@field vault_ids? string|string[] `--vault-id`, for example "prod@~/.vault_pass"
----@field password_files? string|string[] `--vault-password-file`
----@field ask_password? boolean Always prompt, ignoring any configured or discovered credential
----@field encrypt_vault_id? string `--encrypt-vault-id`: which identity to encrypt with
----@field new_vault_id? string `--new-vault-id` for VaultRekey
----@field new_password_file? string `--new-vault-password-file` for VaultRekey
----@field ansible_vault_path? string Path to the ansible-vault executable
-
 local ansible_cfg = require("ansible-vault.ansible_cfg")
+local config_mod = require("ansible-vault.config")
 local credentials = require("ansible-vault.credentials")
+local fs = require("ansible-vault.fs")
 local secure = require("ansible-vault.secure")
 local yaml = require("ansible-vault.yaml")
 
@@ -29,7 +16,6 @@ M.MIN_NVIM_VERSION = "0.12"
 
 local uv = vim.uv
 local AUGROUP = "AnsibleVault"
-local DEFAULT_FILE_MODE = 384 -- 0600
 local NAMESPACE = vim.api.nvim_create_namespace("ansible-vault")
 local parse_vault_from_yaml
 local has_rekey_target
@@ -38,29 +24,10 @@ local restore_inline_regions
 local leave_plaintext_mode
 local remember_header
 
+---The live configuration table. Callers hold this reference, so `setup()` fills
+---it in place rather than replacing it.
 ---@type AnsibleVaultConfig
-local DEFAULT_CONFIG = {
-  vault_ids = nil,
-  password_files = nil,
-  ask_password = false,
-  encrypt_vault_id = nil,
-  new_vault_id = nil,
-  new_password_file = nil,
-  ansible_vault_path = nil,
-}
-
-local CONFIG_TYPES = {
-  vault_ids = { "string", "table" },
-  password_files = { "string", "table" },
-  ask_password = { "boolean" },
-  encrypt_vault_id = { "string" },
-  new_vault_id = { "string" },
-  new_password_file = { "string" },
-  ansible_vault_path = { "string" },
-}
-
----@type AnsibleVaultConfig
-M.config = vim.deepcopy(DEFAULT_CONFIG)
+M.config = config_mod.values
 
 ---Render an argv with credential values replaced.
 ---
@@ -87,36 +54,9 @@ local function redact_argv(argv)
   return table.concat(parts, " ")
 end
 
----@param value any
----@return boolean
-local function is_nonempty_string(value)
-  return type(value) == "string" and value ~= ""
-end
-
----Merge per-command overrides over the configured defaults.
----
----The list-valued keys are replaced wholesale rather than merged:
----`tbl_deep_extend` merges list-like tables element by element, so a single
----`--vault-id x` against a configured list of two would leave the second
----configured entry in place and silently pass a credential the user did not name.
----@param opts? table
----@return table
-local function effective_config(opts)
-  local overrides = opts and (opts.overrides or opts) or {}
-  local config = vim.tbl_deep_extend("force", M.config, overrides)
-  for _, key in ipairs({ "vault_ids", "password_files" }) do
-    if overrides[key] ~= nil then
-      config[key] = overrides[key]
-    end
-  end
-  return config
-end
-
----@param message string
----@param level integer
-local function notify(message, level)
-  vim.notify(message, level)
-end
+local is_nonempty_string = config_mod.is_nonempty_string
+local effective_config = config_mod.effective
+local notify = config_mod.notify
 
 ---Announce a completed operation on the one `User` pattern the plugin emits.
 ---
@@ -1364,56 +1304,6 @@ function M.encrypt_string_under_cursor(opts)
   encrypt_string_selection(target, selection, opts)
 end
 
----@param path string
----@param data string
----@return boolean
----@return string|nil
-local function atomic_write_file(path, data)
-  local dir = vim.fn.fnamemodify(path, ":h")
-  local tail = vim.fn.fnamemodify(path, ":t")
-  local bytes = uv.random(4)
-  local nonce = bytes:byte(1) * 16777216 + bytes:byte(2) * 65536 + bytes:byte(3) * 256 + bytes:byte(4)
-  local tmp = string.format("%s/.%s.ansible-vault.nvim.%d.%d", dir, tail, uv.getpid(), nonce)
-
-  local mode = DEFAULT_FILE_MODE
-  local stat = uv.fs_stat(path)
-  if stat and stat.mode then
-    mode = stat.mode % 512
-  end
-
-  local fd, open_err = uv.fs_open(tmp, "wx", mode)
-  if not fd then
-    return false, open_err or "failed to create temporary output file"
-  end
-
-  local written, write_err = uv.fs_write(fd, data)
-  if type(written) == "number" and written >= #data then
-    -- Durability matters here: the rename replaces the only copy of the
-    -- ciphertext, so the new contents have to be on disk before it happens.
-    uv.fs_fsync(fd)
-  end
-  uv.fs_close(fd)
-
-  if type(written) ~= "number" or written < #data then
-    os.remove(tmp)
-    return false, write_err or "failed to write encrypted output"
-  end
-
-  local ok, rename_err = uv.fs_rename(tmp, path)
-  if not ok then
-    os.remove(tmp)
-    return false, rename_err or "failed to replace original file"
-  end
-
-  local dir_fd = uv.fs_open(dir, "r", DEFAULT_FILE_MODE)
-  if dir_fd then
-    pcall(uv.fs_fsync, dir_fd)
-    uv.fs_close(dir_fd)
-  end
-
-  return true, nil
-end
-
 --- Inline region tracking -------------------------------------------------
 ---
 ---After `:VaultDecryptString` the buffer holds one decrypted value inside an
@@ -1636,7 +1526,7 @@ write_plaintext_buffer = function(buf, target_path, opts)
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       local body = table.concat(lines, eol) .. (vim.bo[buf].endofline and eol or "")
 
-      local write_ok, write_err = atomic_write_file(path, body)
+      local write_ok, write_err = fs.atomic_write(path, body)
       if not write_ok then
         vim.notify("Failed to write file: " .. tostring(write_err), vim.log.levels.ERROR)
         finish(false)
@@ -1672,7 +1562,7 @@ write_plaintext_buffer = function(buf, target_path, opts)
         return
       end
 
-      local write_ok, write_err = atomic_write_file(path, output)
+      local write_ok, write_err = fs.atomic_write(path, output)
       if not write_ok then
         vim.notify("Failed to write encrypted file: " .. tostring(write_err), vim.log.levels.ERROR)
         finish(false)
@@ -1686,38 +1576,6 @@ write_plaintext_buffer = function(buf, target_path, opts)
   end, opts, context)
 
   await()
-end
-
----@param path string
----@return table|nil
-local function file_signature(path)
-  local stat = uv.fs_stat(path)
-  if not stat then
-    return nil
-  end
-
-  return {
-    size = stat.size,
-    mtime_sec = stat.mtime and stat.mtime.sec or 0,
-    mtime_nsec = stat.mtime and stat.mtime.nsec or 0,
-    ctime_sec = stat.ctime and stat.ctime.sec or 0,
-    ctime_nsec = stat.ctime and stat.ctime.nsec or 0,
-  }
-end
-
----@param left table|nil
----@param right table|nil
----@return boolean
-local function same_file_signature(left, right)
-  if not left or not right then
-    return left == right
-  end
-
-  return left.size == right.size
-    and left.mtime_sec == right.mtime_sec
-    and left.mtime_nsec == right.mtime_nsec
-    and left.ctime_sec == right.ctime_sec
-    and left.ctime_nsec == right.ctime_nsec
 end
 
 ---@param edit_buf integer
@@ -1790,7 +1648,7 @@ function M.edit(buf, opts)
   local original_win = vim.api.nvim_get_current_win()
   local filetype = vim.bo[original_buf].filetype
   local original_tick = changedtick(original_buf)
-  local original_signature = file_signature(original_file)
+  local original_signature = fs.signature(original_file)
 
   local context = buffer_context(original_buf)
 
@@ -1900,7 +1758,7 @@ function M.edit(buf, opts)
               return
             end
 
-            if not same_file_signature(orig_signature, file_signature(orig_file)) then
+            if not fs.same_signature(orig_signature, fs.signature(orig_file)) then
               if is_valid_buf(cur_buf) then
                 vim.b[cur_buf].vault_write_pending = false
               end
@@ -1908,7 +1766,7 @@ function M.edit(buf, opts)
               return
             end
 
-            local write_ok, write_err = atomic_write_file(orig_file, enc_output)
+            local write_ok, write_err = fs.atomic_write(orig_file, enc_output)
             if not write_ok then
               if is_valid_buf(cur_buf) then
                 vim.b[cur_buf].vault_write_pending = false
@@ -2422,49 +2280,18 @@ function M.register_commands()
   end
 end
 
----Check a user-supplied config, reporting everything wrong with it at once.
----
----An unknown key is an error, not something to ignore: a typo or a key left over
----from an older version otherwise looks like it took effect.
----@param opts table
----@return string[] errors
-local function validate_config(opts)
-  local errors = {}
-
-  for key, value in pairs(opts) do
-    local expected = CONFIG_TYPES[key]
-    if not expected then
-      table.insert(errors, string.format("unknown option: %s", key))
-    elseif not vim.tbl_contains(expected, type(value)) then
-      table.insert(errors, string.format("%s must be %s, got %s", key, table.concat(expected, " or "), type(value)))
-    end
-  end
-
-  -- `ansible-vault` puts --ask-vault-password and --vault-password-file in a
-  -- mutually exclusive group, so configuring both cannot mean anything.
-  if opts.ask_password == true and (opts.password_files ~= nil or opts.vault_ids ~= nil) then
-    table.insert(errors, "ask_password cannot be combined with password_files or vault_ids")
-  end
-
-  if opts.new_vault_id ~= nil and opts.new_password_file ~= nil then
-    table.insert(errors, "new_vault_id and new_password_file are mutually exclusive")
-  end
-
-  return errors
-end
-
 ---Setup the plugin.
 ---@param opts? AnsibleVaultConfig
 function M.setup(opts)
   opts = opts or {}
 
-  local errors = validate_config(opts)
+  local errors = config_mod.validate(opts)
   if #errors > 0 then
     vim.notify("ansible-vault.nvim setup: " .. table.concat(errors, "; "), vim.log.levels.ERROR)
     return
   end
 
-  M.config = vim.tbl_deep_extend("force", vim.deepcopy(DEFAULT_CONFIG), opts)
+  config_mod.apply(opts)
   M._configured = true
 
   ansible_cfg.clear_cache()
