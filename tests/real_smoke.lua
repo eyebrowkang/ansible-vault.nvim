@@ -361,4 +361,8 @@ assert_true(with_new:find("token: original", 1, true) ~= nil, "the rekeyed file 
 vim.fn.system({ ansible_vault, "view", "--vault-password-file", rekey_old, rekey_file })
 assert_true(vim.v.shell_error ~= 0, "the OLD password must no longer open the file after a rekey")
 
+-- Flush explicitly: Neovim writes its own messages to the same stream, and on
+-- exit this final line was sometimes lost, making a passing run look like a
+-- failed one to anything grepping for the marker.
 io.stdout:write("REAL_SMOKE_OK\n")
+io.stdout:flush()
