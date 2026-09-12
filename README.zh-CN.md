@@ -35,10 +35,8 @@ English documentation: [README.md](README.md)
 
 **集成**
 
-- `:VaultInfo` 查看当前 buffer 和插件配置诊断信息
 - `:checkhealth ansible-vault` 诊断
-- 通过 `User` autocmd events 集成 statusline 或其他插件
-- statusline 辅助函数会显示 vault ID 标签
+- 通过一个 `User` autocmd event 集成 statusline 或其他插件
 - 支持通过 `conda run` 调用 Conda 环境中的 `ansible-vault`
 
 ## 依赖
@@ -164,7 +162,7 @@ ansible 只在**进程 cwd** 里找 `ansible.cfg`，不会向上递归。而在�
 `vault_identity_list`、`vault_identity`、`vault_encrypt_identity`、
 `vault_id_match`、`ask_vault_pass`。
 
-执行 `:VaultInfo` 可以看到命中了哪个配置文件、以及当前实际生效的凭据来源。
+执行 `:checkhealth ansible-vault` 可以看到命中了哪个配置文件、以及当前实际生效的凭据来源。
 
 #### vault ID 标签会被保留
 
@@ -191,9 +189,7 @@ header。
 | `:VaultView` | 在只读浮窗中查看解密内容 |
 | `:VaultEdit` | 在 scratch buffer 中编辑解密内容，`:write` 时重新加密保存 |
 | `:VaultClearPasswordCache` | 清理内存中的交互式密码缓存 |
-| `:VaultInfo [args]` | 查看当前 buffer 和插件配置诊断信息 |
 | `:VaultRekey [args]` | 对当前加密文件执行 rekey |
-| `:VaultToggle` | 在加密/解密状态之间切换 |
 | `:VaultEncryptString` | 加密视觉选择的文本 |
 | `:VaultDecryptString` | 原地解密选中的 inline vault 字符串，`:w` 会还原 |
 | `:VaultViewString` | 查看视觉选择中的 inline vault 字符串 |
@@ -288,23 +284,6 @@ require("ansible-vault").setup({
 ```
 
 保存后插件会重新载入原始加密 buffer，并避免因为重新载入而再次触发自动编辑。
-
-### 切换当前 buffer 状态
-
-执行 `:VaultToggle` 可以在普通内容和 vault 密文之间切换。用它解密同样会进入
-`:VaultDecrypt` 的明文编辑态，所以 `:w` 依然会先重新加密。
-
-### 查看状态信息
-
-执行：
-
-```vim
-:VaultInfo
-```
-
-信息窗口会显示当前 buffer 是否加密、凭据来源、已配置的 vault label、
-auto-edit 设置、命令超时、密码缓存状态，以及最近一次成功的 vault
-操作。
 
 ### 调整通知和超时
 
@@ -432,7 +411,6 @@ vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decry
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
 vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
-vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>", { desc = "Vault Toggle" })
 vim.keymap.set("v", "<leader>vs", ":VaultEncryptString<cr>", { silent = true, desc = "Vault Encrypt String" })
 vim.keymap.set("v", "<leader>vS", ":VaultDecryptString<cr>", { silent = true, desc = "Vault Decrypt String" })
 vim.keymap.set("v", "<leader>vv", ":VaultViewString<cr>", { silent = true, desc = "Vault View String" })
@@ -442,11 +420,18 @@ vim.keymap.set("n", "<leader>vS", "<cmd>VaultDecryptStringUnderCursor<cr>", { de
 
 ## Statusline 集成
 
+使用 `is_buffer_encrypted()`：它每次都会检查 buffer 内容，而不依赖之前某次操作
+留下的状态。
+
 ```lua
 require("lualine").setup({
   sections = {
     lualine_x = {
-      { require("ansible-vault").status },
+      {
+        function()
+          return require("ansible-vault").is_buffer_encrypted() and "[VAULT]" or ""
+        end,
+      },
     },
   },
 })
@@ -474,38 +459,33 @@ vault.decrypt()
 vault.view()
 vault.edit()
 vault.rekey()
-vault.info()
-local info_lines = vault.get_info()
 vault.clear_password_cache()
-vault.toggle()
 vault.encrypt_string()
 vault.decrypt_string()
 vault.view_string()
 vault.encrypt_string_under_cursor()
 vault.view_string_under_cursor()
 vault.decrypt_string_under_cursor()
-vault.status()  -- ""、"[VAULT]"、"[VAULT:prod]" 或 "[VAULT:decrypted]"
 vault.cleanup() -- 丢弃进程内仍持有的全部密钥（VimLeavePre 时自动执行）
 ```
 
 ## User Events
 
-插件会在成功操作后触发 `User` autocmd。你可以监听具体事件，例如
-`AnsibleVaultEncrypt`，也可以监听所有操作的 `AnsibleVaultOperation`：
+插件会在成功操作后触发 `User` autocmd，pattern 只有一个 `AnsibleVaultOperation`：
 
 ```lua
 vim.api.nvim_create_autocmd("User", {
   pattern = "AnsibleVaultOperation",
   callback = function(event)
-    vim.print(event.data.operation)
+    vim.print(event.data.op, event.data.scope)
   end,
 })
 ```
 
-当前事件包括 `AnsibleVaultEncrypt`、`AnsibleVaultDecrypt`、
-`AnsibleVaultView`、`AnsibleVaultCreate`、`AnsibleVaultEditOpen`、
-`AnsibleVaultEditSave`、`AnsibleVaultPlaintextSave`、`AnsibleVaultRekey`、
-`AnsibleVaultStringEncrypt` 和 `AnsibleVaultStringDecrypt`。
+事件 `data` 中带有 `op`（`"encrypt"`、`"decrypt"`、`"view"`、`"edit"`、
+`"save"`、`"rekey"`、`"create"`）、`scope`（`"file"` 或 `"inline"`），以及对应的
+buffer 和文件路径。只有一个 pattern，因此一个 autocmd 就能响应全部操作，再按
+`op`/`scope` 过滤即可。
 
 ## 安全说明
 
@@ -534,7 +514,7 @@ Neovim 的 swap、undo、runtime 目录里搜索明文。
 
 **仍然需要你自己注意的部分**
 
-以下是插件刻意不去修改的全局选项。`:VaultInfo` 和 `:checkhealth ansible-vault` 在它们
+以下是插件刻意不去修改的全局选项。`:checkhealth ansible-vault` 在它们
 开启时会给出警告：
 
 - **`'shada'`** 会持久化寄存器。你从解密后的 buffer 或 `:VaultView` 浮窗里 *yank* 出来的

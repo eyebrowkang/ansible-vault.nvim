@@ -285,7 +285,7 @@ tests["encrypt uses argv and supports paths with spaces"] = function()
 
   assert_true(log_contains(fake.log, "ARG:" .. config.password_file), "password path was not passed as one argv item")
   assert_false(log_contains(fake.log, "ARG:--encrypt-vault-id"), "default encryption must not force --encrypt-vault-id")
-  assert_true(vim.b[buf].ansible_vault_encrypted, "encrypted buffer marker was not set")
+  assert_true(vault.is_buffer_encrypted(buf), "buffer should report itself encrypted")
 end
 
 tests["async encrypt writes back to the original buffer"] = function()
@@ -630,16 +630,16 @@ tests["slow vault operations time out"] = function()
   vim.env.FAKE_VAULT_SLEEP = nil
 end
 
-tests["VaultInfo reports state and operations emit User events"] = function()
+tests["operations announce themselves on AnsibleVaultOperation"] = function()
   local fake = create_fake_vault()
   reset_config(fake)
 
-  local event_data
+  local seen = {}
   vim.api.nvim_create_autocmd("User", {
-    pattern = "AnsibleVaultEncrypt",
+    pattern = "AnsibleVaultOperation",
     once = true,
     callback = function(event)
-      event_data = event.data
+      seen = event.data or {}
     end,
   })
 
@@ -648,14 +648,11 @@ tests["VaultInfo reports state and operations emit User events"] = function()
 
   wait_until(function()
     return vault.is_buffer_encrypted(buf)
-  end, "encrypt did not finish before VaultInfo check")
+  end, "encrypt did not finish")
 
-  assert_true(event_data and event_data.operation == "Encrypt", "encrypt User event was not emitted")
-
-  local info = table.concat(vault.get_info(buf), "\n")
-  assert_true(info:find("Encrypted: yes", 1, true), "VaultInfo did not report encrypted state")
-  assert_true(info:find("Credential source: password_file", 1, true), "VaultInfo did not report credential source")
-  assert_true(info:find("Last operation: Encrypt", 1, true), "VaultInfo did not report last operation")
+  assert_eq(seen.op, "encrypt", "the event should carry the operation")
+  assert_eq(seen.scope, "file", "the event should carry the scope it applied to")
+  assert_eq(seen.buf, buf, "the event should carry the buffer it applied to")
 end
 
 tests["VaultDecryptString replaces selected YAML vault block"] = function()
@@ -1123,7 +1120,7 @@ tests["encrypt restores normal write handling"] = function()
   end, "buffer did not leave plaintext mode")
 
   assert_true(vim.bo[buf].swapfile, "'swapfile' should be restored once the buffer holds ciphertext again")
-  assert_true(vim.b[buf].ansible_vault_encrypted, "buffer should be marked encrypted")
+  assert_true(vault.is_buffer_encrypted(buf), "buffer should report itself encrypted")
 end
 
 tests["decrypting an inline string enters inline mode and write restores the block"] = function()
@@ -1383,28 +1380,6 @@ tests["a 1.2 vault id label survives re-encryption"] = function()
   )
 end
 
-tests["statusline reports the vault id label"] = function()
-  local fake = create_fake_vault()
-  reset_config(fake)
-
-  local dir = temp_dir()
-  local buf = new_file_buffer(dir, "vault.yml", { "$ANSIBLE_VAULT;1.2;AES256;prod", "ENC:x" })
-
-  vault.view(buf) -- any operation records the header
-  wait_until(function()
-    return vim.b[buf].ansible_vault_label == "prod"
-  end, "label was not recorded")
-
-  assert_eq(vault.status(buf), "[VAULT:prod]", "an encrypted buffer should show its vault id label")
-
-  vault.decrypt(buf)
-  wait_until(function()
-    return vim.bo[buf].buftype == "acwrite"
-  end, "buffer did not enter plaintext mode")
-
-  assert_eq(vault.status(buf), "[VAULT:decrypted]", "a decrypted buffer should say so")
-end
-
 --- ansible.cfg and ANSIBLE_* ----------------------------------------------
 
 local function make_project(cfg_lines)
@@ -1434,8 +1409,10 @@ tests["ansible.cfg found upward supplies credentials without extra flags"] = fun
   assert_false(log_contains(fake.log, "ARG:--vault-id"), "no credential flag should be passed")
   assert_true(log_has_line(fake.log, "CWD:" .. root), "ansible-vault must run where the config was found")
 
-  local info = table.concat(vault.get_info(buf), "\n")
-  assert_true(info:find("ansible.cfg", 1, true) ~= nil, "VaultInfo should report the discovered config")
+  local described =
+    require("ansible-vault.credentials").describe(vault.config, { file_path = vim.api.nvim_buf_get_name(buf) })
+  assert_eq(described.cfg_path, root .. "/ansible.cfg", "the discovered config should be reported")
+  assert_eq(described.source, "ansible.cfg", "credentials should be attributed to ansible.cfg")
 end
 
 tests["configured credentials name an identity when ansible.cfg adds one"] = function()
@@ -1468,10 +1445,11 @@ tests["ANSIBLE_VAULT_PASSWORD_FILE is honoured and outranks ansible.cfg"] = func
   vim.env.ANSIBLE_VAULT_PASSWORD_FILE = env_pass
 
   local buf = new_file_buffer(root .. "/group_vars/prod", "vault.yml", { "plain" })
-  local info = table.concat(vault.get_info(buf), "\n")
+  local described =
+    require("ansible-vault.credentials").describe(vault.config, { file_path = vim.api.nvim_buf_get_name(buf) })
   assert_true(
-    info:find("ANSIBLE_* environment", 1, true) ~= nil,
-    "VaultInfo should attribute credentials to the environment"
+    described.source:find("ANSIBLE_* environment", 1, true) ~= nil,
+    "credentials should be attributed to the environment"
   )
 
   vim.env.ANSIBLE_VAULT_PASSWORD_FILE = nil

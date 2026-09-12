@@ -41,10 +41,8 @@ values, built so that decrypted content never reaches the disk.
 
 **Integration**
 
-- `:VaultInfo` buffer and configuration diagnostics
 - `:checkhealth ansible-vault`
-- `User` autocmd events for statuslines and other plugins
-- Statusline helper that shows the vault ID label
+- A `User` autocmd event for statuslines and other plugins
 - Conda environment support via `conda run`
 
 ## Requirements
@@ -193,8 +191,8 @@ These keys are read from `[defaults]`, and the matching environment variables
 override them: `vault_password_file`, `vault_identity_list`, `vault_identity`,
 `vault_encrypt_identity`, `vault_id_match` and `ask_vault_pass`.
 
-Run `:VaultInfo` to see which config was found and which credential source is
-actually in effect.
+Run `:checkhealth ansible-vault` to see which config was found and which
+credential source is actually in effect.
 
 Use `password_file` for a single vault password:
 
@@ -308,9 +306,7 @@ The cache is disabled by default. Clear it manually with
 | `:VaultView` | View decrypted content in floating window |
 | `:VaultEdit` | Edit encrypted file in a scratch buffer, encrypt on save |
 | `:VaultClearPasswordCache` | Clear the in-memory interactive password cache |
-| `:VaultInfo [args]` | Show current buffer and plugin configuration diagnostics |
 | `:VaultRekey [args]` | Rekey the current encrypted file |
-| `:VaultToggle` | Toggle between encrypted/decrypted state |
 | `:VaultEncryptString` | Encrypt selected text (visual mode) |
 | `:VaultDecryptString` | Decrypt selected inline vault string in place; `:w` restores it |
 | `:VaultViewString` | View selected encrypted string (visual mode) |
@@ -415,24 +411,6 @@ require("ansible-vault").setup({
 
 The original encrypted buffer is reloaded after save. The plugin suppresses the
 automatic edit loop for that reload.
-
-### Toggle a Buffer
-
-Run `:VaultToggle` to encrypt a plain buffer or decrypt an encrypted buffer.
-Decrypting this way enters the same plaintext editing mode as `:VaultDecrypt`,
-so `:w` still re-encrypts.
-
-### Inspect State
-
-Run:
-
-```vim
-:VaultInfo
-```
-
-The info window shows the current buffer state, credential source, configured
-vault labels, auto-edit settings, timeout, password-cache state, and the
-last successful vault operation.
 
 ### Tune Notifications and Timeouts
 
@@ -568,7 +546,6 @@ vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decry
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
 vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
-vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>", { desc = "Vault Toggle" })
 vim.keymap.set("v", "<leader>vs", ":VaultEncryptString<cr>", { silent = true, desc = "Vault Encrypt String" })
 vim.keymap.set("v", "<leader>vS", ":VaultDecryptString<cr>", { silent = true, desc = "Vault Decrypt String" })
 vim.keymap.set("v", "<leader>vv", ":VaultViewString<cr>", { silent = true, desc = "Vault View String" })
@@ -578,18 +555,19 @@ vim.keymap.set("n", "<leader>vS", "<cmd>VaultDecryptStringUnderCursor<cr>", { de
 
 ## Statusline Integration
 
-You can show vault status in your statusline:
-
-The status string is `"[VAULT]"` for an encrypted buffer, `"[VAULT:prod]"` when
-the file carries a vault ID label, `"[VAULT:decrypted]"` while it is in plaintext
-editing mode, and `""` otherwise.
+Use `is_buffer_encrypted()`, which inspects the buffer every time rather than
+relying on state left behind by an earlier operation:
 
 ```lua
 -- For lualine
 require("lualine").setup({
   sections = {
     lualine_x = {
-      { require("ansible-vault").status },
+      {
+        function()
+          return require("ansible-vault").is_buffer_encrypted() and "[VAULT]" or ""
+        end,
+      },
     },
   },
 })
@@ -632,15 +610,8 @@ vault.edit()
 -- Rekey current encrypted file
 vault.rekey()
 
--- Show current buffer and plugin state
-vault.info()
-local info_lines = vault.get_info()
-
 -- Clear the optional in-memory password cache
 vault.clear_password_cache()
-
--- Toggle encryption state
-vault.toggle()
 
 -- Encrypt selected text
 vault.encrypt_string()
@@ -656,33 +627,28 @@ vault.encrypt_string_under_cursor()
 vault.view_string_under_cursor()
 vault.decrypt_string_under_cursor()
 
--- Get status string for statusline: "", "[VAULT]", "[VAULT:prod]" or
--- "[VAULT:decrypted]"
-vault.status()
-
 -- Drop every secret this process still holds (also runs on VimLeavePre)
 vault.cleanup()
 ```
 
 ## User Events
 
-The plugin emits `User` autocommands after successful operations. Listen to a
-specific event such as `AnsibleVaultEncrypt`, or to `AnsibleVaultOperation` for
-all operations:
+The plugin emits one `User` autocommand pattern, `AnsibleVaultOperation`, after
+every successful operation:
 
 ```lua
 vim.api.nvim_create_autocmd("User", {
   pattern = "AnsibleVaultOperation",
   callback = function(event)
-    vim.print(event.data.operation)
+    vim.print(event.data.op, event.data.scope)
   end,
 })
 ```
 
-Current events are `AnsibleVaultEncrypt`, `AnsibleVaultDecrypt`,
-`AnsibleVaultView`, `AnsibleVaultCreate`, `AnsibleVaultEditOpen`,
-`AnsibleVaultEditSave`, `AnsibleVaultPlaintextSave`, `AnsibleVaultRekey`,
-`AnsibleVaultStringEncrypt`, and `AnsibleVaultStringDecrypt`.
+The event `data` carries `op` (`"encrypt"`, `"decrypt"`, `"view"`, `"edit"`,
+`"save"`, `"rekey"` or `"create"`), `scope` (`"file"` or `"inline"`) and the
+buffer and file it applied to. One pattern means one autocmd can react to
+everything and filter on `op`/`scope`.
 
 ## Inline YAML Strings
 
@@ -737,8 +703,8 @@ plaintext.
 
 ### What is still up to you
 
-These are global Neovim settings the plugin deliberately does not change. Both
-`:VaultInfo` and `:checkhealth ansible-vault` warn when they are enabled:
+These are global Neovim settings the plugin deliberately does not change.
+`:checkhealth ansible-vault` warns when they are enabled:
 
 - **`'shada'`** persists registers, so text you *yank* out of a decrypted buffer
   or the `:VaultView` window is written to the shada file on exit. Consider
