@@ -20,7 +20,6 @@ English documentation: [README.md](README.md)
 - `:VaultCreate` 新建加密文件
 - 通过选区或光标位置加密、查看、解密 inline `!vault` 值
 - 对加密文件执行 rekey
-- 使用 Telescope 或内置 `vim.ui.select` 查找 vault 文件
 
 **凭据**
 
@@ -111,9 +110,6 @@ require("ansible-vault").setup({
   -- 交互式密码在内存中的缓存秒数。0 表示每次操作都重新询问。
   password_cache_ttl = 0,
 
-  -- :VaultFiles picker 后端："auto"、"telescope" 或 "builtin"
-  picker = "auto",
-
   -- ansible-vault 命令超时时间，单位毫秒。0 表示关闭超时。
   timeout_ms = 30000,
 
@@ -195,7 +191,6 @@ header。
 | `:VaultView` | 在只读浮窗中查看解密内容 |
 | `:VaultEdit` | 在 scratch buffer 中编辑解密内容，`:write` 时重新加密保存 |
 | `:VaultClearPasswordCache` | 清理内存中的交互式密码缓存 |
-| `:VaultFiles [view\|edit\|rekey]` | 选择 vault 文件并查看、编辑或 rekey |
 | `:VaultInfo [args]` | 查看当前 buffer 和插件配置诊断信息 |
 | `:VaultRekey [args]` | 对当前加密文件执行 rekey |
 | `:VaultToggle` | 在加密/解密状态之间切换 |
@@ -299,20 +294,6 @@ require("ansible-vault").setup({
 执行 `:VaultToggle` 可以在普通内容和 vault 密文之间切换。用它解密同样会进入
 `:VaultDecrypt` 的明文编辑态，所以 `:w` 依然会先重新加密。
 
-### 查找 vault 文件
-
-执行：
-
-```vim
-:VaultFiles view
-:VaultFiles edit
-:VaultFiles rekey
-```
-
-插件会扫描当前工作目录下首行为 Ansible Vault header 的文件。安装了
-Telescope 时会自动使用 Telescope，否则回退到 `vim.ui.select`。如果希望始终
-使用内置 picker，可以设置 `picker = "builtin"`。
-
 ### 查看状态信息
 
 执行：
@@ -322,7 +303,7 @@ Telescope 时会自动使用 Telescope，否则回退到 `vim.ui.select`。如�
 ```
 
 信息窗口会显示当前 buffer 是否加密、凭据来源、已配置的 vault label、
-auto-edit/picker 设置、命令超时、密码缓存状态，以及最近一次成功的 vault
+auto-edit 设置、命令超时、密码缓存状态，以及最近一次成功的 vault
 操作。
 
 ### 调整通知和超时
@@ -451,7 +432,6 @@ vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decry
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
 vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
-vim.keymap.set("n", "<leader>vf", "<cmd>VaultFiles view<cr>", { desc = "Vault Files" })
 vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>", { desc = "Vault Toggle" })
 vim.keymap.set("v", "<leader>vs", ":VaultEncryptString<cr>", { silent = true, desc = "Vault Encrypt String" })
 vim.keymap.set("v", "<leader>vS", ":VaultDecryptString<cr>", { silent = true, desc = "Vault Decrypt String" })
@@ -494,7 +474,6 @@ vault.decrypt()
 vault.view()
 vault.edit()
 vault.rekey()
-vault.files({ positionals = { "view" } })
 vault.info()
 local info_lines = vault.get_info()
 vault.clear_password_cache()

@@ -8,7 +8,6 @@
 ---@field auto_detect? boolean Auto detect vault encrypted files (default: true)
 ---@field auto_edit? boolean Automatically open encrypted files with VaultEdit (default: false)
 ---@field password_cache_ttl? number Cache interactive passwords in memory for N seconds (default: 0)
----@field picker? "auto"|"telescope"|"builtin" Picker backend for VaultFiles (default: "auto")
 ---@field timeout_ms? number ansible-vault job timeout in milliseconds (default: 30000, set 0 to disable)
 ---@field notify_success? boolean Show success/info notifications (default: true)
 ---@field conda_env? string Conda environment name where ansible-vault is installed
@@ -32,7 +31,6 @@ M.MIN_NVIM_VERSION = "0.12"
 local uv = vim.uv
 local AUGROUP = "AnsibleVault"
 local DEFAULT_FILE_MODE = 384 -- 0600
-local SCAN_FILE_LIMIT = 20000
 local NAMESPACE = vim.api.nvim_create_namespace("ansible-vault")
 local parse_vault_from_yaml
 local extract_vault_from_yaml
@@ -53,7 +51,6 @@ local DEFAULT_CONFIG = {
   auto_detect = true,
   auto_edit = false,
   password_cache_ttl = 0,
-  picker = "auto",
   timeout_ms = 30000,
   notify_success = true,
   conda_env = nil,
@@ -65,7 +62,6 @@ local DEFAULT_CONFIG = {
 M.config = vim.deepcopy(DEFAULT_CONFIG)
 
 local last_operation = nil
-local suppress_auto_edit_path = nil
 
 ---Debug log helper.
 ---
@@ -525,16 +521,6 @@ local function complete_operation_args(arg_lead, include_rekey, include_labels)
     vim.list_extend(candidates, labels)
   end
 
-  return vim.tbl_filter(function(candidate)
-    return vim.startswith(candidate, arg_lead)
-  end, candidates)
-end
-
----@param arg_lead string
----@return string[]
-local function complete_files_args(arg_lead)
-  local candidates = { "view", "edit", "rekey" }
-  vim.list_extend(candidates, complete_operation_args(arg_lead, true))
   return vim.tbl_filter(function(candidate)
     return vim.startswith(candidate, arg_lead)
   end, candidates)
@@ -2255,133 +2241,6 @@ function M.decrypt_string_under_cursor(opts)
   decrypt_string_selection(target, selection, "replace", opts)
 end
 
----@return string[]
-local function discover_vault_files()
-  local files
-  if vim.fn.executable("rg") == 1 then
-    files = vim.fn.systemlist({ "rg", "--files" })
-  else
-    files = vim.fn.glob("**/*", false, true)
-  end
-
-  local result = {}
-  local scanned = 0
-  local truncated = false
-
-  for _, file in ipairs(files or {}) do
-    if scanned >= SCAN_FILE_LIMIT then
-      truncated = true
-      break
-    end
-    if vim.fn.filereadable(file) == 1 then
-      scanned = scanned + 1
-      local first = vim.fn.readfile(file, "", 1)[1] or ""
-      -- Only the header is inspected, and only its first bytes need to match, so
-      -- binary files are rejected without reading further.
-      if M.is_encrypted({ first }) then
-        table.insert(result, file)
-      end
-    end
-  end
-
-  if truncated then
-    vim.notify(
-      string.format("Scanned the first %d files only; some vault files may be missing", SCAN_FILE_LIMIT),
-      vim.log.levels.WARN
-    )
-  end
-
-  table.sort(result)
-  return result
-end
-
----@param file string
----@param action string
----@param opts? table
-local function open_vault_file_action(file, action, opts)
-  suppress_auto_edit_path = vim.fn.fnamemodify(file, ":p")
-  local ok, err = pcall(vim.cmd, "edit " .. vim.fn.fnameescape(file))
-  suppress_auto_edit_path = nil
-  if not ok then
-    vim.notify("Failed to open vault file: " .. err, vim.log.levels.ERROR)
-    return
-  end
-
-  local buf = vim.api.nvim_get_current_buf()
-
-  if action == "edit" then
-    M.edit(buf, opts)
-  elseif action == "rekey" then
-    M.rekey(opts)
-  else
-    M.view(buf, opts)
-  end
-end
-
----@param files string[]
----@param action string
----@param opts? table
----@return boolean
-local function telescope_pick(files, action, opts)
-  local config = effective_config(opts)
-  if config.picker == "builtin" then
-    return false
-  end
-
-  local ok_pickers, pickers = pcall(require, "telescope.pickers")
-  local ok_finders, finders = pcall(require, "telescope.finders")
-  local ok_conf, conf = pcall(require, "telescope.config")
-  local ok_actions, actions = pcall(require, "telescope.actions")
-  local ok_state, action_state = pcall(require, "telescope.actions.state")
-  if not (ok_pickers and ok_finders and ok_conf and ok_actions and ok_state) then
-    return false
-  end
-
-  local picker = pickers.new({}, {
-    prompt_title = "Ansible Vault Files",
-    finder = finders.new_table(files),
-    sorter = conf.values.generic_sorter({}),
-    attach_mappings = function(prompt_bufnr)
-      actions.select_default:replace(function()
-        local selection = action_state.get_selected_entry()
-        actions.close(prompt_bufnr)
-        if selection and selection.value then
-          open_vault_file_action(selection.value, action, opts)
-        end
-      end)
-      return true
-    end,
-  })
-  picker:find()
-
-  return true
-end
-
----Pick a vault file and view/edit/rekey it.
----@param opts? table
-function M.files(opts)
-  local action = "view"
-  if opts and opts.positionals and vim.tbl_contains({ "view", "edit", "rekey" }, opts.positionals[1]) then
-    action = opts.positionals[1]
-  end
-
-  local files = discover_vault_files()
-  if #files == 0 then
-    vim.notify("No Ansible Vault files found", vim.log.levels.WARN)
-    return
-  end
-
-  if telescope_pick(files, action, opts) then
-    return
-  end
-
-  vim.ui.select(files, { prompt = "Ansible Vault files" }, function(choice)
-    if choice then
-      open_vault_file_action(choice, action, opts)
-    end
-  end)
-end
-
 ---@param value boolean
 ---@return string
 local function yes_no(value)
@@ -2454,7 +2313,6 @@ function M.get_info(buf, opts)
     "",
     "Auto detect: " .. yes_no(config.auto_detect ~= false),
     "Auto edit: " .. yes_no(config.auto_edit == true),
-    "Picker: " .. tostring(config.picker or "auto"),
     "Timeout: " .. (timeout and string.format("%dms", timeout) or "disabled"),
     "Success notifications: " .. yes_no(config.notify_success ~= false),
     "Password cache: " .. credentials.describe_cache(config.password_cache_ttl),
@@ -2587,7 +2445,6 @@ local COMPLETERS = {
   labels = function(arg_lead)
     return complete_operation_args(arg_lead, false, true)
   end,
-  files = complete_files_args,
   create = complete_create_args,
 }
 
@@ -2649,14 +2506,6 @@ local COMMANDS = {
     nargs = 0,
     run = function()
       M.clear_password_cache()
-    end,
-  },
-  {
-    name = "VaultFiles",
-    desc = "Pick an Ansible Vault file",
-    complete = "files",
-    run = function(_, parsed)
-      M.files(parsed)
     end,
   },
   {
@@ -2813,14 +2662,6 @@ function M.setup(opts)
           return
         end
 
-        if
-          suppress_auto_edit_path
-          and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(event.buf), ":p") == suppress_auto_edit_path
-        then
-          suppress_auto_edit_path = nil
-          return
-        end
-
         if encrypted and M.config.auto_edit then
           vim.schedule(function()
             if is_valid_buf(event.buf) and M.is_buffer_encrypted(event.buf) then
@@ -2844,7 +2685,6 @@ M._private = {
   parse_vault_from_yaml = parse_vault_from_yaml,
   output_to_lines = output_to_lines,
   complete_operation_args = complete_operation_args,
-  complete_files_args = complete_files_args,
   complete_create_args = complete_create_args,
   needs_yaml_quoting = needs_yaml_quoting,
   yaml_quote_value = yaml_quote_value,

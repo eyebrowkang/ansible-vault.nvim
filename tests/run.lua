@@ -202,7 +202,6 @@ local function reset_config(fake, opts)
   vault.config.auto_detect = true
   vault.config.auto_edit = false
   vault.config.password_cache_ttl = 0
-  vault.config.picker = "auto"
   vault.config.timeout_ms = 30000
   vault.config.notify_success = true
   vault.config.conda_env = nil
@@ -695,75 +694,6 @@ tests["auto_edit opens encrypted files in a scratch buffer"] = function()
       and vim.bo[vim.api.nvim_get_current_buf()].buftype == "acwrite"
   end, "auto_edit did not open VaultEdit scratch buffer")
 
-  vim.api.nvim_buf_delete(vim.api.nvim_get_current_buf(), { force = true })
-end
-
-tests["VaultFiles builtin picker can view selected vault file"] = function()
-  local fake = create_fake_vault()
-  reset_config(fake, { picker = "builtin" })
-
-  local original_cwd = vim.fn.getcwd()
-  local original_select = vim.ui.select
-  local vault_file = fake.dir .. "/picked.yml"
-  write_file(vault_file, "$ANSIBLE_VAULT;1.1;AES256\nTARGET\n")
-
-  vim.fn.chdir(fake.dir)
-  vim.ui.select = function(items, _, callback)
-    assert_eq(items, { "picked.yml" }, "VaultFiles did not discover the expected vault file")
-    callback(items[1])
-  end
-
-  vault.files({ positionals = { "view" } })
-
-  wait_until(function()
-    return vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, -1, false)[1] == "plain: target"
-  end, "VaultFiles did not view the selected vault file")
-
-  vim.ui.select = original_select
-  vim.fn.chdir(original_cwd)
-  vim.api.nvim_win_close(0, true)
-end
-
-tests["VaultFiles edit suppresses auto_edit duplicate scratch buffers"] = function()
-  local fake = create_fake_vault()
-  reset_config(fake, { picker = "builtin", auto_edit = true })
-
-  local original_cwd = vim.fn.getcwd()
-  local original_select = vim.ui.select
-  local vault_file = fake.dir .. "/picked.yml"
-  write_file(vault_file, "$ANSIBLE_VAULT;1.1;AES256\nTARGET\n")
-
-  vim.fn.chdir(fake.dir)
-  vim.ui.select = function(items, _, callback)
-    assert_eq(items, { "picked.yml" }, "VaultFiles did not discover the expected vault file")
-    callback(items[1])
-  end
-
-  vault.files({ positionals = { "edit" } })
-
-  wait_until(function()
-    return vim.bo[vim.api.nvim_get_current_buf()].buftype == "acwrite"
-  end, "VaultFiles edit did not open a scratch buffer")
-
-  vim.wait(100, function()
-    return false
-  end, 20)
-
-  local scratch_count = 0
-  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    if
-      vim.api.nvim_buf_is_loaded(buf)
-      and vim.bo[buf].buftype == "acwrite"
-      and vim.api.nvim_buf_get_name(buf):find("picked.yml", 1, true)
-    then
-      scratch_count = scratch_count + 1
-    end
-  end
-
-  assert_eq(scratch_count, 1, "VaultFiles edit opened duplicate scratch buffers")
-
-  vim.ui.select = original_select
-  vim.fn.chdir(original_cwd)
   vim.api.nvim_buf_delete(vim.api.nvim_get_current_buf(), { force = true })
 end
 

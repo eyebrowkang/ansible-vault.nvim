@@ -29,8 +29,6 @@ reaches the disk. See |ansible-vault-security|.
 - Encrypt, view and decrypt inline `!vault` values, by selection or under
   the cursor
 - Rekey encrypted files
-- Diff decrypted vault content
-- Pick vault files with Telescope or the built-in picker
 - Reads `ansible.cfg` and `ANSIBLE_*` variables the way Ansible does
 - Preserves the vault ID label carried by a format 1.2 header
 - Interactive password input with optional in-memory caching
@@ -95,11 +93,6 @@ All commands accept optional vault credential overrides as arguments.
                                                  *:VaultClearPasswordCache*
 :VaultClearPasswordCache
     Clear the in-memory interactive password cache.
-
-                                                 *:VaultFiles*
-:VaultFiles [view|edit|rekey]
-    Scan the current working directory for Ansible Vault files and
-    open the selected file in view, edit, or rekey mode.
 
                                                  *:VaultInfo*
 :VaultInfo [args]
@@ -172,7 +165,6 @@ Suggested keymaps (not set by the plugin): >
     vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>")
     vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>")
     vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>")
-    vim.keymap.set("n", "<leader>vf", "<cmd>VaultFiles view<cr>")
     vim.keymap.set("v", "<leader>vs", ":VaultEncryptString<cr>", {silent=true})
     vim.keymap.set("v", "<leader>vS", ":VaultDecryptString<cr>", {silent=true})
     vim.keymap.set("v", "<leader>vv", ":VaultViewString<cr>", {silent=true})
@@ -197,7 +189,6 @@ Call |ansible-vault.setup()| with your settings: >
       auto_detect = true,
       auto_edit = false,
       password_cache_ttl = 0,
-      picker = "auto",
       timeout_ms = 30000,
       notify_success = true,
       conda_env = nil,
@@ -250,11 +241,6 @@ Call |ansible-vault.setup()| with your settings: >
     Cache interactive passwords in Neovim memory for N seconds.
     Set to `0` to prompt for every operation. Clear with
     |:VaultClearPasswordCache|.
-
-                                                 *ansible-vault-config-picker*
-`picker` ~
-    (`"auto"`, `"telescope"`, or `"builtin"`, default `"auto"`)
-    Picker backend for |:VaultFiles|.
 
                                                  *ansible-vault-config-timeout_ms*
 `timeout_ms` ~
@@ -395,11 +381,6 @@ on the next attempt.
                                      *ansible-vault.rekey()*
 `rekey(opts?)` ~
     Rekey the current file-backed encrypted buffer.
-
-                                     *ansible-vault.files()*
-`files(opts?)` ~
-    Pick a vault file. `opts` can contain `positionals` with
-    the action (`"view"`, `"edit"`, or `"rekey"`).
 
                                      *ansible-vault.info()*
 `info(buf?, opts?)` ~
