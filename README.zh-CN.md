@@ -480,6 +480,66 @@ Neovim 的 swap、undo、runtime 目录里搜索明文。
 - **明文在查看/编辑期间位于 Neovim 内存中**，因此可能进入操作系统 swap 分区或 core dump。
   如果这对你重要，请检查其他插件、剪贴板设置，以及终端/会话录制。
 
+## 从 v0.1.0 迁移
+
+v0.2.0 是一次有意的破坏性变更：移除边缘集成、合并重叠的接口，而不是保留兼容别名。
+这里没有「废弃但仍可用」的东西——被移除的名字就是不存在了。
+
+### 命令
+
+| v0.1.0 | v0.2.0 |
+|--------|--------|
+| `:VaultEncryptString` | `:'<,'>VaultEncrypt` |
+| `:VaultEncryptStringUnderCursor` | `:.VaultEncrypt` |
+| `:VaultViewString`、`:VaultViewStringUnderCursor` | `:VaultView`（光标在 block 内）|
+| `:VaultDecryptString`、`:VaultDecryptStringUnderCursor` | `:VaultDecrypt`（光标在 block 内）|
+| `:VaultToggle` | `:VaultEncrypt` 或 `:VaultDecrypt` |
+| `:VaultClearPasswordCache` | 已移除——密码不再缓存 |
+| `:VaultInfo` | `:checkhealth ansible-vault` |
+| `:VaultDiff` | 已移除——请对解密后的副本使用 diff 工具 |
+| `:VaultFiles` | 已移除——请使用你的模糊查找插件 |
+
+### 配置项
+
+| v0.1.0 | v0.2.0 |
+|--------|--------|
+| `password_file = "p"` | `password_files = "p"`（也接受列表）|
+| `vault_id = "prod@p"` | `vault_ids = "prod@p"`（也接受列表）|
+| `rekey_password_file` | `new_password_file` |
+| `rekey_vault_id` | `new_vault_id` |
+| `conda_env = "env"` | `ansible_vault_path = "<env>/bin/ansible-vault"` |
+| `password_cache_ttl` | 已移除——每次操作都询问 |
+| `timeout_ms` | 已移除——改为内部固定值 |
+| `notify_success` | 已移除 |
+| `auto_detect`、`auto_edit` | 已移除——请显式执行命令 |
+| `picker` | 随 `:VaultFiles` 一起移除 |
+| `debug` | 已移除 |
+| `vim.g.ansible_vault_config` | 请调用 `setup()` |
+
+未知配置键现在会直接报错，而不是被忽略，所以遗留的配置项会明确告诉你，而不是看起来
+还在生效。
+
+### 命令参数
+
+`--vault-pass-file` 和 `--password-file` 已移除，请统一使用
+`--vault-password-file`（现在可以重复传入）。裸标签简写
+（`:VaultEncryptString prod`）已移除，请写 `--encrypt-vault-id prod`。新增
+`--ask-vault-password`。无法识别的参数会直接报错。
+
+### API 与事件
+
+`toggle`、`diff`、`files`、`info`、`get_info`、`status`、`clear_password_cache`
+以及全部 `*_string*` / `*_under_cursor` 函数均已移除；六个动作改为通过 `opts` 中的
+`range`/`line1`/`line2` 指定作用域。11 个 `AnsibleVault*` 事件合并为
+`AnsibleVaultOperation`，`op` 和 `scope` 放在 `event.data` 里。statusline 请用
+`is_buffer_encrypted()` 替代 `status()`。
+
+### 值得注意的行为变化
+
+- 不再支持字符级（charwise）和块级（blockwise）inline 加密；range 一律按整行处理。
+- `:VaultRekey` 不再传 `--encrypt-vault-id`。如果你之前依赖旧行为，请检查带标签的
+  文件是否真的完成了轮换——旧代码可能用**旧密码**重新加密并报告成功。
+
 ## 开发
 
 运行 headless 测试：

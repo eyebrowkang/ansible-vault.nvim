@@ -16,6 +16,7 @@ TABLE OF CONTENTS                                   *ansible-vault-contents*
 8. Security ........................... |ansible-vault-security|
 9. Health Check ....................... |ansible-vault-health|
 10. Statusline Integration ............ |ansible-vault-statusline|
+11. Migrating from v0.1.0 ............. |ansible-vault-migration|
 
 ==============================================================================
 1. INTRODUCTION                                     *ansible-vault-intro*
@@ -490,5 +491,60 @@ behind: >
       },
     })
 <
+==============================================================================
+11. MIGRATING FROM v0.1.0                        *ansible-vault-migration*
+
+v0.2.0 removes peripheral integrations and collapses overlapping surface
+rather than carrying aliases forward. Nothing is deprecated; removed names
+are gone, and an unknown `setup()` key or command argument is an error.
+
+COMMANDS
+
+    `:VaultEncryptString`                -> `:'<,'>VaultEncrypt`
+    `:VaultEncryptStringUnderCursor`     -> `:.VaultEncrypt`
+    `:VaultViewString`(`UnderCursor`)      -> |:VaultView| with the cursor in the block
+    `:VaultDecryptString`(`UnderCursor`)   -> |:VaultDecrypt| with the cursor in the block
+    `:VaultToggle`                       -> |:VaultEncrypt| or |:VaultDecrypt|
+    `:VaultClearPasswordCache`           -> removed; passwords are never cached
+    `:VaultInfo`                         -> |:checkhealth|
+    `:VaultDiff`                         -> removed
+    `:VaultFiles`                        -> removed; use a fuzzy finder
+
+CONFIGURATION
+
+    `password_file`         -> `password_files`   (also takes a list)
+    `vault_id`             -> `vault_ids`        (also takes a list)
+    `rekey_password_file`   -> `new_password_file`
+    `rekey_vault_id`        -> `new_vault_id`
+    `conda_env`            -> `ansible_vault_path` = `<env>/bin/ansible-vault`
+    `password_cache_ttl`    -> removed; every operation prompts
+    `timeout_ms`           -> removed; fixed internally
+    `notify_success`        -> removed
+    `auto_detect`, `auto_edit` -> removed; run a command explicitly
+    `picker`               -> removed with `:VaultFiles`
+    `debug`                -> removed
+    `vim.g.ansible_vault_config` -> call |ansible-vault.setup()|
+
+ARGUMENTS
+
+`--vault-pass-file` and `--password-file` are gone; use
+`--vault-password-file`, which can now be repeated. The bare label shortcut
+is gone; write `--encrypt-vault-id <label>`. `--ask-vault-password` is new.
+
+API AND EVENTS
+
+`toggle()`, `diff()`, `files()`, `info()`, `get_info()`, `status()`,
+`clear_password_cache()` and every `*_string*` / `*_under_cursor` function
+are removed; the six verbs take `range`/`line1`/`line2` in `opts`. The
+eleven `AnsibleVault*` events collapse to `AnsibleVaultOperation`. For a
+statusline use |ansible-vault.is_buffer_encrypted()|.
+
+BEHAVIOUR
+
+- Charwise and blockwise inline encryption are gone; a range is whole lines.
+- |:VaultRekey| no longer passes `--encrypt-vault-id`. If you relied on the
+  old behaviour, verify your labelled files actually rotated: the old code
+  could re-encrypt with the OLD password and report success.
+
 ==============================================================================
  vim:tw=78:ts=8:ft=help:norl:

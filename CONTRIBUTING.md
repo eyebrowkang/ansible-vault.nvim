@@ -69,3 +69,9 @@ Commands are declared once, in the `COMMANDS` table in
 `lua/ansible-vault/init.lua`. Add an entry there; `plugin/ansible-vault.lua`
 registers whatever the table contains. Then update `README.md`,
 `README.zh-CN.md` and `doc/ansible-vault.txt`.
+
+Prefer teaching an existing verb a new scope over adding a command. Each of the
+six commands resolves its own target from the range, the buffer and the cursor,
+and that is deliberate: the previous surface had three commands per verb — one
+for a selection, one for the cursor, one for the whole file — which is three
+places to keep in sync and three names for the user to choose between.
