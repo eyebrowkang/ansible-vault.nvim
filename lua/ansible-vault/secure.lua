@@ -42,12 +42,6 @@ function M.protect(buf)
   vim.bo[buf].undofile = false
 end
 
----@param buf integer
----@return boolean
-function M.is_protected(buf)
-  return is_valid(buf) and vim.b[buf][SAVED_OPTS] ~= nil
-end
-
 ---Restore the options saved by `protect`. Call once the buffer holds ciphertext
 ---again, so normal crash recovery comes back.
 ---@param buf integer

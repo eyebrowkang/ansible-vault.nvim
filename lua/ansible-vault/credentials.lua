@@ -1,9 +1,8 @@
 ---Credential resolution.
 ---
----One implementation of the precedence rules, shared by the code that actually
----runs `ansible-vault`, by `:VaultInfo`, and by `:checkhealth`. Keeping these in
----sync matters: when they drift, the diagnostics confidently report a credential
----source that is not the one being used.
+---One implementation of the precedence rules, shared by the code that runs
+---`ansible-vault` and by `:checkhealth`, so diagnostics report the credential
+---source actually being used.
 ---
 ---Precedence, highest first:
 ---
@@ -367,8 +366,7 @@ end
 
 --- Diagnostics ------------------------------------------------------------
 
----Describe credential resolution for `:VaultInfo` and `:checkhealth`, without
----side effects.
+---Describe credential resolution for `:checkhealth` without side effects.
 ---@param config table
 ---@param context? { file_path?: string }
 ---@return table
@@ -379,9 +377,7 @@ function M.describe(config, context)
     cwd = plan.cwd,
     cfg_path = plan.cfg.cfg_path,
     cfg_source = plan.cfg.cfg_source,
-    ansible_supplies = plan.cfg.has_credentials,
     needs_disambiguation = plan.needs_disambiguation,
-    our_label = plan.our_label,
     encrypt_label = M.encrypt_label(config, plan, context),
     settings = plan.cfg.settings,
   }

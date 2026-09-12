@@ -57,8 +57,7 @@ end
 
 ---Check a user-supplied config, reporting everything wrong with it at once.
 ---
----An unknown key is an error, not something to ignore: a typo or a key left over
----from an older version otherwise looks like it took effect.
+---An unknown key is an error, so a typo cannot look like it took effect.
 ---@param opts table
 ---@return string[] errors
 function M.validate(opts)

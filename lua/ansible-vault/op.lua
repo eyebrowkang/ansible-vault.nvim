@@ -1,10 +1,8 @@
 ---The plumbing every vault operation shares.
 ---
----Each operation does the same three things around its actual work: resolve
----credentials for the file it applies to, decide which identity to encrypt with,
----and announce itself when it lands. Those were open-coded at nine call sites,
----which is how `--encrypt-vault-id` ended up on `rekey`, where it means something
----different and silently re-encrypts with the old password.
+---Resolve credentials for the target file, decide which identity to encrypt with,
+---and announce completed operations. `rekey` has separate identity rules because
+---`--encrypt-vault-id` can silently re-encrypt with the old password there.
 ---
 ---Credential *policy* still lives in `credentials.lua`. This module only threads
 ---the effective configuration through to it.
