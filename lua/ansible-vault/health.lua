@@ -1,5 +1,6 @@
 local M = {}
 
+local cli = require("ansible-vault.cli")
 local credentials = require("ansible-vault.credentials")
 local secure = require("ansible-vault.secure")
 local vault = require("ansible-vault")
@@ -94,7 +95,7 @@ function M.check()
     )
   end
 
-  local executable = vault.executable_argv()[1]
+  local executable = cli.executable_argv()[1]
   if vim.fn.executable(executable) == 1 then
     health.ok("ansible-vault executable found: " .. executable)
   else

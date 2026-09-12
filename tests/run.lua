@@ -196,7 +196,7 @@ local function reset_config(fake, opts)
   -- `setup()` below replaces the whole table, so there is nothing to clear by
   -- hand. Listing every key here is what made this drift out of sync with the
   -- schema every time one was added or removed.
-  vault.timeout_ms = 30000
+  require("ansible-vault.cli").timeout_ms = 30000
   notifications = {}
 
   local config = {
@@ -735,7 +735,7 @@ end
 tests["slow vault operations time out"] = function()
   local fake = create_fake_vault()
   reset_config(fake)
-  vault.timeout_ms = 50
+  require("ansible-vault.cli").timeout_ms = 50
   vim.env.FAKE_VAULT_SLEEP = "1"
 
   local buf = new_buffer({ "plain: value" })
@@ -747,7 +747,7 @@ tests["slow vault operations time out"] = function()
 
   assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "plain: value" }, "timed out operation changed buffer")
   vim.env.FAKE_VAULT_SLEEP = nil
-  vault.timeout_ms = 30000
+  require("ansible-vault.cli").timeout_ms = 30000
 end
 
 tests["operations announce themselves on AnsibleVaultOperation"] = function()
@@ -1368,7 +1368,7 @@ tests["failed decryption does not surface process output"] = function()
 end
 
 tests["debug logging redacts credential arguments"] = function()
-  local redact = vault._private.redact_argv
+  local redact = require("ansible-vault.cli").redact_argv
   assert_eq(
     redact({ "ansible-vault", "encrypt", "--vault-password-file", "/home/u/.secret", "-" }),
     "ansible-vault encrypt --vault-password-file <redacted> -"
