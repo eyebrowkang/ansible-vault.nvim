@@ -66,7 +66,7 @@ vim.fn.setfperm(password_file, "rw-------")
 
 vault.setup({
   ansible_vault_path = ansible_vault,
-  password_file = password_file,
+  password_files = password_file,
 })
 
 local buf = vim.api.nvim_create_buf(true, false)
@@ -230,7 +230,7 @@ vim.fn.setfperm(own_pass, "rw-------")
 
 vault.setup({
   ansible_vault_path = ansible_vault,
-  password_file = own_pass,
+  password_files = own_pass,
 })
 require("ansible-vault.ansible_cfg").clear_cache()
 
@@ -250,7 +250,7 @@ vim.cmd("cd " .. vim.fn.fnameescape(original_cwd))
 local created = workdir .. "/created.yml"
 vault.setup({
   ansible_vault_path = ansible_vault,
-  password_file = password_file,
+  password_files = password_file,
 })
 vim.cmd("VaultCreate " .. vim.fn.fnameescape(created))
 local created_buf = vim.api.nvim_get_current_buf()

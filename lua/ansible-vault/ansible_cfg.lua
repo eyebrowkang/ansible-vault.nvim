@@ -22,7 +22,6 @@ local KEYS = {
   vault_identity_list = "list",
   vault_identity = "string",
   vault_encrypt_identity = "string",
-  vault_id_match = "boolean",
   ask_vault_pass = "boolean",
 }
 
@@ -209,7 +208,6 @@ function M.env_settings()
   end
 
   for env_name, key in pairs({
-    ANSIBLE_VAULT_ID_MATCH = "vault_id_match",
     ANSIBLE_ASK_VAULT_PASS = "ask_vault_pass",
   }) do
     local value = vim.env[env_name]

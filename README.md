@@ -28,7 +28,7 @@ values, built so that decrypted content never reaches the disk.
 
 - Reads `ansible.cfg` and the `ANSIBLE_*` environment variables the way Ansible
   does, searching upward from the current file
-- Password file, one or more vault IDs, or an interactive prompt
+- One or more password files or vault IDs, or an interactive prompt
 - Per-command credential overrides with command-line completion
 
 **Fidelity**
@@ -65,13 +65,11 @@ supported.
   "eyebrowkang/ansible-vault.nvim",
   config = function()
     require("ansible-vault").setup({
-      -- Optional: path to password file
-      password_file = "~/.vault_pass",
-      -- Optional: vault ID
-      vault_id = nil,
-      -- Optional: multiple vault IDs
+      -- Optional: --vault-password-file (a string or a list)
+      password_files = "~/.vault_pass",
+      -- Optional: --vault-id (a string or a list)
       vault_ids = nil,
-      -- Optional: vault ID label to use when encrypting
+      -- Optional: --encrypt-vault-id
       encrypt_vault_id = nil,
       -- Optional: custom ansible-vault path
       ansible_vault_path = nil,
@@ -95,24 +93,26 @@ use {
 
 ```lua
 require("ansible-vault").setup({
-  -- Path to ansible-vault password file
-  password_file = nil,
-
-  -- Vault ID to use for decryption (for multi-vault setups)
-  vault_id = nil,
-
-  -- Multiple vault IDs. Takes precedence over vault_id when set.
+  -- --vault-id. A single string, or a list for multi-vault setups.
   vault_ids = nil,
 
-  -- Vault ID label to use for encryption.
+  -- --vault-password-file. A single string, or a list.
+  password_files = nil,
+
+  -- Always prompt, ignoring any configured or discovered credential.
+  -- Cannot be combined with vault_ids or password_files.
+  ask_password = false,
+
+  -- --encrypt-vault-id: which identity to encrypt with.
   -- Leave nil to let ansible-vault choose from the configured vault IDs.
   encrypt_vault_id = nil,
 
-  -- New password file for :VaultRekey
-  rekey_password_file = nil,
+  -- --new-vault-id for :VaultRekey, for example "prod@~/.ansible/new-pass"
+  new_vault_id = nil,
 
-  -- New vault ID for :VaultRekey, for example "prod@~/.ansible/new-pass"
-  rekey_vault_id = nil,
+  -- --new-vault-password-file for :VaultRekey.
+  -- Mutually exclusive with new_vault_id, as in ansible-vault itself.
+  new_password_file = nil,
 
   -- Custom path to ansible-vault executable
   ansible_vault_path = nil,
@@ -124,7 +124,8 @@ require("ansible-vault").setup({
 The plugin resolves credentials in this order:
 
 1. per-command overrides, such as `:VaultEncrypt --vault-id prod@~/.prod-pass`
-2. `setup()` configuration: `password_file`, then `vault_ids`, then `vault_id`
+2. `setup()` configuration: `ask_password`, then `password_files`, then
+   `vault_ids`
 3. `ANSIBLE_*` environment variables
 4. `ansible.cfg`
 5. interactive password prompt
@@ -152,29 +153,21 @@ resolves them, which is relative to the config file itself.
 
 These keys are read from `[defaults]`, and the matching environment variables
 override them: `vault_password_file`, `vault_identity_list`, `vault_identity`,
-`vault_encrypt_identity`, `vault_id_match` and `ask_vault_pass`.
+`vault_encrypt_identity` and `ask_vault_pass`.
 
 Run `:checkhealth ansible-vault` to see which config was found and which
 credential source is actually in effect.
 
-Use `password_file` for a single vault password:
+Use `password_files` for a single vault password:
 
 ```lua
 require("ansible-vault").setup({
-  password_file = "~/.ansible/vault-pass",
+  password_files = "~/.ansible/vault-pass",
 })
 ```
 
-Use `vault_id` for Ansible multi-vault setups:
-
-```lua
-require("ansible-vault").setup({
-  vault_id = "prod@~/.ansible/prod-pass",
-  encrypt_vault_id = "prod",
-})
-```
-
-Use `vault_ids` when more than one identity is needed:
+Use `vault_ids` for Ansible multi-vault setups. Both keys take a single string
+or a list, because the flags they stand for are repeatable:
 
 ```lua
 require("ansible-vault").setup({
@@ -183,6 +176,15 @@ require("ansible-vault").setup({
     "prod@~/.ansible/prod-pass",
   },
   encrypt_vault_id = "prod",
+})
+```
+
+Set `ask_password = true` to always prompt, for a vault whose password is not
+written down anywhere:
+
+```lua
+require("ansible-vault").setup({
+  ask_password = true,
 })
 ```
 
@@ -208,25 +210,27 @@ your global setup:
 ```vim
 :VaultEdit --vault-id prod@~/.ansible/prod-pass
 :VaultView --vault-password-file ~/.ansible/prod-pass
-:VaultEncryptString prod
+:VaultEncryptString --encrypt-vault-id prod
+:VaultDecrypt --ask-vault-password
 ```
 
-The bare label shortcut, such as `prod`, is supported by the inline encrypt
-commands and maps to `--encrypt-vault-id prod`.
+Flags are spelled exactly as `ansible-vault` spells them, and an unrecognised
+one is an error rather than being silently ignored — a typo used to fall through
+to a password prompt, which reads as "the credential was not found".
 
 Configure `VaultRekey` with a new password file or a new vault ID:
 
 ```lua
 require("ansible-vault").setup({
-  password_file = "~/.ansible/old-pass",
-  rekey_password_file = "~/.ansible/new-pass",
+  password_files = "~/.ansible/old-pass",
+  new_password_file = "~/.ansible/new-pass",
 })
 ```
 
 ```lua
 require("ansible-vault").setup({
-  vault_id = "old@~/.ansible/old-pass",
-  rekey_vault_id = "new@~/.ansible/new-pass",
+  vault_ids = "old@~/.ansible/old-pass",
+  new_vault_id = "new@~/.ansible/new-pass",
 })
 ```
 
@@ -235,7 +239,7 @@ If `ansible-vault` is not on `PATH`, point to the executable directly:
 ```lua
 require("ansible-vault").setup({
   ansible_vault_path = "/opt/homebrew/bin/ansible-vault",
-  password_file = "~/.ansible/vault-pass",
+  password_files = "~/.ansible/vault-pass",
 })
 ```
 
@@ -433,8 +437,8 @@ Configure a rekey target first:
 
 ```lua
 require("ansible-vault").setup({
-  password_file = "~/.ansible/old-pass",
-  rekey_password_file = "~/.ansible/new-pass",
+  password_files = "~/.ansible/old-pass",
+  new_password_file = "~/.ansible/new-pass",
 })
 ```
 
