@@ -110,10 +110,8 @@ end
 ---@return table
 ---Parse command arguments into config overrides.
 ---
----Credential flags are spelled exactly as `ansible-vault` spells them, and an
----unrecognised one is an error rather than a silently ignored positional: a typo
----like `--vault-pasword-file` used to fall through to an interactive prompt,
----which looks like the credential simply was not found.
+---Credential flags are spelled exactly as `ansible-vault` spells them.
+---Unrecognised flags are errors, not positional arguments.
 ---@return table|nil parsed, string|nil err
 local function parse_operation_options(args, opts)
   local result = {
@@ -388,11 +386,9 @@ end
 
 --- Scope-aware verbs -------------------------------------------------------
 ---
----One command per verb, acting on whatever the buffer, the range and the cursor
----say it should act on. The alternative — a separate command per verb for the
----selection and for the cursor — meant three commands for one idea, and made the
----no-range forms read the `'<`/`'>` marks, which silently pointed at an old
----selection somewhere else in the buffer.
+---One command per verb, with the target resolved from the buffer, explicit
+---range and cursor. Never read the `'<`/`'>` marks: they may point at a stale
+---selection elsewhere in the buffer.
 
 ---@param buf? integer
 ---@param opts? table
@@ -575,9 +571,7 @@ end
 
 --- Commands ---------------------------------------------------------------
 ---
----One table, one registration pass. The commands used to be declared both here
----and in `plugin/ansible-vault.lua`, each with `force = true`, so whichever ran
----last silently won.
+---One table, one registration pass.
 
 ---@param arg_lead string
 ---@return string[]
@@ -608,7 +602,7 @@ local COMPLETERS = {
 local COMMANDS = {
   {
     name = "VaultEncrypt",
-    desc = "Encrypt the buffer, or the inline !vault value in [range] or under the cursor",
+    desc = "Encrypt the buffer, or the inline YAML value in [range]",
     complete = "labels",
     range = true,
     run = function(_, parsed)

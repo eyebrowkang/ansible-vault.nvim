@@ -85,8 +85,7 @@ function M.enter(buf, mode, opts)
   notify(
     mode == "file" and "Buffer is decrypted. :w re-encrypts before writing."
       or "Value is decrypted. :w restores the vault block before writing.",
-    vim.log.levels.INFO,
-    opts
+    vim.log.levels.INFO
   )
 end
 
