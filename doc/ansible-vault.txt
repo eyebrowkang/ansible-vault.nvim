@@ -85,19 +85,9 @@ All commands accept optional vault credential overrides as arguments.
     content is encrypted and atomically written back to the original
     file.
 
-                                                 *:VaultToggle*
-:VaultToggle [args]
-    Toggle between encrypted and decrypted state. If the buffer is
-    encrypted, decrypts it; if plain, encrypts it.
-
                                                  *:VaultClearPasswordCache*
 :VaultClearPasswordCache
     Clear the in-memory interactive password cache.
-
-                                                 *:VaultInfo*
-:VaultInfo [args]
-    Show the current buffer state and plugin configuration in a
-    floating window.
 
                                                  *:VaultRekey*
 :VaultRekey [args]
@@ -164,7 +154,6 @@ Suggested keymaps (not set by the plugin): >
     vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>")
     vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>")
     vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>")
-    vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>")
     vim.keymap.set("v", "<leader>vs", ":VaultEncryptString<cr>", {silent=true})
     vim.keymap.set("v", "<leader>vS", ":VaultDecryptString<cr>", {silent=true})
     vim.keymap.set("v", "<leader>vv", ":VaultViewString<cr>", {silent=true})
@@ -227,7 +216,7 @@ Call |ansible-vault.setup()| with your settings: >
 `auto_detect` ~
     (boolean, default `true`)
     Automatically detect vault-encrypted files on |BufReadPost|
-    and set `vim.b.ansible_vault_encrypted`.
+    and record the vault ID label carried by the header.
 
                                                  *ansible-vault-config-auto_edit*
 `auto_edit` ~
@@ -310,7 +299,7 @@ variables override them: `vault_password_file`, `vault_identity_list`,
 `vault_identity`, `vault_encrypt_identity`, `vault_id_match` and
 `ask_vault_pass`.
 
-Run |:VaultInfo| to see which config was found and which credential
+Run |:checkhealth| to see which config was found and which credential
 source is actually in effect.
 
                                             *ansible-vault-vault-id-label*
@@ -382,28 +371,9 @@ on the next attempt.
 `rekey(opts?)` ~
     Rekey the current file-backed encrypted buffer.
 
-                                     *ansible-vault.info()*
-`info(buf?, opts?)` ~
-    Show plugin and buffer state in a floating window.
-
-                                     *ansible-vault.get_info()*
-`get_info(buf?, opts?)` ~
-    Return diagnostic info as a list of strings.
-
-                                     *ansible-vault.toggle()*
-`toggle(buf?, opts?)` ~
-    Toggle between encrypted and decrypted state.
-
                                      *ansible-vault.clear_password_cache()*
 `clear_password_cache()` ~
     Clear the in-memory interactive password cache.
-
-                                     *ansible-vault.status()*
-`status(buf?)` ~
-    Statusline string: `"[VAULT]"` for an encrypted buffer,
-    `"[VAULT:prod]"` when the file carries a vault ID label,
-    `"[VAULT:decrypted]"` while it is in plaintext editing mode,
-    and `""` otherwise.
 
                                      *ansible-vault.cleanup()*
 `cleanup()` ~
@@ -440,19 +410,16 @@ on the next attempt.
 
 The plugin emits |User| autocommands after successful operations:
 
-    `AnsibleVaultEncrypt`
-    `AnsibleVaultDecrypt`
-    `AnsibleVaultView`
-    `AnsibleVaultCreate`
-    `AnsibleVaultEditOpen`
-    `AnsibleVaultEditSave`
-    `AnsibleVaultPlaintextSave`
-    `AnsibleVaultRekey`
-    `AnsibleVaultStringEncrypt`
-    `AnsibleVaultStringDecrypt`
-    `AnsibleVaultOperation`  (emitted for all operations)
+The plugin emits exactly one pattern, `AnsibleVaultOperation`, so a
+single autocommand can react to everything and filter on the payload.
 
-The event `data` contains at least `{ operation = "<name>" }`.
+The event `data` contains:
+
+    `op`     one of `"encrypt"`, `"decrypt"`, `"view"`, `"edit"`,
+           `"save"`, `"rekey"`, `"create"`
+    `scope`  `"file"` or `"inline"`
+    `buf`    the buffer the operation applied to
+    `file`   the file path, when the operation touched one
 
 Example: >
 
@@ -503,7 +470,7 @@ WHAT THE PLUGIN GUARANTEES
 WHAT IS STILL UP TO YOU
 
 These are global Neovim settings the plugin deliberately does not
-change. |:VaultInfo| and |:checkhealth| warn when they are enabled.
+change. |:checkhealth| warns when they are enabled.
 
 - 'shada' persists registers, so text you *yank* out of a decrypted
   buffer or the |:VaultView| window is written to the shada file on
@@ -535,8 +502,9 @@ The health check reports:
 ==============================================================================
 10. STATUSLINE INTEGRATION                  *ansible-vault-statusline*
 
-Use |ansible-vault.status()| in your statusline. It returns `"[VAULT]"`,
-`"[VAULT:<label>]"`, `"[VAULT:decrypted]"` or `""`: >
+Use |ansible-vault.is_buffer_encrypted()|. It inspects the buffer on
+every call rather than relying on state an earlier operation left
+behind: >
 
     -- Manual integration
     if require("ansible-vault").is_buffer_encrypted() then
@@ -547,7 +515,11 @@ Use |ansible-vault.status()| in your statusline. It returns `"[VAULT]"`,
     require("lualine").setup({
       sections = {
         lualine_x = {
-          { require("ansible-vault").status },
+          {
+            function()
+              return require("ansible-vault").is_buffer_encrypted() and "[VAULT]" or ""
+            end,
+          },
         },
       },
     })

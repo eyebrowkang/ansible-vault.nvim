@@ -33,7 +33,6 @@ local AUGROUP = "AnsibleVault"
 local DEFAULT_FILE_MODE = 384 -- 0600
 local NAMESPACE = vim.api.nvim_create_namespace("ansible-vault")
 local parse_vault_from_yaml
-local extract_vault_from_yaml
 local has_rekey_target
 local write_plaintext_buffer
 local restore_inline_regions
@@ -60,8 +59,6 @@ local DEFAULT_CONFIG = {
 
 ---@type AnsibleVaultConfig
 M.config = vim.deepcopy(DEFAULT_CONFIG)
-
-local last_operation = nil
 
 ---Debug log helper.
 ---
@@ -130,20 +127,16 @@ local function notify(message, level, opts)
   vim.notify(message, level)
 end
 
----@param operation string
+---Announce a completed operation on the one `User` pattern the plugin emits.
+---
+---A single pattern with the operation in `data` is what a listener actually
+---wants: one autocmd can act on everything, and filtering on `op`/`scope` is a
+---comparison rather than a dozen registrations to keep in sync.
+---@param op "encrypt"|"decrypt"|"view"|"edit"|"save"|"rekey"|"create"
+---@param scope "file"|"inline"
 ---@param data? table
-local function emit_event(operation, data)
-  local payload = vim.tbl_deep_extend("force", { operation = operation }, data or {})
-  last_operation = {
-    operation = operation,
-    time = os.time(),
-    data = payload,
-  }
-
-  pcall(vim.api.nvim_exec_autocmds, "User", {
-    pattern = "AnsibleVault" .. operation,
-    data = payload,
-  })
+local function emit_event(op, scope, data)
+  local payload = vim.tbl_deep_extend("force", { op = op, scope = scope }, data or {})
   pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = "AnsibleVaultOperation",
     data = payload,
@@ -724,7 +717,6 @@ remember_header = function(buf, content)
   end
 
   local header = M.parse_header(content or vim.api.nvim_buf_get_lines(buf, 0, 1, false))
-  vim.b[buf].ansible_vault_encrypted = header ~= nil
   if header then
     vim.b[buf].ansible_vault_version = header.version
     vim.b[buf].ansible_vault_label = header.label
@@ -852,7 +844,7 @@ function M.encrypt(buf, opts)
       if success then
         if replace_buffer_lines(target, tick, output, "Buffer encrypted successfully", opts) then
           leave_plaintext_mode(target)
-          emit_event("Encrypt", { buf = target })
+          emit_event("encrypt", "file", { buf = target })
         end
       else
         vim.notify("Encryption failed: " .. output, vim.log.levels.ERROR)
@@ -904,7 +896,7 @@ function M.decrypt(buf, opts)
       if success then
         if replace_buffer_lines(target, tick, output, "Buffer decrypted successfully", opts) then
           enter_plaintext_mode(target, "file", opts)
-          emit_event("Decrypt", { buf = target })
+          emit_event("decrypt", "file", { buf = target })
         end
       else
         clear_password_cache()
@@ -948,7 +940,7 @@ function M.view(buf, opts)
 
       if success then
         open_output_window(output, " Vault View (read-only) ", filetype)
-        emit_event("View", { buf = target })
+        emit_event("view", "file", { buf = target })
       else
         clear_password_cache()
         vim.notify("View failed: " .. output, vim.log.levels.ERROR)
@@ -1273,7 +1265,7 @@ end
 ---@param buf integer
 ---@param selection AnsibleVaultSelection
 ---@param opts? table
-local function encrypt_string_selection(buf, selection, opts, on_done)
+local function encrypt_string_selection(buf, selection, opts)
   if not selection or #selection.lines == 0 then
     vim.notify("No text selected", vim.log.levels.WARN)
     return
@@ -1315,25 +1307,16 @@ local function encrypt_string_selection(buf, selection, opts, on_done)
 
       if not success then
         vim.notify("Encryption failed: " .. output, vim.log.levels.ERROR)
-        if on_done then
-          on_done(false)
-        end
         return
       end
 
       if not is_valid_buf(buf) then
         vim.notify("Vault operation finished, but the target buffer no longer exists", vim.log.levels.WARN)
-        if on_done then
-          on_done(false)
-        end
         return
       end
 
       if changedtick(buf) ~= planned_tick then
         vim.notify("Vault operation finished, but the buffer changed; result was not applied", vim.log.levels.ERROR)
-        if on_done then
-          on_done(false)
-        end
         return
       end
 
@@ -1341,13 +1324,9 @@ local function encrypt_string_selection(buf, selection, opts, on_done)
 
       if ok then
         notify("String encrypted successfully", vim.log.levels.INFO, opts)
-        emit_event("StringEncrypt", { buf = buf, name = plan.name })
+        emit_event("encrypt", "inline", { buf = buf, name = plan.name })
       else
         vim.notify("Failed to update selection: " .. err, vim.log.levels.ERROR)
-      end
-
-      if on_done then
-        on_done(ok)
       end
     end, opts, creds)
   end, opts, context)
@@ -1375,18 +1354,6 @@ function M.encrypt_string_under_cursor(opts)
   end
 
   encrypt_string_selection(target, selection, opts)
-end
-
----Toggle between encrypted and decrypted state.
----@param buf? integer
----@param opts? table
-function M.toggle(buf, opts)
-  local target = normalize_buf(buf)
-  if M.is_buffer_encrypted(target) then
-    M.decrypt(target, opts)
-  else
-    M.encrypt(target, opts)
-  end
 end
 
 ---@param path string
@@ -1670,7 +1637,7 @@ write_plaintext_buffer = function(buf, target_path, opts)
 
       leave_plaintext_mode(buf)
       notify("Vault values restored and saved: " .. path, vim.log.levels.INFO, opts)
-      emit_event("PlaintextSave", { buf = buf, file = path })
+      emit_event("save", "inline", { buf = buf, file = path })
       finish(true)
     end)
     await()
@@ -1705,7 +1672,7 @@ write_plaintext_buffer = function(buf, target_path, opts)
       end
 
       notify("Encrypted and saved: " .. path, vim.log.levels.INFO, opts)
-      emit_event("PlaintextSave", { buf = buf, file = path })
+      emit_event("save", "file", { buf = buf, file = path })
       finish(true)
     end, opts, creds)
   end, opts, context)
@@ -1953,7 +1920,7 @@ function M.edit(buf, opts)
             end
 
             notify("Encrypted and saved: " .. orig_file, vim.log.levels.INFO, opts)
-            emit_event("EditSave", { buf = orig_buf, file = orig_file })
+            emit_event("save", "file", { buf = orig_buf, file = orig_file })
             if is_valid_buf(cur_buf) then
               cleanup_edit_buffer(cur_buf)
               close_edit_buffer(cur_buf, orig_buf, orig_file, original_win)
@@ -1971,7 +1938,7 @@ function M.edit(buf, opts)
       })
 
       notify("Editing decrypted content. :w encrypts and saves.", vim.log.levels.INFO, opts)
-      emit_event("EditOpen", { buf = edit_buf, original_buf = original_buf, file = original_file })
+      emit_event("edit", "file", { buf = edit_buf, original_buf = original_buf, file = original_file })
     end, opts, creds)
   end, opts, context)
 end
@@ -2042,7 +2009,7 @@ function M.rekey(opts)
       end
 
       notify("Vault file rekeyed successfully", vim.log.levels.INFO, opts)
-      emit_event("Rekey", { buf = target, file = file_path })
+      emit_event("rekey", "file", { buf = target, file = file_path })
     end, opts, creds)
   end, opts, context)
 end
@@ -2053,18 +2020,6 @@ end
 parse_vault_from_yaml = function(content)
   debug_log("parsing inline vault block (%d bytes)", #content)
   return yaml.parse_block(content)
-end
-
----Extract vault content from YAML format, removing indentation.
----@param content string
----@return string|nil vault_content
----@return string|nil var_name
-extract_vault_from_yaml = function(content)
-  local parsed = parse_vault_from_yaml(content)
-  if not parsed then
-    return nil, nil
-  end
-  return parsed.vault_content, parsed.var_name
 end
 
 local needs_yaml_quoting = yaml.needs_quoting
@@ -2199,7 +2154,7 @@ local function decrypt_string_selection(target, selection, mode, opts)
         track_inline_region(target, selection.start_row, selection.start_row + #replacement - 1, parsed)
         enter_plaintext_mode(target, "inline", opts)
         notify("String decrypted successfully", vim.log.levels.INFO, opts)
-        emit_event("StringDecrypt", { buf = target, name = parsed.var_name })
+        emit_event("decrypt", "inline", { buf = target, name = parsed.var_name })
       else
         vim.notify("Failed to update selection: " .. tostring(err), vim.log.levels.ERROR)
       end
@@ -2239,127 +2194,6 @@ function M.decrypt_string_under_cursor(opts)
   local target = vim.api.nvim_get_current_buf()
   local selection = find_vault_block_under_cursor(target)
   decrypt_string_selection(target, selection, "replace", opts)
-end
-
----@param value boolean
----@return string
-local function yes_no(value)
-  return value and "yes" or "no"
-end
-
----@param config table
----@return string
-local function describe_vault_labels(config)
-  local labels = {}
-  local add_label = function(vault_id)
-    local label = type(vault_id) == "string" and vault_id:match("^([^@]+)@")
-    if label then
-      table.insert(labels, label)
-    end
-  end
-
-  if type(config.vault_ids) == "table" then
-    for _, vault_id in ipairs(config.vault_ids) do
-      add_label(vault_id)
-    end
-  end
-  add_label(config.vault_id)
-
-  if #labels == 0 then
-    return "none"
-  end
-  return table.concat(labels, ", ")
-end
-
----Return human-readable plugin and buffer state lines.
----@param buf? integer
----@param opts? table
----@return string[]
-function M.get_info(buf, opts)
-  local target = normalize_buf(buf)
-  local config = effective_config(opts)
-  local buffer_name = is_valid_buf(target) and vim.api.nvim_buf_get_name(target) or ""
-  local pending = is_valid_buf(target) and vim.b[target].ansible_vault_pending or nil
-  local modified = is_valid_buf(target) and vim.bo[target].modified or false
-  local plaintext = is_valid_buf(target) and vim.b[target].ansible_vault_plaintext or nil
-  local label = is_valid_buf(target) and vim.b[target].ansible_vault_label or nil
-  local version = is_valid_buf(target) and vim.b[target].ansible_vault_version or nil
-
-  -- Same resolver the real operations use, so this cannot report a source that
-  -- is not the one in effect.
-  local resolved = credentials.describe(config, buffer_context(target))
-
-  local timeout = get_timeout_ms(opts)
-  local lines = {
-    "Ansible Vault",
-    "",
-    "Buffer: " .. (buffer_name ~= "" and buffer_name or "[No Name]"),
-    "Encrypted: " .. yes_no(is_valid_buf(target) and M.is_buffer_encrypted(target)),
-    "Vault format: " .. (version and ("1." .. version:gsub("^1%.", "")) or "unknown"),
-    "Vault ID label: " .. (label or "none"),
-    "Plaintext mode: " .. (plaintext or "no"),
-    "Modified: " .. yes_no(modified),
-    "Pending operation: " .. (pending or "none"),
-    "",
-    "Executable: " .. table.concat(M.executable_argv(opts), " "),
-    "Credential source: " .. resolved.source,
-    "ansible.cfg: " .. (resolved.cfg_path or "none") .. " (" .. resolved.cfg_source .. ")",
-    "Vault working directory: " .. (resolved.cwd or "inherited"),
-    "Vault labels: " .. describe_vault_labels(config),
-    "Encrypt vault ID: " .. (resolved.encrypt_label or "ansible-vault default"),
-    "Rekey target: " .. (is_nonempty_string(config.rekey_password_file) and "password_file" or is_nonempty_string(
-      config.rekey_vault_id
-    ) and "vault_id" or "command args"),
-    "",
-    "Auto detect: " .. yes_no(config.auto_detect ~= false),
-    "Auto edit: " .. yes_no(config.auto_edit == true),
-    "Timeout: " .. (timeout and string.format("%dms", timeout) or "disabled"),
-    "Success notifications: " .. yes_no(config.notify_success ~= false),
-    "Password cache: " .. credentials.describe_cache(config.password_cache_ttl),
-  }
-
-  local warnings = secure.global_warnings()
-  if #warnings > 0 then
-    table.insert(lines, "")
-    table.insert(lines, "Warnings:")
-    for _, warning in ipairs(warnings) do
-      table.insert(lines, "  " .. warning)
-    end
-  end
-
-  if last_operation then
-    table.insert(lines, "")
-    table.insert(lines, "Last operation: " .. last_operation.operation)
-    table.insert(lines, "Last operation time: " .. os.date("%Y-%m-%d %H:%M:%S", last_operation.time))
-  end
-
-  return lines
-end
-
----Show plugin and current buffer state in a floating window.
----@param buf? integer
----@param opts? table
-function M.info(buf, opts)
-  open_output_window(table.concat(M.get_info(buf, opts), "\n"), " Ansible Vault Info ", "")
-end
-
----Get status string for statusline.
----@param buf? integer
----@return string
-function M.status(buf)
-  local target = normalize_buf(buf)
-  if not M.is_buffer_encrypted(target) then
-    if is_valid_buf(target) and vim.b[target].ansible_vault_plaintext then
-      return "[VAULT:decrypted]"
-    end
-    return ""
-  end
-
-  local label = is_valid_buf(target) and vim.b[target].ansible_vault_label or nil
-  if label then
-    return "[VAULT:" .. label .. "]"
-  end
-  return "[VAULT]"
 end
 
 ---Create a new Ansible Vault file.
@@ -2402,7 +2236,7 @@ function M.create(opts)
   vim.bo[buf].modified = false
 
   enter_plaintext_mode(buf, "file", opts)
-  emit_event("Create", { buf = buf, file = path })
+  emit_event("create", "file", { buf = buf, file = path })
 end
 
 ---Clear the in-memory interactive password cache.
@@ -2475,14 +2309,6 @@ local COMMANDS = {
     end,
   },
   {
-    name = "VaultToggle",
-    desc = "Toggle vault encryption state",
-    complete = "operation",
-    run = function(_, parsed)
-      M.toggle(nil, parsed)
-    end,
-  },
-  {
     name = "VaultEdit",
     desc = "Edit encrypted buffer in a secure scratch buffer",
     complete = "operation",
@@ -2506,14 +2332,6 @@ local COMMANDS = {
     nargs = 0,
     run = function()
       M.clear_password_cache()
-    end,
-  },
-  {
-    name = "VaultInfo",
-    desc = "Show Ansible Vault buffer and configuration info",
-    complete = "rekey",
-    run = function(_, parsed)
-      M.info(nil, parsed)
     end,
   },
   {
@@ -2674,14 +2492,9 @@ function M.setup(opts)
   end
 end
 
-M._parse_command_options = function(args_str, opts)
-  return parse_operation_options(parse_command_args(args_str), opts)
-end
-
 M._private = {
   build_vault_argv = build_vault_argv,
   expand_vault_id = expand_vault_id,
-  extract_vault_from_yaml = extract_vault_from_yaml,
   parse_vault_from_yaml = parse_vault_from_yaml,
   output_to_lines = output_to_lines,
   complete_operation_args = complete_operation_args,

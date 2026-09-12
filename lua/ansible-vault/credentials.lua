@@ -219,18 +219,6 @@ local function cached_password(ttl)
   return nil
 end
 
----@param ttl any
----@return string
-function M.describe_cache(ttl)
-  if not should_cache(ttl) then
-    return "disabled"
-  end
-  if password_cache.password and password_cache.expires_at > os.time() then
-    return string.format("active (%ds remaining)", password_cache.expires_at - os.time())
-  end
-  return "enabled, empty"
-end
-
 --- Planning ---------------------------------------------------------------
 
 ---@class AnsibleVaultPlan
