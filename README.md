@@ -23,8 +23,6 @@ values, built so that decrypted content never reaches the disk.
 - Create a new encrypted file with `:VaultCreate`
 - Encrypt, view and decrypt inline `!vault` values, by selection or under the cursor
 - Rekey encrypted files
-- Diff decrypted vault content against another file or a Git revision
-- Find vault files with Telescope or the built-in `vim.ui.select` picker
 
 **Credentials**
 
@@ -83,8 +81,6 @@ supported.
       auto_edit = false,
       -- Optional: cache interactive passwords in memory for N seconds
       password_cache_ttl = 0,
-      -- Optional: VaultFiles picker backend ("auto", "telescope", "builtin")
-      picker = "auto",
       -- Optional: ansible-vault job timeout in milliseconds (0 disables it)
       timeout_ms = 30000,
       -- Optional: suppress success/info notifications
@@ -143,9 +139,6 @@ require("ansible-vault").setup({
   -- Cache interactive passwords in memory for N seconds.
   -- Set to 0 to prompt for every operation.
   password_cache_ttl = 0,
-
-  -- Picker backend for :VaultFiles: "auto", "telescope", or "builtin"
-  picker = "auto",
 
   -- ansible-vault job timeout in milliseconds. Set 0 to disable.
   timeout_ms = 30000,
@@ -315,7 +308,6 @@ The cache is disabled by default. Clear it manually with
 | `:VaultView` | View decrypted content in floating window |
 | `:VaultEdit` | Edit encrypted file in a scratch buffer, encrypt on save |
 | `:VaultClearPasswordCache` | Clear the in-memory interactive password cache |
-| `:VaultFiles [view\|edit\|rekey]` | Pick a vault file and view, edit, or rekey it |
 | `:VaultInfo [args]` | Show current buffer and plugin configuration diagnostics |
 | `:VaultRekey [args]` | Rekey the current encrypted file |
 | `:VaultToggle` | Toggle between encrypted/decrypted state |
@@ -430,21 +422,6 @@ Run `:VaultToggle` to encrypt a plain buffer or decrypt an encrypted buffer.
 Decrypting this way enters the same plaintext editing mode as `:VaultDecrypt`,
 so `:w` still re-encrypts.
 
-### Pick Vault Files
-
-Run:
-
-```vim
-:VaultFiles view
-:VaultFiles edit
-:VaultFiles rekey
-```
-
-The picker scans files under the current working directory and keeps files whose
-first line is an Ansible Vault header. Telescope is used automatically when it
-is installed; otherwise the plugin falls back to `vim.ui.select`. Set
-`picker = "builtin"` to always use the built-in picker.
-
 ### Inspect State
 
 Run:
@@ -454,7 +431,7 @@ Run:
 ```
 
 The info window shows the current buffer state, credential source, configured
-vault labels, auto-edit/picker settings, timeout, password-cache state, and the
+vault labels, auto-edit settings, timeout, password-cache state, and the
 last successful vault operation.
 
 ### Tune Notifications and Timeouts
@@ -591,7 +568,6 @@ vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decry
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
 vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
-vim.keymap.set("n", "<leader>vf", "<cmd>VaultFiles view<cr>", { desc = "Vault Files" })
 vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>", { desc = "Vault Toggle" })
 vim.keymap.set("v", "<leader>vs", ":VaultEncryptString<cr>", { silent = true, desc = "Vault Encrypt String" })
 vim.keymap.set("v", "<leader>vS", ":VaultDecryptString<cr>", { silent = true, desc = "Vault Decrypt String" })
@@ -655,11 +631,6 @@ vault.edit()
 
 -- Rekey current encrypted file
 vault.rekey()
-
--- Diff decrypted current buffer against a file or Git revision
-
--- Pick vault files from the current working directory
-vault.files({ positionals = { "view" } })
 
 -- Show current buffer and plugin state
 vault.info()
