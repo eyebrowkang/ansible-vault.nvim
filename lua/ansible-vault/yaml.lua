@@ -1,417 +1,537 @@
----YAML and vault-header parsing.
+---Single YAML scalars and vault envelopes.
 ---
----Ansible accepts far more shapes than a naive pattern suggests. All of these are
----valid inline vault values and are handled here:
+---Deliberately not a YAML document parser. It knows exactly two shapes and
+---rejects everything else *before* Ansible is invoked, because a wrong guess here
+---silently encrypts or destroys data the user never selected:
 ---
----    key: !vault |            "key": !vault |          - key: !vault |
----    key: !vault |-           'key': !vault |          - !vault |
+---  * one scalar — `key: value`, `- key: value`, `- value`, or a literal `|`
+---    block with its indented body;
+---  * one vault envelope — `key: !vault |` plus an evenly indented
+---    `$ANSIBLE_VAULT` header and hex payload.
 ---
----plus arbitrary nesting and any ciphertext indentation. The rule that keeps this
----honest: never guess where the ciphertext starts, locate the `$ANSIBLE_VAULT`
----header line and read from there.
+---The pair `parse_plaintext` / `format_plaintext` is the whole reason an inline
+---value survives a decrypt/encrypt round trip byte for byte. A decrypted value is
+---arbitrary bytes: it can be empty, start with a space, contain newlines, or end
+---with none, one or several of them. Rendering it as a literal block with an
+---explicit indentation indicator and an explicit chomping indicator is what makes
+---all of those readable in the buffer *and* recoverable exactly.
 local M = {}
 
----Characters a bare YAML key may not start with, because they introduce
----comments, tags, anchors, aliases, or flow collections.
 local BARE_KEY_REJECT_FIRST = "[#!&*%[%]{}|>%%@`,]"
 
----@class AnsibleVaultHeader
----@field version string Vault format version, for example "1.1" or "1.2"
----@field cipher string Cipher name, in practice always "AES256"
----@field label string|nil Vault ID label, only present in format 1.2 and newer
-
----Parse an `$ANSIBLE_VAULT;1.2;AES256;label` header line.
----Leading whitespace is tolerated so inline blocks parse the same as whole files.
----@param line string|nil
----@return AnsibleVaultHeader|nil
 function M.parse_header(line)
   if type(line) ~= "string" then
     return nil
   end
-
-  local body = line:match("^%s*%$ANSIBLE_VAULT;(.*)$")
+  local body = line:match("^%s*%$ANSIBLE_VAULT;(.-)%s*$")
   if not body then
     return nil
   end
-
-  body = body:gsub("[\r%s]+$", "")
   local parts = vim.split(body, ";", { plain = true })
-  local version, cipher, label = parts[1], parts[2], parts[3]
-
-  if not version or not version:match("^%d[%d%.]*$") then
+  if (#parts ~= 3 and #parts ~= 2) or not parts[1]:match("^%d[%d%.]*$") or not parts[2]:match("^%w+$") then
     return nil
   end
-  if not cipher or not cipher:match("^%w+$") then
-    return nil
-  end
-  if label == "" then
-    label = nil
-  end
-
-  return { version = version, cipher = cipher, label = label }
+  return { version = parts[1], cipher = parts[2], label = parts[3] ~= "" and parts[3] or nil }
 end
 
----@param line string|nil
----@return boolean
 function M.is_vault_header(line)
   return M.parse_header(line) ~= nil
 end
 
----@param line string
----@return integer
 function M.indent_width(line)
   return #(line:match("^([ \t]*)") or "")
 end
 
----Drop a trailing `# comment`, respecting quotes.
----@param line string
----@return string
 function M.strip_comment(line)
-  local quote = nil
-  local escaped = false
-
-  for i = 1, #line do
-    local char = line:sub(i, i)
-
+  local quote, escaped
+  local i = 1
+  while i <= #line do
+    local c = line:sub(i, i)
     if quote then
-      if quote == '"' and char == "\\" and not escaped then
+      if quote == '"' and c == "\\" and not escaped then
         escaped = true
       else
-        if char == quote and not escaped then
-          quote = nil
+        if c == quote and not escaped then
+          if quote == "'" and line:sub(i + 1, i + 1) == "'" then
+            i = i + 1
+          else
+            quote = nil
+          end
         end
         escaped = false
       end
-    elseif char == "'" or char == '"' then
-      quote = char
-    elseif char == "#" and (i == 1 or line:sub(i - 1, i - 1):match("%s")) then
+    elseif c == "'" or c == '"' then
+      quote = c
+    elseif c == "#" and (i == 1 or line:sub(i - 1, i - 1):match("%s")) then
       return line:sub(1, i - 1)
     end
+    i = i + 1
   end
-
   return line
 end
 
----@param value string
----@return string
-function M.unquote(value)
-  local quote = value:match("^(['\"])")
-  if not quote then
+local ESCAPES = {
+  ["0"] = "\0",
+  a = "\7",
+  b = "\8",
+  t = "\t",
+  n = "\n",
+  v = "\11",
+  f = "\12",
+  r = "\r",
+  e = "\27",
+  [" "] = " ",
+  ['"'] = '"',
+  ["/"] = "/",
+  ["\\"] = "\\",
+  N = "\194\133",
+  _ = "\194\160",
+  L = "\226\128\168",
+  P = "\226\128\169",
+}
+
+local function scalar(value)
+  value = M.strip_comment(value):gsub("[ \t]+$", "")
+  local quote = value:sub(1, 1)
+  if quote ~= "'" and quote ~= '"' then
+    if value:match("^[!&*%[%]{}|>@`%%]") or value:match(":%s") or value:match("^%-[ \t]") then
+      return nil, "select one scalar, not a YAML collection, tag, or alias"
+    end
     return value
   end
-
-  local escaped = false
-  for i = 2, #value do
-    local char = value:sub(i, i)
-    if quote == '"' and char == "\\" and not escaped then
-      escaped = true
-    else
-      if char == quote and not escaped then
-        local result = value:sub(2, i - 1)
-        if quote == '"' then
-          result = result:gsub('\\"', '"'):gsub("\\\\", "\\")
-        end
-        return result
+  local out, i = {}, 2
+  while i <= #value do
+    local c = value:sub(i, i)
+    if c == quote then
+      if quote == "'" and value:sub(i + 1, i + 1) == "'" then
+        out[#out + 1] = "'"
+        i = i + 2
+      elseif i == #value then
+        return table.concat(out)
+      else
+        return nil, "unexpected text after quoted scalar"
       end
-      escaped = false
+    elseif quote == '"' and c == "\\" then
+      local escape = value:sub(i + 1, i + 1)
+      local width = ({ x = 2, u = 4, U = 8 })[escape]
+      if width then
+        local hex = value:sub(i + 2, i + 1 + width)
+        local code = #hex == width and hex:match("^%x+$") and tonumber(hex, 16) or nil
+        if not code or code > 0x10ffff or (code >= 0xd800 and code <= 0xdfff) then
+          return nil, "invalid Unicode escape"
+        end
+        out[#out + 1] = vim.fn.nr2char(code)
+        i = i + width + 2
+      elseif ESCAPES[escape] then
+        out[#out + 1] = ESCAPES[escape]
+        i = i + 2
+      else
+        return nil, "invalid quoted scalar escape"
+      end
+    else
+      out[#out + 1] = c
+      i = i + 1
     end
   end
-
-  return value:sub(2)
+  return nil, "unterminated quoted scalar"
 end
 
----@class AnsibleVaultKeyLine
----@field indent string Whitespace before the (optional) list dash
----@field dash string The list item prefix, for example "- ", or ""
----@field key string The key with quotes removed
----@field key_raw string The key exactly as written
----@field rest string Everything after the colon and its trailing spaces
----@field value_col integer Byte offset in the original line where `rest` starts
+function M.unquote(value)
+  return scalar(value)
+end
 
----Split a `key: value` line, tolerating quoted keys and list-item prefixes.
----@param line string
----@return AnsibleVaultKeyLine|nil
+---Keep the raw key and list prefix, not Ansible's re-rendering of the key.
 function M.parse_key_line(line)
   if type(line) ~= "string" then
     return nil
   end
-
   local indent = line:match("^([ \t]*)") or ""
   local remainder = line:sub(#indent + 1)
-
-  local dash = ""
-  local dashed, after_dash = remainder:match("^(%-[ \t]+)(.*)$")
-  if dashed then
-    dash = dashed
-    remainder = after_dash
-  end
-
-  local key_raw, rest = remainder:match('^("[^"]*")[ \t]*:[ \t]*(.*)$')
-  if not key_raw then
-    key_raw, rest = remainder:match("^('[^']*')[ \t]*:[ \t]*(.*)$")
-  end
-  if not key_raw then
-    key_raw, rest = remainder:match("^([^%s][^:]*)[ \t]*:[ \t]*(.*)$")
-    if key_raw and (key_raw:sub(1, 1):match(BARE_KEY_REJECT_FIRST) or key_raw:match("%s#")) then
-      return nil
-    end
-  end
-
-  if not key_raw or key_raw == "" then
-    return nil
-  end
-
-  return {
-    indent = indent,
-    dash = dash,
-    key = M.unquote(key_raw),
-    key_raw = key_raw,
-    rest = rest,
-    value_col = #line - #rest,
-  }
-end
-
----Split a `key: value` line and resolve the scalar value.
----Returns nil for the value when it introduces a block scalar or is absent.
----@param line string
----@return string|nil indent
----@return string|nil key
----@return string|nil value
-function M.extract_key_value(line)
-  local parsed = M.parse_key_line(line)
-  if not parsed then
-    return nil, nil, nil
-  end
-
-  local rest = parsed.rest
-  if rest == "" or rest:match("^!") then
-    return parsed.indent, parsed.key, nil
-  end
-
-  rest = M.strip_comment(rest):gsub("%s+$", "")
-  if rest == "" then
-    return parsed.indent, parsed.key, ""
-  end
-
-  return parsed.indent, parsed.key, M.unquote(rest)
-end
-
----Recognize the `!vault |`, `!vault |-`, `!vault |2+`, `!vault >` … introducers.
----@param rest string|nil
----@return table|nil
-function M.parse_block_scalar(rest)
-  if type(rest) ~= "string" then
-    return nil
-  end
-
-  local after = rest:match("^!vault[ \t]*(.*)$")
-  if not after then
-    return nil
-  end
-
-  after = M.strip_comment(after):gsub("%s+$", "")
-  local style, mods = after:match("^([|>])([%d%-%+]*)$")
-  if not style then
-    return nil
-  end
-
-  return { style = style, mods = mods }
-end
-
----True when the line opens an inline vault block.
----@param line string
----@return boolean
-function M.is_block_opener(line)
-  local parsed = M.parse_key_line(line)
-  if parsed and M.parse_block_scalar(parsed.rest) then
-    return true
-  end
-
-  -- A bare `- !vault |` or `!vault |` with no key.
-  local bare = line:match("^[ \t]*%-?[ \t]*(.*)$")
-  return M.parse_block_scalar(bare) ~= nil
-end
-
----Locate the inline vault block containing `cursor_row`.
----@param lines string[] All buffer lines
----@param cursor_row integer 1-based
----@return integer|nil start_row 1-based
----@return integer|nil end_row 1-based
-function M.find_block(lines, cursor_row)
-  local start_row
-
-  for row = cursor_row, 1, -1 do
-    local line = lines[row] or ""
-    if M.is_block_opener(line) then
-      start_row = row
-      break
-    end
-
-    -- Stop at the first unindented non-blank line above the cursor; the block
-    -- opener always sits at or below that level.
-    if row ~= cursor_row and line:match("%S") and not line:match("^[ \t]") then
-      break
-    end
-  end
-
-  if not start_row then
-    if M.is_vault_header(lines[cursor_row]) then
-      start_row = cursor_row
-    else
-      return nil
-    end
-  end
-
-  local base_indent = M.indent_width(lines[start_row] or "")
-  local end_row = start_row
-
-  for row = start_row + 1, #lines do
-    local line = lines[row] or ""
-    if line:match("%S") then
-      if M.indent_width(line) <= base_indent then
-        break
+  local dash, after = remainder:match("^(%-[ \t]+)(.*)$")
+  dash = dash or ""
+  remainder = after or remainder
+  local quote, escaped, colon
+  local i = 1
+  while i <= #remainder do
+    local c = remainder:sub(i, i)
+    if quote then
+      if quote == '"' and c == "\\" and not escaped then
+        escaped = true
+      else
+        if c == quote and not escaped then
+          if quote == "'" and remainder:sub(i + 1, i + 1) == "'" then
+            i = i + 1
+          else
+            quote = nil
+          end
+        end
+        escaped = false
       end
-      end_row = row
+    elseif i == 1 and (c == "'" or c == '"') then
+      quote = c
+    elseif c == ":" and (i == #remainder or remainder:sub(i + 1, i + 1):match("[ \t]")) then
+      colon = i
+      break
     end
+    i = i + 1
   end
-
-  if cursor_row > end_row then
+  if not colon then
     return nil
   end
-
-  return start_row, end_row
+  local raw = remainder:sub(1, colon - 1):gsub("[ \t]+$", "")
+  if raw == "" or raw:sub(1, 1):match(BARE_KEY_REJECT_FIRST) or raw:match("%s#") then
+    return nil
+  end
+  local key = scalar(raw)
+  if not key then
+    return nil
+  end
+  local rest = remainder:sub(colon + 1):gsub("^[ \t]*", "")
+  return { indent = indent, dash = dash, key = key, key_raw = raw, rest = rest, value_col = #line - #rest }
 end
 
----@class AnsibleVaultBlock
----@field vault_content string Dedented ciphertext, ready for `ansible-vault decrypt`
----@field var_name string|nil YAML key the block belongs to
----@field indent string Indentation of the key line
----@field dash string List item prefix of the key line
----@field header AnsibleVaultHeader|nil Parsed vault header
+local function literal(rest, tagged)
+  if tagged then
+    rest = rest:match("^!vault[ \t]+(.*)$")
+    if not rest then
+      return nil
+    end
+  end
+  rest = M.strip_comment(rest):gsub("%s+$", "")
+  local style, mods = rest:match("^([|>])([1-9%+%-]*)$")
+  if not style or #mods > 2 then
+    return nil
+  end
+  local digit = mods:match("[1-9]")
+  local chomp = mods:match("[%+%-]")
+  if #mods ~= (digit and 1 or 0) + (chomp and 1 or 0) then
+    return nil
+  end
+  return { style = style, mods = mods, indent = tonumber(digit), chomp = chomp }
+end
 
----Parse an inline vault block into its ciphertext and surrounding YAML shape.
----@param content string The block text, starting at the key or ciphertext line
----@return AnsibleVaultBlock|nil
+function M.parse_block_scalar(rest)
+  return type(rest) == "string" and literal(rest, true) or nil
+end
+
+local function shape(line)
+  local key = M.parse_key_line(line)
+  if key then
+    key.var_name = key.key
+    return key
+  end
+  local indent, rest = line:match("^([ \t]*)(.*)$")
+  local dash, after = rest:match("^(%-[ \t]+)(.*)$")
+  return { indent = indent, dash = dash or "", rest = after or rest }
+end
+
+function M.is_block_opener(line)
+  return type(line) == "string" and M.parse_block_scalar(shape(line).rest) ~= nil
+end
+
+---Validate a complete vault envelope, returning its lines without the trailing
+---blank one.
+---
+---Used before a child process's output is allowed to replace data on disk or in a
+---buffer: `ansible-vault` exiting 0 is not by itself proof that it produced
+---ciphertext. A header line alone is not an envelope, and every payload line must
+---be an even-length run of hex digits.
+---@param content string
+---@return string[]|nil
+function M.vault_lines(content)
+  local lines = vim.split(content, "\n", { plain = true })
+  if lines[#lines] == "" then
+    table.remove(lines)
+  end
+  for i, line in ipairs(lines) do
+    lines[i] = line:gsub("\r$", "")
+  end
+  if #lines < 2 or not M.parse_header(lines[1]) then
+    return nil
+  end
+  for i = 2, #lines do
+    if not lines[i]:match("^%x+$") or #lines[i] % 2 ~= 0 then
+      return nil
+    end
+  end
+  return lines
+end
+
+---Parse one `key: !vault |` block, keeping the key exactly as it was written.
+---@param content string
+---@return table|nil parsed `indent`, `dash`, `key_raw`, `var_name`, `vault_content`, `header`
 function M.parse_block(content)
   if type(content) ~= "string" then
     return nil
   end
-
   local lines = vim.split(content, "\n", { plain = true })
+  if lines[#lines] == "" then
+    table.remove(lines)
+  end
+  for i, line in ipairs(lines) do
+    lines[i] = line:gsub("\r$", "")
+  end
+  local parsed = shape(lines[1] or "")
+  if not M.parse_block_scalar(parsed.rest) or #lines < 3 then
+    return nil
+  end
+  local base = #parsed.indent + #parsed.dash
+  local width = M.indent_width(lines[2])
+  if width <= base or not M.is_vault_header(lines[2]) then
+    return nil
+  end
+  local cipher = {}
+  for i = 2, #lines do
+    if M.indent_width(lines[i]) ~= width then
+      return nil
+    end
+    cipher[#cipher + 1] = lines[i]:sub(width + 1)
+  end
+  if not M.vault_lines(table.concat(cipher, "\n")) then
+    return nil
+  end
+  parsed.vault_content = table.concat(cipher, "\n") .. "\n"
+  parsed.header = M.parse_header(cipher[1])
+  return parsed
+end
+
+---Locate the single `!vault` block containing `cursor_row`, if there is one.
+---
+---Scans upwards for the nearest block opener and then forwards over the evenly
+---indented payload. A cursor past the end of that payload is not "in" the block,
+---so an unrelated line below one does not resolve to it.
+---@param lines string[]
+---@param cursor_row integer 1-based
+---@return integer|nil start_row, integer|nil end_row both 1-based, inclusive
+function M.find_block(lines, cursor_row)
+  for start = cursor_row, 1, -1 do
+    if M.is_block_opener(lines[start]) then
+      local width = M.indent_width(lines[start + 1] or "")
+      local last = start + 1
+      if not M.is_vault_header(lines[last]) then
+        return nil
+      end
+      while
+        lines[last + 1]
+        and M.indent_width(lines[last + 1]) == width
+        and lines[last + 1]:sub(width + 1):match("^%x+$")
+      do
+        last = last + 1
+      end
+      if cursor_row > last then
+        return nil
+      end
+      local block = {}
+      for i = start, last do
+        block[#block + 1] = lines[i]
+      end
+      if M.parse_block(table.concat(block, "\n")) then
+        return start, last
+      end
+      return nil
+    end
+  end
+end
+
+---Recover the exact bytes a selected scalar stands for.
+---
+---The inverse of `format_plaintext`, and the only place that knows how a literal
+---block's indentation indicator and chomping indicator map back onto trailing
+---newlines. Anything it cannot read unambiguously is an error rather than a
+---guess, so a selection that grabbed a neighbouring line is refused before
+---`ansible-vault` ever runs.
+---
+---`last_eol` says whether a newline follows the final selected line in the
+---buffer; without it a value ending in a newline could not be told apart from one
+---that does not at the end of a file.
+---@param lines string[]
+---@param last_eol boolean
+---@return table|nil parsed, string|nil err
+function M.parse_plaintext(lines, last_eol)
+  if #lines == 0 then
+    return nil, "empty selection"
+  end
+  local parsed = shape(lines[1])
+  if parsed.indent:find("\t") or parsed.dash:find("\t") then
+    return nil, "tabs in YAML indentation are not supported"
+  end
+  local block = literal(parsed.rest, false)
+  if not block then
+    if #lines ~= 1 then
+      return nil, "select exactly one scalar, including its literal block body"
+    end
+    local value, err = scalar(parsed.rest)
+    if value == nil then
+      return nil, err
+    end
+    parsed.content = value
+    -- Anything below this line indented past the key belongs to this value:
+    -- a nested mapping, a list, or a plain scalar continued on the next line.
+    -- `vars:` with children under it is *not* an empty value to encrypt.
+    parsed.continues_at = #parsed.indent + #parsed.dash + 1
+    return parsed
+  end
+  if block.style ~= "|" then
+    return nil, "folded YAML scalars are ambiguous; use a literal | scalar"
+  end
+  local base = #parsed.indent + #parsed.dash
+  local width = block.indent and base + block.indent or nil
+  if not width then
+    for i = 2, #lines do
+      if lines[i]:match("%S") then
+        width = M.indent_width(lines[i])
+        break
+      end
+    end
+    width = width or base + 2
+  end
+  if width <= base then
+    return nil, "literal body must be indented under its value"
+  end
+  local body = {}
+  for i = 2, #lines do
+    local line = lines[i]
+    if line:match("%S") and (M.indent_width(line) < width or line:sub(1, width):find("\t")) then
+      return nil, "selection includes text outside the literal scalar"
+    end
+    body[#body + 1] = #line >= width and line:sub(width + 1) or ""
+  end
+  local value = table.concat(body, "\n") .. (#body > 0 and last_eol and "\n" or "")
+  if block.chomp == "-" then
+    value = value:gsub("\n+$", "")
+  elseif block.chomp ~= "+" then
+    local had_eol = value:sub(-1) == "\n"
+    value = value:gsub("\n+$", "")
+    if value ~= "" and had_eol then
+      value = value .. "\n"
+    end
+  end
+  parsed.content = value
+  -- A line below the selection indented this far is more of the same literal
+  -- block, which means the selection cut the value in half.
+  parsed.continues_at = width
+  return parsed
+end
+
+function M.needs_quoting(value)
+  return value == ""
+    or value:find("[%c]") ~= nil
+    or value:match("^[%s%d%[%{%]%}'\"&*!|>%%@`~%+%-%.]") ~= nil
+    or value:match("[#:]%s?") ~= nil
+    or value:match("%s$") ~= nil
+    or ({
+        yes = true,
+        no = true,
+        ["true"] = true,
+        ["false"] = true,
+        null = true,
+        on = true,
+        off = true,
+        y = true,
+        n = true,
+      })[value:lower()]
+      == true
+end
+
+function M.quote_value(value)
+  return M.needs_quoting(value) and vim.json.encode(value) or value
+end
+
+local function prefix(parsed)
+  return (parsed.indent or "") .. (parsed.dash or "") .. (parsed.key_raw and parsed.key_raw .. ": " or "")
+end
+
+---Render arbitrary bytes as the value of `parsed`'s key.
+---
+---A single line becomes a quoted scalar; anything with a newline becomes a
+---literal block with an explicit `2` indentation indicator, so a value whose
+---first line starts with a space is still unambiguous. The chomping indicator
+---carries the trailing newline: `+` keeps every one of them, `-` says there was
+---none. Bytes that no literal block can hold (carriage returns, control
+---characters) fall back to a quoted scalar.
+---@param value string
+---@param parsed table From `parse_plaintext` or `parse_block`
+---@param last_eol boolean Whether a newline will follow the last emitted line
+---@return string[]
+function M.format_plaintext(value, parsed, last_eol)
+  if not value:find("\n", 1, true) or value:find("\r", 1, true) or value:find("[%z\1-\8\11\12\14-\31]") then
+    return { prefix(parsed) .. M.quote_value(value) }
+  end
+  local trailing = value:sub(-1) == "\n"
+  local body = vim.split(value, "\n", { plain = true })
+  if trailing then
+    table.remove(body)
+  end
+  local lines = { prefix(parsed) .. (trailing and "|2+" or "|2-") }
+  local indent = (parsed.indent or "") .. string.rep(" ", #(parsed.dash or "") + 2)
+  for _, line in ipairs(body) do
+    lines[#lines + 1] = indent .. line
+  end
+  if trailing and not last_eol then
+    lines[#lines + 1] = indent
+  end
+  return lines
+end
+
+---Pull the envelope out of `ansible-vault encrypt_string` output.
+---
+---Only the ciphertext is taken from the child. The key it echoes back is its own
+---re-rendering of `--stdin-name`, which is not always the YAML the user wrote, so
+---this locates the `$ANSIBLE_VAULT` header and reads the evenly indented payload
+---from there rather than trying to parse that first line.
+---@param output string
+---@return string[]|nil
+function M.extract_envelope(output)
+  if type(output) ~= "string" then
+    return nil
+  end
+  local lines = vim.split(output, "\n", { plain = true })
   for i, line in ipairs(lines) do
     lines[i] = line:gsub("\r$", "")
   end
 
-  local var_name, indent, dash = nil, "", ""
-  local first = lines[1] or ""
-
-  local key_line = M.parse_key_line(first)
-  if key_line and M.parse_block_scalar(key_line.rest) then
-    var_name = key_line.key
-    indent = key_line.indent
-    dash = key_line.dash
-  else
-    local bare_indent, bare = first:match("^([ \t]*)(.*)$")
-    local bare_dash, after = bare:match("^(%-[ \t]+)(.*)$")
-    if bare_dash and M.parse_block_scalar(after) then
-      indent = bare_indent
-      dash = bare_dash
-    elseif M.parse_block_scalar(bare) then
-      indent = bare_indent
-    end
-  end
-
-  -- Never guess: find the line that actually carries the vault header.
-  local first_cipher
+  local first
   for i, line in ipairs(lines) do
     if M.is_vault_header(line) then
-      first_cipher = i
+      first = i
       break
     end
   end
-
-  if not first_cipher then
+  if not first then
     return nil
   end
 
-  local cipher_lines = {}
-  for i = first_cipher, #lines do
-    if lines[i]:match("%S") then
-      table.insert(cipher_lines, lines[i])
+  local width = M.indent_width(lines[first])
+  local envelope = {}
+  for i = first, #lines do
+    if lines[i] == "" then
+      break
     end
-  end
-
-  if #cipher_lines == 0 then
-    return nil
-  end
-
-  local min_indent = math.huge
-  for _, line in ipairs(cipher_lines) do
-    min_indent = math.min(min_indent, M.indent_width(line))
-  end
-
-  if min_indent < math.huge and min_indent > 0 then
-    for i, line in ipairs(cipher_lines) do
-      cipher_lines[i] = line:sub(min_indent + 1)
+    if M.indent_width(lines[i]) ~= width then
+      return nil
     end
+    envelope[#envelope + 1] = lines[i]:sub(width + 1)
   end
 
-  return {
-    vault_content = table.concat(cipher_lines, "\n"),
-    var_name = var_name,
-    indent = indent,
-    dash = dash,
-    header = M.parse_header(cipher_lines[1]),
-  }
+  return M.vault_lines(table.concat(envelope, "\n"))
 end
 
-local BOOLEAN_WORDS = {
-  yes = true,
-  no = true,
-  ["true"] = true,
-  ["false"] = true,
-  null = true,
-  on = true,
-  off = true,
-  y = true,
-  n = true,
-  Y = true,
-  N = true,
-  YES = true,
-  NO = true,
-  TRUE = true,
-  FALSE = true,
-  NULL = true,
-  ON = true,
-  OFF = true,
-}
-
----@param value string
----@return boolean
-function M.needs_quoting(value)
-  if value == "" then
-    return true
+---Render an encrypted scalar under `parsed`'s original key, indentation and list
+---dash. The prefix comes from the buffer, never from the child's output.
+---@param output string
+---@param parsed table
+---@return string[]|nil lines, string|nil err
+function M.format_vault(output, parsed)
+  local envelope = M.extract_envelope(output)
+  if not envelope then
+    return nil, "ansible-vault returned an invalid encrypted scalar"
   end
-  if value:sub(1, 1):match("[%[%{%]%}'\"&*!|>%%@`~]") then
-    return true
+  local lines = { prefix(parsed) .. "!vault |" }
+  local indent = (parsed.indent or "") .. string.rep(" ", #(parsed.dash or "") + 2)
+  for _, line in ipairs(envelope) do
+    lines[#lines + 1] = indent .. line
   end
-  if value:match("#") or value:match(": ") or value:match("%s$") or value:match("^%s") then
-    return true
-  end
-  if BOOLEAN_WORDS[value] then
-    return true
-  end
-  return false
-end
-
----@param value string
----@return string
-function M.quote_value(value)
-  if not M.needs_quoting(value) then
-    return value
-  end
-  local escaped = value:gsub("\\", "\\\\"):gsub('"', '\\"')
-  return '"' .. escaped .. '"'
+  return lines
 end
 
 return M

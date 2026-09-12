@@ -1,404 +1,370 @@
----Plaintext mode: the single point where decrypted content can reach the disk.
+---Managed buffers: every buffer this plugin lets hold decrypted content.
 ---
----Once a buffer holds plaintext, `'buftype'` is `acwrite` and one `BufWriteCmd`
----owns every write. That is what makes `:w`, `:wq`, `:x` and even
----`:w {other-file}` all encrypt first, and what stops Neovim from writing a backup
----or an undo file along the way. There is deliberately no second path out.
+---A managed buffer has 'swapfile' and 'undofile' off and a 'buftype' of
+---`acwrite`, which means Neovim runs no write path of its own: no backup file, no
+---undo file, and exactly one `BufWriteCmd` deciding what reaches the disk. Three
+---different things can be behind that one command, and keeping them apart is the
+---point of this module:
 ---
----Two shapes exist. "file" means the whole buffer is plaintext, so a write
----encrypts all of it. "inline" means the buffer is ordinary YAML with some
----`!vault` values decrypted in place: each is tracked by an extmark, a write folds
----exactly those back into `!vault` blocks, and the surrounding lines are written
----unchanged. The second is what makes a partly-encrypted file work at all.
+---  * `:VaultDecrypt` leaves *real plaintext* in the buffer, and `:w` saves that
+---    plaintext. Decrypting and then saving is how you decrypt a file; it does not
+---    quietly re-encrypt, ask for a password again, or confirm anything.
+---  * `:VaultCreate` and `:VaultEdit` put plaintext in a buffer whose writes
+---    encrypt. Those writers live in `edit.lua`; they register here so the
+---    hardening, the teardown and the "did this write actually land" rules are
+---    shared rather than reimplemented per command.
 ---
----The extmark is left-gravity, so deleting a decrypted value collapses its region
----onto the following line. The fold-back therefore checks the key recorded at
----decrypt time still matches before replacing anything; otherwise it would
----encrypt a value the user never decrypted.
+---Teardown is ordering-sensitive. Reloading a buffer fires `BufUnload` *while the
+---plaintext is still in it* and only then `BufReadPre`/`BufReadPost`, so restoring
+---'swapfile' at either of the first two points would write the secret to a swap
+---file on the way out. The session is therefore dropped immediately — no further
+---write can be hijacked — but the options are put back from a one-shot
+---`BufReadPost`, after the new contents have replaced the plaintext. A read that
+---fails never reaches that point, and the buffer stays protected.
 local M = {}
 
 local buffer = require("ansible-vault.buffer")
-local cli = require("ansible-vault.cli")
 local config = require("ansible-vault.config")
 local fs = require("ansible-vault.fs")
-local op = require("ansible-vault.op")
 local secure = require("ansible-vault.secure")
-local yaml = require("ansible-vault.yaml")
 
 local notify = config.notify
-local is_nonempty_string = config.is_nonempty_string
-local NAMESPACE = vim.api.nvim_create_namespace("ansible-vault")
 
-local write_plaintext_buffer
+---@class AnsibleVaultSession
+---@field buf integer The managed buffer
+---@field kind "plaintext"|"create"|"file"|"inline"
+---@field write fun(session: AnsibleVaultSession, path: string, bang: boolean): boolean, string|nil
+---@field target? string Path this session writes to, for the fixed-target kinds
+---@field signature? table Baseline for detecting outside changes to `target`
+---@field epoch integer Bumped by every write and by teardown; late callbacks compare it
+---@field writing boolean
+---@field autocmds integer[]
 
---- Plaintext editing mode -------------------------------------------------
----
----Once a buffer holds decrypted content, every write has to go back through this
----plugin. Setting 'buftype' to "acwrite" is what guarantees that: Neovim then
----routes `:w`, `:w {file}` and `:x` alike to our BufWriteCmd and never runs its
----own write path, so no plaintext backup file is made, no undo file is written,
----and a reflexive `:w` cannot put secrets on disk.
----
----Two shapes exist. "file" means the whole buffer is plaintext, so `:w` encrypts
----all of it and the buffer stays decrypted for further editing. "inline" means
----only the tracked `!vault` values were decrypted, so `:w` folds them back into
----the buffer and the file is written as ordinary YAML.
+---@type table<integer, AnsibleVaultSession>
+local sessions = {}
 
----Which kind of plaintext a buffer is currently holding, if any.
----@param buf integer
----@return "file"|"inline"|nil
-function M.mode(buf)
-  if not buffer.is_valid(buf) then
+---@param buf? integer
+---@return AnsibleVaultSession|nil
+function M.get(buf)
+  if type(buf) ~= "number" then
     return nil
   end
-  return vim.b[buf].ansible_vault_plaintext
+  return sessions[buf]
 end
 
----@param buf integer
----@param mode "file"|"inline"
----@param opts? table
-function M.enter(buf, mode, opts)
-  if not buffer.is_valid(buf) then
-    return
-  end
-
-  secure.protect(buf)
-
-  if M.mode(buf) then
-    return
-  end
-
-  -- Unnamed buffers get the same treatment: `:w some-file` on one would
-  -- otherwise write the plaintext straight out. BufWriteCmd receives the
-  -- requested path, so it encrypts to wherever the user asked.
-  vim.b[buf].ansible_vault_plaintext = mode
-  vim.bo[buf].buftype = "acwrite"
-
-  vim.b[buf].ansible_vault_write_autocmd = vim.api.nvim_create_autocmd("BufWriteCmd", {
-    buffer = buf,
-    desc = "Encrypt Ansible Vault content before writing",
-    callback = function(event)
-      write_plaintext_buffer(event.buf, event.file, opts)
-    end,
-  })
-
-  notify(
-    mode == "file" and "Buffer is decrypted. :w re-encrypts before writing."
-      or "Value is decrypted. :w restores the vault block before writing.",
-    vim.log.levels.INFO
-  )
+---Whether a buffer is one this plugin manages, and of which kind.
+---@param buf? integer
+---@return "plaintext"|"create"|"file"|"inline"|nil
+function M.kind(buf)
+  local session = M.get(buf)
+  return session and session.kind or nil
 end
 
----Return the buffer to its normal, ciphertext-backed behaviour.
----@param buf integer
-function M.leave(buf)
-  if not buffer.is_valid(buf) then
-    return
-  end
-
-  vim.b[buf].ansible_vault_plaintext = nil
-  vim.b[buf].ansible_vault_inline = nil
-  pcall(vim.api.nvim_buf_clear_namespace, buf, NAMESPACE, 0, -1)
-
-  -- Remove only our own handler; other plugins may have their own BufWriteCmd
-  -- registered against this buffer.
-  local autocmd_id = vim.b[buf].ansible_vault_write_autocmd
-  if autocmd_id then
-    pcall(vim.api.nvim_del_autocmd, autocmd_id)
-    vim.b[buf].ansible_vault_write_autocmd = nil
-  end
-
-  secure.restore(buf)
+---Whether a buffer holds decrypted content that `:w` would save as plaintext.
+---@param buf? integer
+---@return boolean
+function M.holds_plaintext(buf)
+  return M.kind(buf) == "plaintext"
 end
 
---- Inline region tracking -------------------------------------------------
+---Stop managing a buffer.
 ---
----After decrypting one inline value, the buffer holds that plaintext inside an
----otherwise ordinary YAML file. An extmark follows that region through
----subsequent edits so `:w` can fold exactly it back into a `!vault` block.
-
+---`restore` says when normal write behaviour may come back:
+---  * `"now"`     — the caller has proved no plaintext is left in the buffer;
+---  * `"on_read"` — after the buffer's contents have been replaced by a read;
+---  * `"never"`   — the buffer is going away.
 ---@param buf integer
----@param start_row integer 0-based
----@param end_row integer 0-based
----@param parsed table
-function M.track_region(buf, start_row, end_row, parsed)
-  local end_line = vim.api.nvim_buf_get_lines(buf, end_row, end_row + 1, false)[1] or ""
-  local id = vim.api.nvim_buf_set_extmark(buf, NAMESPACE, start_row, 0, {
-    end_row = end_row,
-    end_col = #end_line,
-    right_gravity = false,
-    end_right_gravity = true,
-  })
-
-  local regions = vim.b[buf].ansible_vault_inline or {}
-  table.insert(regions, {
-    id = id,
-    name = parsed.var_name,
-    indent = parsed.indent or "",
-    dash = parsed.dash or "",
-    label = parsed.header and parsed.header.label or nil,
-  })
-  vim.b[buf].ansible_vault_inline = regions
-end
-
----Recover the scalar the user currently sees in a tracked region.
----@param lines string[]
----@param region table
----@return string name
----@return string content
-local function inline_region_value(lines, region)
-  if #lines == 1 then
-    local _, key, value = yaml.extract_key_value(lines[1])
-    return key or region.name, value or lines[1]
-  end
-
-  -- A multi-line value was written back as `key: |` plus an indented body.
-  local min_indent = math.huge
-  for i = 2, #lines do
-    if lines[i]:match("%S") then
-      min_indent = math.min(min_indent, yaml.indent_width(lines[i]))
-    end
-  end
-
-  local body = {}
-  for i = 2, #lines do
-    table.insert(body, min_indent < math.huge and lines[i]:sub(min_indent + 1) or lines[i])
-  end
-
-  local key_line = yaml.parse_key_line(lines[1])
-  return key_line and key_line.key or region.name, table.concat(body, "\n")
-end
-
----Re-encrypt every tracked inline region back into the buffer.
----@param buf integer
----@param opts? table
----@param callback fun(ok: boolean)
-function M.restore_regions(buf, opts, callback)
-  local regions = vim.b[buf].ansible_vault_inline or {}
-  if #regions == 0 then
-    callback(true)
+---@param restore? "now"|"on_read"|"never"
+function M.release(buf, restore)
+  local session = sessions[buf]
+  if not session then
     return
   end
 
-  local resolved = {}
-  for _, region in ipairs(regions) do
-    local ok, mark = pcall(vim.api.nvim_buf_get_extmark_by_id, buf, NAMESPACE, region.id, { details = true })
-    if ok and mark and mark[1] and mark[3] then
-      table.insert(resolved, {
-        region = region,
-        start_row = mark[1],
-        end_row = math.max(mark[1], mark[3].end_row or mark[1]),
-      })
-    end
+  sessions[buf] = nil
+  -- Anything still in flight for this session is now stale: it must not write,
+  -- clear 'modified', or release a lock a later operation took.
+  session.epoch = session.epoch + 1
+
+  for _, id in ipairs(session.autocmds or {}) do
+    pcall(vim.api.nvim_del_autocmd, id)
+  end
+  session.autocmds = {}
+
+  if session.on_release then
+    pcall(session.on_release, session)
   end
 
-  -- Bottom-up, so an earlier replacement cannot shift a later one.
-  table.sort(resolved, function(a, b)
-    return a.start_row > b.start_row
-  end)
+  if not buffer.is_valid(buf) or restore == "never" then
+    return
+  end
 
-  local context = buffer.capture_context(buf)
-
-  op.credentials(function(creds)
-    if not creds then
-      callback(false)
-      return
-    end
-
-    local index = 0
-    local function step()
-      index = index + 1
-      if index > #resolved then
-        buffer.run_cleanup(creds.cleanup)
-        callback(true)
-        return
-      end
-
-      local entry = resolved[index]
-      local region = entry.region
-      local lines = vim.api.nvim_buf_get_lines(buf, entry.start_row, entry.end_row + 1, false)
-      local name, content = inline_region_value(lines, region)
-
-      -- The extmark is left-gravity, so deleting the decrypted lines collapses it
-      -- onto whatever follows. Without this check the next value down would be
-      -- read as the region's content and replaced with a !vault block — encrypting
-      -- something the user never decrypted. Skip instead, and say so.
-      if #lines == 0 or (region.name and name ~= region.name) then
-        vim.notify(
-          string.format(
-            "The decrypted value for '%s' is no longer there; it was not re-encrypted",
-            region.name or "an inline value"
-          ),
-          vim.log.levels.WARN
-        )
-        step()
-        return
-      end
-
-      local args = op.with_encrypt_vault_id(
-        creds.args,
-        opts,
-        creds,
-        vim.tbl_extend("force", context, { header_label = region.label or context.header_label })
-      )
-      table.insert(args, "--stdin-name")
-      table.insert(args, name or "encrypted_string")
-
-      cli.run("encrypt_string", content, args, function(success, output)
-        if not success then
-          buffer.run_cleanup(creds.cleanup)
-          vim.notify("Failed to re-encrypt " .. (name or "value") .. ": " .. output, vim.log.levels.ERROR)
-          callback(false)
-          return
-        end
-
-        local out_lines = cli.output_to_lines(output)
-        while #out_lines > 0 and out_lines[#out_lines] == "" do
-          table.remove(out_lines, #out_lines)
-        end
-
-        local indent = region.indent or ""
-        local dash = region.dash or ""
-        local continuation = indent .. string.rep(" ", #dash)
-        for i, line in ipairs(out_lines) do
-          out_lines[i] = (i == 1 and indent .. dash or continuation) .. line
-        end
-
-        local ok = pcall(vim.api.nvim_buf_set_lines, buf, entry.start_row, entry.end_row + 1, false, out_lines)
-        if not ok then
-          buffer.run_cleanup(creds.cleanup)
-          vim.notify("Failed to update buffer while re-encrypting", vim.log.levels.ERROR)
-          callback(false)
-          return
-        end
-
-        step()
-      end, opts, creds)
-    end
-
-    step()
-  end, opts, context)
+  if restore == "now" then
+    -- No read replaced this text, so persistent undo stays off: the change that
+    -- made the buffer ciphertext again could otherwise write the plaintext it
+    -- replaced into the undo file. See `secure.restore`.
+    secure.restore(buf, false)
+  elseif restore ~= nil then
+    -- `BufNewFile` as well as `BufReadPost`: re-editing a file that has since
+    -- been deleted fires only the former, and the buffer is just as empty either
+    -- way. A read that fails outright fires neither, and that buffer keeps its
+    -- hardened options deliberately — `:w` then failing with E676 is the correct
+    -- end of a write path whose owner is gone.
+    pcall(vim.api.nvim_create_autocmd, { "BufReadPost", "BufNewFile" }, {
+      buffer = buf,
+      once = true,
+      desc = "Restore normal write behaviour once the plaintext is gone",
+      callback = function()
+        -- A read replaces the *contents*, but it is itself one undoable change,
+        -- so the plaintext it replaced is still one `:undo` away. Persistent undo
+        -- comes back only if the history *actually* went away — a buffer someone
+        -- else made 'nomodifiable' cannot be cleared, and then the safe default is
+        -- to leave 'undofile' off rather than assume the cleanup happened.
+        secure.restore(buf, secure.clear_undo_history(buf))
+      end,
+    })
+  end
 end
 
----Write a buffer that is currently holding decrypted content.
+---Run one write for a session, turning its result into the success or failure the
+---`:w` that triggered it needs to see.
 ---
----Reached only through the BufWriteCmd installed by `enter_plaintext_mode`, so
----this is the single place plaintext can turn into bytes on disk -- and it never
----writes those bytes, only the ciphertext `ansible-vault` returns.
----@param buf integer
----@param target_path string
----@param opts? table
-write_plaintext_buffer = function(buf, target_path, opts)
-  if not buffer.is_valid(buf) then
-    return
+---A `BufWriteCmd` that only notifies is reported as a *successful* write: `:wq`
+---would then quit with the buffer's changes unsaved. Failure therefore leaves
+---'modified' set and raises, which is what makes `:wq` and `:x` stay put.
+---@param session AnsibleVaultSession
+---@param event table
+local function run_write(session, event)
+  local buf = event.buf
+
+  if sessions[buf] ~= session then
+    error("this buffer is no longer managed by ansible-vault.nvim; reopen it with :VaultEdit", 0)
   end
 
-  if vim.b[buf].ansible_vault_write_pending then
-    vim.notify("Vault write already in progress", vim.log.levels.WARN)
-    return
+  if session.writing then
+    error("a vault write is already running for this buffer", 0)
   end
 
-  local path = target_path
-  if not is_nonempty_string(path) then
+  local path = event.file
+  if not config.is_nonempty_string(path) then
     path = vim.api.nvim_buf_get_name(buf)
   end
-  if not is_nonempty_string(path) then
-    vim.notify("Cannot write a vault buffer with no file name", vim.log.levels.ERROR)
-    return
+  if not config.is_nonempty_string(path) then
+    error("cannot write a vault buffer with no file name", 0)
   end
 
-  local mode = vim.b[buf].ansible_vault_plaintext
-  vim.b[buf].ansible_vault_write_pending = true
+  session.writing = true
+  local called, ok, err = pcall(session.write, session, path, vim.v.cmdbang == 1)
+  session.writing = false
 
-  local done = false
+  if not called then
+    error("vault write failed: " .. tostring(ok), 0)
+  end
+  if not ok then
+    error(err or "vault write failed", 0)
+  end
+end
 
-  local function finish(ok)
-    done = true
+---Take ownership of a buffer that is about to hold, or already holds, plaintext.
+---
+---Hardening happens here rather than in the caller's success path, because
+---resetting 'swapfile' deletes an existing swap file and must precede the
+---plaintext, never follow it.
+---
+---Returns `nil` if the buffer could not actually be secured, and leaves nothing
+---half-installed behind. Every step is checked rather than assumed: a buffer that
+---is treated as managed while its writes still go through Neovim's own path is
+---the one failure that puts plaintext on disk, so "we asked for it" is not good
+---enough — the options are read back to confirm they took.
+---@param session AnsibleVaultSession
+---@return AnsibleVaultSession|nil
+function M.manage(session)
+  local buf = session.buf
+  M.release(buf, "never")
+
+  secure.protect(buf)
+  pcall(function()
+    vim.bo[buf].buftype = "acwrite"
+  end)
+
+  session.epoch = session.epoch or 0
+  session.writing = false
+  session.autocmds = {}
+
+  ---@param ok boolean
+  ---@param id any
+  ---@return boolean
+  local function installed(ok, id)
+    if ok then
+      table.insert(session.autocmds, id)
+    end
+    return ok
+  end
+
+  local secured = installed(pcall(vim.api.nvim_create_autocmd, "BufWriteCmd", {
+    buffer = buf,
+    desc = "Write an Ansible Vault buffer through the plugin",
+    callback = function(event)
+      run_write(session, event)
+    end,
+  }))
+    and installed(
+      pcall(
+        secure.refuse_partial_writes,
+        buf,
+        "a partial or appending write would put this buffer's plaintext on disk "
+          .. "unencrypted, bypassing the vault writer; write the whole buffer instead"
+      )
+    )
+    and installed(pcall(vim.api.nvim_create_autocmd, { "BufUnload", "BufWipeout", "BufReadPre" }, {
+      buffer = buf,
+      desc = "Drop the Ansible Vault session for a buffer being replaced",
+      callback = function()
+        -- BufUnload fires while the plaintext is still in the buffer, so the
+        -- options stay locked down until a read has replaced it.
+        M.release(buf, "on_read")
+      end,
+    }))
+    and vim.bo[buf].buftype == "acwrite"
+    and vim.bo[buf].swapfile == false
+    and vim.bo[buf].undofile == false
+
+  if not secured then
+    for _, id in ipairs(session.autocmds) do
+      pcall(vim.api.nvim_del_autocmd, id)
+    end
+    session.autocmds = {}
+    -- Deliberately *not* `secure.restore`: this buffer may already hold
+    -- plaintext, and putting 'swapfile' back would write that secret to a swap
+    -- file immediately, without the user ever asking for a write. Failing to
+    -- secure a buffer is no reason to unsecure it.
+    return nil
+  end
+
+  sessions[buf] = session
+
+  return session
+end
+
+---Whether a write to `path` is this buffer saving itself, as opposed to an
+---explicit `:w {other-file}`.
+---
+---A buffer with no name has nothing for a write to be "other" than, so `:w
+---{path}` on one *is* that buffer being saved — which is what Neovim does for an
+---ordinary buffer, where 'cpoptions' contains `F` by default. It does not do it
+---for an `acwrite` buffer, because the handler owns the write, so the name is
+---adopted here instead. Without that, the first `:w {path}` would leave the
+---buffer looking unsaved and the second would not.
+---@param session AnsibleVaultSession
+---@param path string
+---@return boolean
+local function writes_itself(session, path)
+  -- `:saveas` renames the buffer and *then* writes, so a write to the buffer's
+  -- current name is this buffer saving itself even when that is not the file it
+  -- was decrypted from. Without this the buffer could never be saved again: the
+  -- write would be taken for a copy, 'modified' would stay set, and `:wq` would
+  -- refuse to quit for the rest of the session.
+  local name = vim.api.nvim_buf_get_name(session.buf)
+  if name ~= "" then
+    return path == name or path == session.target
+  end
+
+  -- Unnamed: there is nothing for the write to be "other" than.
+  return session.target == nil or path == session.target
+end
+
+---Save the plaintext a `:VaultDecrypt`ed buffer is holding.
+---
+---This is the one writer that puts decrypted bytes on disk, and it does so
+---because the user asked for exactly that. It still goes through `atomic_write`
+---so a failed write cannot truncate the file it replaces.
+---@param session AnsibleVaultSession
+---@param path string
+---@param bang boolean
+---@return boolean ok
+---@return string|nil err
+local function write_plaintext(session, path, bang)
+  local buf = session.buf
+  local own = writes_itself(session, path)
+
+  if own and path == session.target then
+    if not bang and not fs.same_signature(session.signature, fs.signature(path)) then
+      return false, path .. " changed on disk since it was decrypted; use :w! to overwrite it anyway"
+    end
+  elseif fs.signature(path) and not bang then
+    return false, path .. " already exists; use :w! to overwrite it"
+  end
+
+  local ok, err = fs.atomic_write(path, buffer.bytes(buf))
+  if not ok then
+    return false, "failed to write " .. path .. ": " .. tostring(err)
+  end
+
+  if own then
+    if buffer.is_valid(buf) and vim.api.nvim_buf_get_name(buf) == "" then
+      pcall(vim.api.nvim_buf_set_name, buf, path)
+    end
+    session.target = path
+    session.signature = fs.signature(path)
+    -- Only the buffer's own file being saved means the buffer is saved. `:w
+    -- {other}` copies the text elsewhere and leaves this buffer unsaved.
     if buffer.is_valid(buf) then
-      vim.b[buf].ansible_vault_write_pending = nil
-      if ok then
-        vim.bo[buf].modified = false
-      end
+      vim.bo[buf].modified = false
     end
   end
 
-  -- `:w` has to have finished by the time it returns, or `:wq` would try to quit
-  -- while the encryption is still in flight. The event loop keeps running, so
-  -- this waits without freezing the job that does the work.
-  local function await()
-    local budget = cli.timeout_ms > 0 and cli.timeout_ms or 30000
-    if not vim.wait(budget + 1000, function()
-      return done
-    end, 20) then
-      vim.notify("Timed out waiting for the vault write to finish", vim.log.levels.ERROR)
-    end
+  notify("Saved decrypted content: " .. path, vim.log.levels.INFO)
+  return true, nil
+end
+
+---Manage a buffer that now holds real plaintext, so `:w` saves that plaintext.
+---
+---The buffer stays managed afterwards: writing it out does not make the remaining
+---decrypted content in it any less decrypted.
+---@param buf integer
+---@return boolean secured
+function M.enter(buf)
+  if not buffer.is_valid(buf) then
+    return false
   end
 
-  if mode == "inline" then
-    -- Fold the decrypted values back into the buffer, then write it as the plain
-    -- YAML it now is. Buffer and file stay in agreement.
-    M.restore_regions(buf, opts, function(ok)
-      if not ok then
-        finish(false)
-        return
-      end
-
-      -- Written as ordinary YAML, so the buffer's own line endings and trailing
-      -- newline have to be reproduced rather than assumed.
-      local eol = vim.bo[buf].fileformat == "dos" and "\r\n" or "\n"
-      local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-      local body = table.concat(lines, eol) .. (vim.bo[buf].endofline and eol or "")
-
-      local write_ok, write_err = fs.atomic_write(path, body)
-      if not write_ok then
-        vim.notify("Failed to write file: " .. tostring(write_err), vim.log.levels.ERROR)
-        finish(false)
-        return
-      end
-
-      M.leave(buf)
-      notify("Vault values restored and saved: " .. path, vim.log.levels.INFO)
-      op.emit("save", "inline", { buf = buf, file = path })
-      finish(true)
-    end)
-    await()
-    return
+  -- A buffer whose writes already encrypt keeps that writer. Decrypting one
+  -- `!vault` value inside a `:VaultEdit` scratch adds plaintext to plaintext; it
+  -- does not turn the scratch into something that saves itself in the clear.
+  if M.kind(buf) then
+    secure.protect(buf)
+    return true
   end
 
-  local context = buffer.capture_context(buf)
-  local content = buffer.content(buf)
+  local name = vim.api.nvim_buf_get_name(buf)
+  local session = M.manage({
+    buf = buf,
+    kind = "plaintext",
+    target = name ~= "" and name or nil,
+    signature = name ~= "" and fs.signature(name) or nil,
+    write = write_plaintext,
+  })
 
-  op.credentials(function(creds)
-    if not creds then
-      finish(false)
-      return
-    end
+  if not session then
+    vim.notify(
+      "This buffer holds decrypted content but could not be secured; do not write it. "
+        .. "Undo the decryption or close it without saving.",
+      vim.log.levels.ERROR
+    )
+    return false
+  end
 
-    local args = op.with_encrypt_vault_id(creds.args, opts, creds, context)
+  notify("Buffer holds decrypted content. :w saves it as plaintext.", vim.log.levels.INFO)
+  return true
+end
 
-    cli.run("encrypt", content, args, function(success, output)
-      buffer.run_cleanup(creds.cleanup)
-
-      if not success then
-        vim.notify("Encryption failed, nothing was written: " .. output, vim.log.levels.ERROR)
-        finish(false)
-        return
-      end
-
-      local write_ok, write_err = fs.atomic_write(path, output)
-      if not write_ok then
-        vim.notify("Failed to write encrypted file: " .. tostring(write_err), vim.log.levels.ERROR)
-        finish(false)
-        return
-      end
-
-      notify("Encrypted and saved: " .. path, vim.log.levels.INFO)
-      op.emit("save", "file", { buf = buf, file = path })
-      finish(true)
-    end, opts, creds)
-  end, opts, context)
-
-  await()
+---Give a buffer its normal write behaviour back.
+---
+---Only correct once the caller has established that no plaintext is left in it:
+---encrypting one value in a file proves nothing about the rest of it.
+---@param buf integer
+function M.leave(buf)
+  M.release(buf, "now")
 end
 
 return M

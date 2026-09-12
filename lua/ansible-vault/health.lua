@@ -1,23 +1,31 @@
+---`:checkhealth ansible-vault`.
+---
+---Answers exactly four questions: can this Neovim run the plugin, can it run
+---`ansible-vault`, which credential would an operation actually use, and is
+---anything in the global configuration able to keep a copy of decrypted content.
+---
+---Everything is read through the same code the operations use, so the report
+---cannot describe a credential source that is not the one in effect. Nothing here
+---has side effects: a diagnostic that installs the password helper would be
+---reporting on a state it created.
 local M = {}
 
 local cli = require("ansible-vault.cli")
+local config = require("ansible-vault.config")
 local credentials = require("ansible-vault.credentials")
 local secure = require("ansible-vault.secure")
-local vault = require("ansible-vault")
 local health = vim.health
 
 local function is_nonempty_string(value)
   return type(value) == "string" and value ~= ""
 end
 
-local expand_path = credentials.expand_path
-
 local function path_exists(path)
   return vim.fn.filereadable(path) == 1 or vim.fn.isdirectory(path) == 1
 end
 
 local function check_password_file(path, label)
-  local expanded = expand_path(path)
+  local expanded = credentials.expand_path(path)
   if vim.fn.filereadable(expanded) ~= 1 then
     health.error(string.format("%s is not readable: %s", label, expanded))
     return
@@ -44,38 +52,34 @@ local function check_password_file(path, label)
   health.ok(string.format("%s is readable with restrictive permissions: %s", label, expanded))
 end
 
-local function parse_vault_label(vault_id)
-  return vault_id:match("^([^@]+)@")
-end
-
-local function check_vault_ids(config)
-  local vault_ids = credentials.as_list(config.vault_ids)
+local function check_vault_ids(values)
+  local vault_ids = credentials.as_list(values.vault_ids)
   if #vault_ids == 0 then
     return
   end
 
   local labels = {}
   for _, vault_id in ipairs(vault_ids) do
-    local label = parse_vault_label(vault_id)
+    local label = vault_id:match("^([^@]+)@")
     if label then
       labels[label] = true
     end
 
     local source = vault_id:match("^[^@]+@(.+)$")
-    if source and source ~= "prompt" and not path_exists(expand_path(source)) then
-      health.warn(string.format("vault_id source is not readable: %s", expand_path(source)))
+    if source and source ~= "prompt" and not path_exists(credentials.expand_path(source)) then
+      health.warn(string.format("vault_id source is not readable: %s", credentials.expand_path(source)))
     end
   end
 
   health.info(string.format("Configured vault IDs: %d", #vault_ids))
 
-  if #vault_ids > 1 and not is_nonempty_string(config.encrypt_vault_id) then
+  if #vault_ids > 1 and not is_nonempty_string(values.encrypt_vault_id) then
     health.warn("Multiple vault_ids are configured; set encrypt_vault_id for deterministic encryption")
   end
 
-  if is_nonempty_string(config.encrypt_vault_id) and next(labels) ~= nil and not labels[config.encrypt_vault_id] then
+  if is_nonempty_string(values.encrypt_vault_id) and next(labels) ~= nil and not labels[values.encrypt_vault_id] then
     health.warn(
-      string.format("encrypt_vault_id '%s' does not match configured vault_id labels", config.encrypt_vault_id)
+      string.format("encrypt_vault_id '%s' does not match configured vault_id labels", values.encrypt_vault_id)
     )
   end
 end
@@ -84,13 +88,13 @@ function M.check()
   health.start("ansible-vault.nvim")
 
   local v = vim.version()
-  if vim.fn.has("nvim-" .. vault.MIN_NVIM_VERSION) == 1 then
+  if vim.fn.has("nvim-" .. config.MIN_NVIM_VERSION) == 1 then
     health.ok(string.format("Neovim %d.%d.%d", v.major, v.minor, v.patch))
   else
     health.error(
       string.format(
         "Neovim %s is required; this plugin tracks the current release only and does not support older ones",
-        vault.MIN_NVIM_VERSION
+        config.MIN_NVIM_VERSION
       )
     )
   end
@@ -102,12 +106,11 @@ function M.check()
     health.error("ansible-vault executable not found: " .. executable)
   end
 
-  local config = vault.config
+  local values = config.values
 
-  -- Resolved through the same code path the real operations use, so this cannot
-  -- report a credential source that is not the one in effect. The report runs in
-  -- its own buffer, so resolution starts from the working directory.
-  local resolved = credentials.describe(config, {})
+  -- The report runs in its own buffer, so resolution starts from the working
+  -- directory rather than from a file being edited.
+  local resolved = credentials.describe(values, {})
 
   health.info("Credential source: " .. resolved.source)
   if resolved.cfg_path then
@@ -120,37 +123,25 @@ function M.check()
   if resolved.needs_disambiguation then
     health.info(
       string.format(
-        "Ansible's own config supplies a second identity; encryption will name '%s' explicitly",
+        "Ansible's own config supplies a second identity; the plugin's credential is named '%s' and takes precedence",
         resolved.encrypt_label or "default"
       )
     )
   end
 
-  local password_files = credentials.as_list(config.password_files)
+  local password_files = credentials.as_list(values.password_files)
   if #password_files > 0 then
     for _, path in ipairs(password_files) do
       check_password_file(path, "password_files")
     end
-    if #credentials.as_list(config.vault_ids) > 0 then
+    if #credentials.as_list(values.vault_ids) > 0 then
       health.info("password_files takes precedence over vault_ids")
     end
   else
-    check_vault_ids(config)
-    if resolved.source == "interactive" and config.ask_password ~= true then
+    check_vault_ids(values)
+    if resolved.source == "interactive" then
       health.warn("No password_files, vault_ids, ANSIBLE_* variable or ansible.cfg found; commands will prompt")
     end
-  end
-
-  if config.ask_password == true then
-    health.ok("ask_password is set: every operation prompts, ignoring other credentials")
-  end
-
-  if is_nonempty_string(config.new_vault_id) then
-    health.info("VaultRekey new vault ID configured: " .. config.new_vault_id)
-  elseif is_nonempty_string(config.new_password_file) then
-    check_password_file(config.new_password_file, "new_password_file")
-  else
-    health.info("VaultRekey requires --new-vault-* command args when no rekey target is configured")
   end
 
   -- Global options the plugin deliberately leaves alone.
@@ -161,17 +152,6 @@ function M.check()
     for _, warning in ipairs(warnings) do
       health.warn(warning)
     end
-  end
-
-  local askpass, askpass_err = credentials._private.ensure_askpass()
-  if askpass then
-    health.ok("Interactive passwords are passed via the environment; nothing secret is written to disk")
-  else
-    health.warn(
-      "Falling back to a 0600 temporary password file ("
-        .. (askpass_err or "unknown reason")
-        .. "); it is removed on exit but would survive a crash"
-    )
   end
 end
 

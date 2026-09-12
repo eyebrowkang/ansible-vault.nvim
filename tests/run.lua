@@ -6,7 +6,7 @@ local root = vim.fn.getcwd() .. "/tests/"
 local H = dofile(root .. "helpers.lua")
 
 local tests = {}
-for _, spec in ipairs({ "spec_core", "spec_privacy", "spec_credentials" }) do
+for _, spec in ipairs({ "spec_core", "spec_privacy", "spec_credentials", "spec_async" }) do
   dofile(root .. spec .. ".lua")(H, tests)
 end
 
@@ -21,7 +21,7 @@ for _, name in ipairs(names) do
   if not filter or name:find(filter, 1, true) then
     ran = ran + 1
     io.stdout:write("TEST ", name, "\n")
-    local ok, err = xpcall(tests[name], debug.traceback)
+    local ok, err = H.run(tests[name])
     if not ok then
       failures = failures + 1
       io.stderr:write("FAILED ", name, "\n", err, "\n")
