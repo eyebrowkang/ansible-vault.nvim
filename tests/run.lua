@@ -741,25 +741,31 @@ tests["operations announce themselves on AnsibleVaultOperation"] = function()
   local fake = create_fake_vault()
   reset_config(fake)
 
+  local buf = new_buffer({ "plain: value" })
+
+  -- Collect rather than `once`: there is a single pattern for every operation, so
+  -- an earlier test's in-flight write can fire it first and consume a one-shot
+  -- autocmd. Match on the buffer instead.
   local seen = {}
-  vim.api.nvim_create_autocmd("User", {
+  local id = vim.api.nvim_create_autocmd("User", {
     pattern = "AnsibleVaultOperation",
-    once = true,
     callback = function(event)
-      seen = event.data or {}
+      if event.data and event.data.buf == buf then
+        table.insert(seen, event.data)
+      end
     end,
   })
 
-  local buf = new_buffer({ "plain: value" })
   vault.encrypt(buf)
 
   wait_until(function()
-    return vault.is_buffer_encrypted(buf)
-  end, "encrypt did not finish")
+    return vault.is_buffer_encrypted(buf) and #seen > 0
+  end, "encrypt did not finish or did not announce itself")
+  vim.api.nvim_del_autocmd(id)
 
-  assert_eq(seen.op, "encrypt", "the event should carry the operation")
-  assert_eq(seen.scope, "file", "the event should carry the scope it applied to")
-  assert_eq(seen.buf, buf, "the event should carry the buffer it applied to")
+  assert_eq(seen[1].op, "encrypt", "the event should carry the operation")
+  assert_eq(seen[1].scope, "file", "the event should carry the scope it applied to")
+  assert_eq(seen[1].buf, buf, "the event should carry the buffer it applied to")
 end
 
 tests["VaultDecrypt over a range replaces the YAML vault block"] = function()
@@ -916,6 +922,38 @@ tests["VaultEncrypt folds a decrypted inline value back without writing"] = func
 
   assert_eq(vim.b[buf].ansible_vault_plaintext, nil, "the buffer should have left plaintext mode")
   assert_eq(read_file(path), before, "folding back must not write the file")
+end
+
+tests["a deleted inline region is not folded onto the next value"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local dir = temp_dir()
+  local buf, path = new_file_buffer(dir, "deleted.yml", {
+    "password: !vault |",
+    "          $ANSIBLE_VAULT;1.1;AES256",
+    "          ENCSTR:secret",
+    "keepme: plain",
+  })
+
+  vault.decrypt(buf, { range = 3, line1 = 1, line2 = 3 })
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: secret"
+  end, "inline decrypt did not finish")
+
+  -- Delete the decrypted line. The extmark is left-gravity, so it now points at
+  -- `keepme: plain`, which must not be mistaken for the region's content.
+  vim.api.nvim_buf_set_lines(buf, 0, 1, false, {})
+
+  vim.cmd("silent write")
+  wait_until(function()
+    return vim.bo[buf].buftype == ""
+  end, "write did not complete")
+
+  assert_true(notification_contains("no longer there"), "the orphaned region should be reported")
+  local written = read_file(path)
+  assert_true(written:find("keepme: plain", 1, true) ~= nil, "the unrelated value must be written unchanged")
+  assert_false(written:find("keepme: !vault", 1, true) ~= nil, "the unrelated value must not be encrypted")
 end
 
 tests["a second inline value can be decrypted while the first is open"] = function()
