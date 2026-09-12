@@ -89,6 +89,14 @@ All commands accept optional vault credential overrides as arguments.
 :VaultRekey [args]
     Rekey the current file-backed encrypted buffer. Requires
     `new_vault_id`, `new_password_file`, or a `--new-vault-*` argument.
+    The buffer must be encrypted and unmodified.
+
+    A format 1.2 vault ID label survives: it is named on the new
+    identity, as `--new-vault-id <label>@<new-password-file>`.
+    `--encrypt-vault-id` is never passed to `rekey`, because there it
+    picks the NEW secret out of a pool seeded with the OLD identities
+    from `ansible.cfg`, which either fails or re-encrypts with the old
+    password while reporting success.
 
                                                  *:VaultEncryptString*
 :[range]VaultEncryptString [args]

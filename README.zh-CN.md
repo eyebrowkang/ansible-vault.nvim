@@ -360,6 +360,11 @@ require("ansible-vault").setup({
 buffer 必须是文件型、已加密且没有未保存修改。rekey 成功后，插件会重新载入
 加密文件。
 
+`1.2` header 里的 vault ID 标签会被保留：插件会把标签放在新身份上，即
+`--new-vault-id prod@<新 password file>`。插件绝不会给 `rekey` 传
+`--encrypt-vault-id`——在这个子命令下，该参数是从「以**旧**身份为基础的候选集」里
+挑选**新**密钥，结果要么直接报错，要么用旧密码重新加密却依然报告成功。
+
 ## 快捷键
 
 插件不会默认设置快捷键。你可以自行添加：
