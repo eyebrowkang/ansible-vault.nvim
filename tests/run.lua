@@ -1022,7 +1022,7 @@ tests["B6 decrypt string quotes YAML special values"] = function()
   reset_config(fake)
 
   local function quote(s)
-    return vault._private.yaml_quote_value(s)
+    return require("ansible-vault.yaml").quote_value(s)
   end
 
   assert_eq(quote("yes"), '"yes"', "boolean 'yes' should be quoted")
@@ -1399,7 +1399,7 @@ end
 --- Inline YAML shapes ------------------------------------------------------
 
 tests["inline parser handles every shape ansible accepts"] = function()
-  local parse = vault._private.parse_vault_from_yaml
+  local parse = require("ansible-vault.yaml").parse_block
   local body = "          $ANSIBLE_VAULT;1.2;AES256;prod\n          6162636465"
 
   local cases = {
@@ -1432,7 +1432,7 @@ tests["inline parser handles every shape ansible accepts"] = function()
 end
 
 tests["inline parser strips carriage returns"] = function()
-  local parse = vault._private.parse_vault_from_yaml
+  local parse = require("ansible-vault.yaml").parse_block
   local parsed = parse("password: !vault |\r\n          $ANSIBLE_VAULT;1.1;AES256\r\n          6162\r")
   assert_true(parsed ~= nil, "CRLF block did not parse")
   assert_eq(parsed.vault_content, "$ANSIBLE_VAULT;1.1;AES256\n6162", "carriage returns must not reach ansible-vault")

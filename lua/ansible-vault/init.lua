@@ -168,9 +168,13 @@ local clear_password_cache = credentials.clear_password_cache
 local expand_path = credentials.expand_path
 local expand_vault_id = credentials.expand_vault_id
 
+---The argv prefix that runs `ansible-vault`, honouring `ansible_vault_path`.
+---
+---Public because `:checkhealth` reports the executable it would actually use, and
+---resolving that itself would be a second implementation that could disagree.
 ---@param opts? table
 ---@return string[]
-local function get_vault_argv(opts)
+function M.executable_argv(opts)
   local config = effective_config(opts)
   local executable = "ansible-vault"
   if is_nonempty_string(config.ansible_vault_path) then
@@ -190,7 +194,7 @@ end
 ---@param opts? table
 ---@return string[]
 local function build_vault_argv(action, args, target, opts)
-  local argv = get_vault_argv(opts)
+  local argv = M.executable_argv(opts)
   table.insert(argv, action)
   for _, arg in ipairs(args or {}) do
     table.insert(argv, tostring(arg))
@@ -2657,7 +2661,7 @@ function M.get_info(buf, opts)
     "Modified: " .. yes_no(modified),
     "Pending operation: " .. (pending or "none"),
     "",
-    "Executable: " .. table.concat(get_vault_argv(opts), " "),
+    "Executable: " .. table.concat(M.executable_argv(opts), " "),
     "Credential source: " .. resolved.source,
     "ansible.cfg: " .. (resolved.cfg_path or "none") .. " (" .. resolved.cfg_source .. ")",
     "Vault working directory: " .. (resolved.cwd or "inherited"),
@@ -3065,7 +3069,6 @@ M._private = {
   build_vault_argv = build_vault_argv,
   expand_vault_id = expand_vault_id,
   extract_vault_from_yaml = extract_vault_from_yaml,
-  get_vault_argv = get_vault_argv,
   parse_vault_from_yaml = parse_vault_from_yaml,
   output_to_lines = output_to_lines,
   complete_operation_args = complete_operation_args,
