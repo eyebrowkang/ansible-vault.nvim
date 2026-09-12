@@ -1,9 +1,11 @@
 local ansible_cfg = require("ansible-vault.ansible_cfg")
+local buffer = require("ansible-vault.buffer")
 local cli = require("ansible-vault.cli")
 local config_mod = require("ansible-vault.config")
 local credentials = require("ansible-vault.credentials")
 local fs = require("ansible-vault.fs")
 local secure = require("ansible-vault.secure")
+local ui = require("ansible-vault.ui")
 local yaml = require("ansible-vault.yaml")
 
 local M = {}
@@ -22,12 +24,22 @@ local parse_vault_from_yaml
 local write_plaintext_buffer
 local restore_inline_regions
 local leave_plaintext_mode
-local remember_header
 
 ---The live configuration table. Callers hold this reference, so `setup()` fills
 ---it in place rather than replacing it.
 ---@type AnsibleVaultConfig
 M.config = config_mod.values
+
+---Parse the `$ANSIBLE_VAULT` header of some content.
+M.parse_header = buffer.parse_header
+
+---Whether some content is vault ciphertext.
+M.is_encrypted = buffer.is_encrypted
+
+---Whether a buffer holds vault ciphertext. The supported way to drive a
+---statusline: it inspects the buffer rather than reading state an earlier
+---operation happened to leave behind.
+M.is_buffer_encrypted = buffer.is_buffer_encrypted
 
 local is_nonempty_string = config_mod.is_nonempty_string
 local effective_config = config_mod.effective
@@ -50,33 +62,6 @@ local function emit_event(op, scope, data)
 end
 
 local expand_path = credentials.expand_path
-
----Context describing which file an operation applies to, so credentials and the
----encryption label can be resolved the way Ansible would resolve them there.
----@param buf? integer
----@return { file_path?: string, header_label?: string }
-local function buffer_context(buf)
-  local context = {}
-  if buf and vim.api.nvim_buf_is_valid(buf) then
-    -- Read the header while the buffer still holds ciphertext. Once it has been
-    -- decrypted there is nothing left to recover the vault id label from, and
-    -- re-encrypting without it silently rewrites the file as format 1.1.
-    remember_header(buf)
-
-    local name = vim.api.nvim_buf_get_name(buf)
-    if name ~= "" then
-      context.file_path = name
-    end
-    context.header_label = vim.b[buf].ansible_vault_label
-  end
-  if not context.file_path then
-    context.file_path = vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf())
-    if context.file_path == "" then
-      context.file_path = nil
-    end
-  end
-  return context
-end
 
 ---Resolve credentials for an operation.
 ---@param callback fun(creds: AnsibleVaultCredentials|nil)
@@ -271,204 +256,6 @@ local function complete_operation_args(arg_lead, include_rekey, include_labels)
   end, candidates)
 end
 
----@param buf? integer
----@return integer
-local function normalize_buf(buf)
-  return buf or vim.api.nvim_get_current_buf()
-end
-
----@param buf integer
----@return boolean
-local function is_valid_buf(buf)
-  return vim.api.nvim_buf_is_valid(buf)
-end
-
----@param buf integer
----@return integer
-local function changedtick(buf)
-  return vim.b[buf].changedtick or 0
-end
-
----@param buf integer
----@return string
-local function buffer_content(buf)
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  return table.concat(lines, "\n")
-end
-
----@param cleanup? fun()
-local function run_cleanup(cleanup)
-  if cleanup then
-    cleanup()
-  end
-end
-
----@param buf integer
----@param operation string
----@return boolean
-local function start_buffer_operation(buf, operation)
-  if vim.b[buf].ansible_vault_pending then
-    vim.notify(
-      string.format("Vault operation already running: %s", vim.b[buf].ansible_vault_pending),
-      vim.log.levels.WARN
-    )
-    return false
-  end
-
-  vim.b[buf].ansible_vault_pending = operation
-  return true
-end
-
----@param buf integer
----@param operation string
-local function finish_buffer_operation(buf, operation)
-  if is_valid_buf(buf) and vim.b[buf].ansible_vault_pending == operation then
-    vim.b[buf].ansible_vault_pending = nil
-  end
-end
-
----@param buf integer
----@param expected_changedtick integer
----@param output string
----@param success_message string
----@param opts? table
----@return boolean
-local function replace_buffer_lines(buf, expected_changedtick, output, success_message, opts)
-  if not is_valid_buf(buf) then
-    vim.notify("Vault operation finished, but the target buffer no longer exists", vim.log.levels.WARN)
-    return false
-  end
-
-  if changedtick(buf) ~= expected_changedtick then
-    vim.notify("Vault operation finished, but the buffer changed; result was not applied", vim.log.levels.ERROR)
-    return false
-  end
-
-  local lines = cli.output_to_lines(output)
-  local becomes_plaintext = not M.is_encrypted(lines)
-
-  local ok, err
-  if becomes_plaintext then
-    -- Harden first: resetting 'swapfile' deletes any existing swap file, and
-    -- doing it before the plaintext lands is what keeps it off disk.
-    ok, err = secure.set_plaintext_lines(buf, lines)
-  else
-    ok, err = secure.with_cleared_undo(buf, function()
-      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    end)
-  end
-
-  if not ok then
-    vim.notify("Failed to update buffer: " .. tostring(err), vim.log.levels.ERROR)
-    return false
-  end
-
-  remember_header(buf, lines)
-  notify(success_message, vim.log.levels.INFO)
-  return true
-end
-
----@param output string
----@param title string
----@param filetype? string
-local function open_output_window(output, title, filetype)
-  -- Explicitly hardened rather than relying on the implicit scratch defaults;
-  -- this window shows decrypted content.
-  local buf = secure.create_buffer(false, true)
-  local lines = cli.output_to_lines(output)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].filetype = filetype or ""
-  vim.bo[buf].modifiable = false
-
-  local max_line_width = 0
-  for _, line in ipairs(lines) do
-    max_line_width = math.max(max_line_width, vim.api.nvim_strwidth(line))
-  end
-
-  local available_width = math.max(1, vim.o.columns - 4)
-  local available_height = math.max(1, vim.o.lines - 4)
-  local width = math.min(math.max(max_line_width + 2, 40), available_width)
-  local height = math.min(math.max(#lines, 1), available_height)
-
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "editor",
-    width = width,
-    height = height,
-    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
-    row = math.max(0, math.floor((vim.o.lines - height) / 2)),
-    style = "minimal",
-    border = "rounded",
-    title = title,
-    title_pos = "center",
-  })
-
-  local close_window = function()
-    if vim.api.nvim_win_is_valid(win) then
-      vim.api.nvim_win_close(win, true)
-    end
-  end
-
-  vim.keymap.set("n", "q", close_window, { buffer = buf, desc = "Close vault view" })
-  vim.keymap.set("n", "<Esc>", close_window, { buffer = buf, desc = "Close vault view" })
-end
-
----@param content string|string[]
----@return string
-local function first_line_of(content)
-  if type(content) == "table" then
-    return content[1] or ""
-  end
-  return content:match("^[^\n]*") or ""
-end
-
----Parse the `$ANSIBLE_VAULT` header of some content.
----@param content string|string[]
----@return AnsibleVaultHeader|nil
-function M.parse_header(content)
-  return yaml.parse_header(first_line_of(content))
-end
-
----Check if content is vault encrypted.
----@param content string|string[]
----@return boolean
-function M.is_encrypted(content)
-  return M.parse_header(content) ~= nil
-end
-
----Check if buffer is vault encrypted.
----@param buf? integer
----@return boolean
-function M.is_buffer_encrypted(buf)
-  local target = normalize_buf(buf)
-  if not is_valid_buf(target) then
-    return false
-  end
-  local lines = vim.api.nvim_buf_get_lines(target, 0, 1, false)
-  return M.is_encrypted(lines)
-end
-
----Record the vault format version and id label a buffer's ciphertext carries, so
----re-encrypting can preserve them instead of silently downgrading to format 1.1.
----@param buf integer
----@param content? string|string[]
-remember_header = function(buf, content)
-  if not is_valid_buf(buf) then
-    return
-  end
-
-  local header = M.parse_header(content or vim.api.nvim_buf_get_lines(buf, 0, 1, false))
-
-  -- Deliberately no else branch. This runs again once the buffer holds plaintext,
-  -- and that content has no header to read a label from; keeping the last one
-  -- seen is exactly what lets `:VaultDecrypt` + `:VaultEncrypt` put the 1.2 label
-  -- back instead of silently rewriting the file as 1.1.
-  if header then
-    vim.b[buf].ansible_vault_version = header.version
-    vim.b[buf].ansible_vault_label = header.label
-  end
-end
-
 --- Plaintext editing mode -------------------------------------------------
 ---
 ---Once a buffer holds decrypted content, every write has to go back through this
@@ -486,7 +273,7 @@ end
 ---@param buf integer
 ---@return "file"|"inline"|nil
 local function plaintext_mode(buf)
-  if not is_valid_buf(buf) then
+  if not buffer.is_valid(buf) then
     return nil
   end
   return vim.b[buf].ansible_vault_plaintext
@@ -496,7 +283,7 @@ end
 ---@param mode "file"|"inline"
 ---@param opts? table
 local function enter_plaintext_mode(buf, mode, opts)
-  if not is_valid_buf(buf) then
+  if not buffer.is_valid(buf) then
     return
   end
 
@@ -531,7 +318,7 @@ end
 ---Return the buffer to its normal, ciphertext-backed behaviour.
 ---@param buf integer
 leave_plaintext_mode = function(buf)
-  if not is_valid_buf(buf) then
+  if not buffer.is_valid(buf) then
     return
   end
 
@@ -553,34 +340,34 @@ end
 ---@param target integer
 ---@param opts? table
 local function encrypt_file(target, opts)
-  local context = buffer_context(target)
+  local context = buffer.capture_context(target)
 
   get_credentials(function(creds)
     if not creds then
       return
     end
 
-    if not is_valid_buf(target) then
-      run_cleanup(creds.cleanup)
+    if not buffer.is_valid(target) then
+      buffer.run_cleanup(creds.cleanup)
       vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
       return
     end
 
-    if not start_buffer_operation(target, "encrypt") then
-      run_cleanup(creds.cleanup)
+    if not buffer.start_operation(target, "encrypt") then
+      buffer.run_cleanup(creds.cleanup)
       return
     end
 
-    local tick = changedtick(target)
-    local content = buffer_content(target)
+    local tick = buffer.changedtick(target)
+    local content = buffer.content(target)
     local args = with_encrypt_vault_id(creds.args, opts, creds, context)
 
     cli.run("encrypt", content, args, function(success, output)
-      run_cleanup(creds.cleanup)
-      finish_buffer_operation(target, "encrypt")
+      buffer.run_cleanup(creds.cleanup)
+      buffer.finish_operation(target, "encrypt")
 
       if success then
-        if replace_buffer_lines(target, tick, output, "Buffer encrypted successfully", opts) then
+        if buffer.replace_lines(target, tick, output, "Buffer encrypted successfully") then
           leave_plaintext_mode(target)
           emit_event("encrypt", "file", { buf = target })
         end
@@ -594,33 +381,33 @@ end
 ---@param target integer
 ---@param opts? table
 local function decrypt_file(target, opts)
-  local context = buffer_context(target)
+  local context = buffer.capture_context(target)
 
   get_credentials(function(creds)
     if not creds then
       return
     end
 
-    if not is_valid_buf(target) then
-      run_cleanup(creds.cleanup)
+    if not buffer.is_valid(target) then
+      buffer.run_cleanup(creds.cleanup)
       vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
       return
     end
 
-    if not start_buffer_operation(target, "decrypt") then
-      run_cleanup(creds.cleanup)
+    if not buffer.start_operation(target, "decrypt") then
+      buffer.run_cleanup(creds.cleanup)
       return
     end
 
-    local tick = changedtick(target)
-    local content = buffer_content(target)
+    local tick = buffer.changedtick(target)
+    local content = buffer.content(target)
 
     cli.run("decrypt", content, creds.args, function(success, output)
-      run_cleanup(creds.cleanup)
-      finish_buffer_operation(target, "decrypt")
+      buffer.run_cleanup(creds.cleanup)
+      buffer.finish_operation(target, "decrypt")
 
       if success then
-        if replace_buffer_lines(target, tick, output, "Buffer decrypted successfully", opts) then
+        if buffer.replace_lines(target, tick, output, "Buffer decrypted successfully") then
           enter_plaintext_mode(target, "file", opts)
           emit_event("decrypt", "file", { buf = target })
         end
@@ -635,24 +422,24 @@ end
 ---@param opts? table
 local function view_file(target, opts)
   local filetype = vim.bo[target].filetype
-  local context = buffer_context(target)
+  local context = buffer.capture_context(target)
 
   get_credentials(function(creds)
     if not creds then
       return
     end
 
-    if not is_valid_buf(target) then
-      run_cleanup(creds.cleanup)
+    if not buffer.is_valid(target) then
+      buffer.run_cleanup(creds.cleanup)
       vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
       return
     end
 
-    cli.run("decrypt", buffer_content(target), creds.args, function(success, output)
-      run_cleanup(creds.cleanup)
+    cli.run("decrypt", buffer.content(target), creds.args, function(success, output)
+      buffer.run_cleanup(creds.cleanup)
 
       if success then
-        open_output_window(output, " Vault View (read-only) ", filetype)
+        ui.open_float(output, " Vault View (read-only) ", filetype)
         emit_event("view", "file", { buf = target })
       else
         vim.notify("View failed: " .. output, vim.log.levels.ERROR)
@@ -774,7 +561,7 @@ local function resolve_scope(buf, range_opts, want)
     return { scope = "file", state = "plaintext" }, nil
   end
 
-  if M.is_buffer_encrypted(buf) then
+  if buffer.is_buffer_encrypted(buf) then
     return { scope = "file", state = "ciphertext" }, nil
   end
 
@@ -878,28 +665,28 @@ local function encrypt_string_selection(buf, selection, opts)
   end
 
   local plan = build_encrypt_string_plan(buf, selection)
-  local planned_tick = changedtick(buf)
-  local context = buffer_context(buf)
+  local planned_tick = buffer.changedtick(buf)
+  local context = buffer.capture_context(buf)
 
   get_credentials(function(creds)
     if not creds then
       return
     end
 
-    if not is_valid_buf(buf) then
-      run_cleanup(creds.cleanup)
+    if not buffer.is_valid(buf) then
+      buffer.run_cleanup(creds.cleanup)
       vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
       return
     end
 
-    if changedtick(buf) ~= planned_tick then
-      run_cleanup(creds.cleanup)
+    if buffer.changedtick(buf) ~= planned_tick then
+      buffer.run_cleanup(creds.cleanup)
       vim.notify("Buffer changed before encryption started; result was not applied", vim.log.levels.ERROR)
       return
     end
 
-    if not start_buffer_operation(buf, "encrypt_string") then
-      run_cleanup(creds.cleanup)
+    if not buffer.start_operation(buf, "encrypt_string") then
+      buffer.run_cleanup(creds.cleanup)
       return
     end
 
@@ -908,20 +695,20 @@ local function encrypt_string_selection(buf, selection, opts)
     table.insert(full_args, plan.name)
 
     cli.run("encrypt_string", plan.content, full_args, function(success, output)
-      run_cleanup(creds.cleanup)
-      finish_buffer_operation(buf, "encrypt_string")
+      buffer.run_cleanup(creds.cleanup)
+      buffer.finish_operation(buf, "encrypt_string")
 
       if not success then
         vim.notify("Encryption failed: " .. output, vim.log.levels.ERROR)
         return
       end
 
-      if not is_valid_buf(buf) then
+      if not buffer.is_valid(buf) then
         vim.notify("Vault operation finished, but the target buffer no longer exists", vim.log.levels.WARN)
         return
       end
 
-      if changedtick(buf) ~= planned_tick then
+      if buffer.changedtick(buf) ~= planned_tick then
         vim.notify("Vault operation finished, but the buffer changed; result was not applied", vim.log.levels.ERROR)
         return
       end
@@ -1024,7 +811,7 @@ restore_inline_regions = function(buf, opts, callback)
     return a.start_row > b.start_row
   end)
 
-  local context = buffer_context(buf)
+  local context = buffer.capture_context(buf)
 
   get_credentials(function(creds)
     if not creds then
@@ -1036,7 +823,7 @@ restore_inline_regions = function(buf, opts, callback)
     local function step()
       index = index + 1
       if index > #resolved then
-        run_cleanup(creds.cleanup)
+        buffer.run_cleanup(creds.cleanup)
         callback(true)
         return
       end
@@ -1073,7 +860,7 @@ restore_inline_regions = function(buf, opts, callback)
 
       cli.run("encrypt_string", content, args, function(success, output)
         if not success then
-          run_cleanup(creds.cleanup)
+          buffer.run_cleanup(creds.cleanup)
           vim.notify("Failed to re-encrypt " .. (name or "value") .. ": " .. output, vim.log.levels.ERROR)
           callback(false)
           return
@@ -1093,7 +880,7 @@ restore_inline_regions = function(buf, opts, callback)
 
         local ok = pcall(vim.api.nvim_buf_set_lines, buf, entry.start_row, entry.end_row + 1, false, out_lines)
         if not ok then
-          run_cleanup(creds.cleanup)
+          buffer.run_cleanup(creds.cleanup)
           vim.notify("Failed to update buffer while re-encrypting", vim.log.levels.ERROR)
           callback(false)
           return
@@ -1116,7 +903,7 @@ end
 ---@param target_path string
 ---@param opts? table
 write_plaintext_buffer = function(buf, target_path, opts)
-  if not is_valid_buf(buf) then
+  if not buffer.is_valid(buf) then
     return
   end
 
@@ -1141,7 +928,7 @@ write_plaintext_buffer = function(buf, target_path, opts)
 
   local function finish(ok)
     done = true
-    if is_valid_buf(buf) then
+    if buffer.is_valid(buf) then
       vim.b[buf].ansible_vault_write_pending = nil
       if ok then
         vim.bo[buf].modified = false
@@ -1192,8 +979,8 @@ write_plaintext_buffer = function(buf, target_path, opts)
     return
   end
 
-  local context = buffer_context(buf)
-  local content = buffer_content(buf)
+  local context = buffer.capture_context(buf)
+  local content = buffer.content(buf)
 
   get_credentials(function(creds)
     if not creds then
@@ -1204,7 +991,7 @@ write_plaintext_buffer = function(buf, target_path, opts)
     local args = with_encrypt_vault_id(creds.args, opts, creds, context)
 
     cli.run("encrypt", content, args, function(success, output)
-      run_cleanup(creds.cleanup)
+      buffer.run_cleanup(creds.cleanup)
 
       if not success then
         vim.notify("Encryption failed, nothing was written: " .. output, vim.log.levels.ERROR)
@@ -1255,25 +1042,25 @@ end
 ---@param original_file string
 ---@param preferred_win integer
 local function close_edit_buffer(edit_buf, original_buf, original_file, preferred_win)
-  if is_valid_buf(original_buf) then
+  if buffer.is_valid(original_buf) then
     pcall(vim.api.nvim_buf_call, original_buf, function()
       vim.cmd("silent! edit!")
     end)
   end
 
-  if is_valid_buf(edit_buf) then
+  if buffer.is_valid(edit_buf) then
     vim.bo[edit_buf].modified = false
   end
 
   local win = vim.api.nvim_win_is_valid(preferred_win) and preferred_win or vim.api.nvim_get_current_win()
-  if is_valid_buf(original_buf) and vim.api.nvim_win_is_valid(win) then
+  if buffer.is_valid(original_buf) and vim.api.nvim_win_is_valid(win) then
     vim.api.nvim_win_set_buf(win, original_buf)
   elseif vim.api.nvim_win_is_valid(win) then
     vim.api.nvim_set_current_win(win)
     vim.cmd("edit " .. vim.fn.fnameescape(original_file))
   end
 
-  if is_valid_buf(edit_buf) then
+  if buffer.is_valid(edit_buf) then
     vim.api.nvim_buf_delete(edit_buf, { force = true })
   end
 end
@@ -1282,17 +1069,17 @@ end
 ---@param buf? integer
 ---@param opts? table
 function M.edit(buf, opts)
-  local original_buf = normalize_buf(buf)
+  local original_buf = buffer.normalize(buf)
   if opts and opts.range and opts.range > 0 then
     vim.notify("VaultEdit works on a whole vault file; use :VaultDecrypt on an inline value", vim.log.levels.ERROR)
     return
   end
-  if not is_valid_buf(original_buf) then
+  if not buffer.is_valid(original_buf) then
     vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
     return
   end
 
-  if not M.is_buffer_encrypted(original_buf) then
+  if not buffer.is_buffer_encrypted(original_buf) then
     vim.notify("Buffer is not encrypted", vim.log.levels.WARN)
     return
   end
@@ -1310,37 +1097,37 @@ function M.edit(buf, opts)
 
   local original_win = vim.api.nvim_get_current_win()
   local filetype = vim.bo[original_buf].filetype
-  local original_tick = changedtick(original_buf)
+  local original_tick = buffer.changedtick(original_buf)
   local original_signature = fs.signature(original_file)
 
-  local context = buffer_context(original_buf)
+  local context = buffer.capture_context(original_buf)
 
   get_credentials(function(creds)
     if not creds then
       return
     end
 
-    if not is_valid_buf(original_buf) then
-      run_cleanup(creds.cleanup)
+    if not buffer.is_valid(original_buf) then
+      buffer.run_cleanup(creds.cleanup)
       vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
       return
     end
 
-    cli.run("decrypt", buffer_content(original_buf), creds.args, function(success, output)
+    cli.run("decrypt", buffer.content(original_buf), creds.args, function(success, output)
       if not success then
-        run_cleanup(creds.cleanup)
+        buffer.run_cleanup(creds.cleanup)
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
         return
       end
 
-      if not is_valid_buf(original_buf) then
-        run_cleanup(creds.cleanup)
+      if not buffer.is_valid(original_buf) then
+        buffer.run_cleanup(creds.cleanup)
         vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
         return
       end
 
-      if changedtick(original_buf) ~= original_tick then
-        run_cleanup(creds.cleanup)
+      if buffer.changedtick(original_buf) ~= original_tick then
+        buffer.run_cleanup(creds.cleanup)
         vim.notify("Original buffer changed before VaultEdit opened; edit was cancelled", vim.log.levels.ERROR)
         return
       end
@@ -1359,7 +1146,7 @@ function M.edit(buf, opts)
       vim.bo[edit_buf].modified = false
       local set_name_ok, set_name_err = pcall(vim.api.nvim_buf_set_name, edit_buf, "ansible-vault://" .. original_file)
       if not set_name_ok then
-        run_cleanup(creds.cleanup)
+        buffer.run_cleanup(creds.cleanup)
         pcall(vim.api.nvim_buf_delete, edit_buf, { force = true })
         vim.notify("VaultEdit: buffer name conflict - " .. (set_name_err or "E95"), vim.log.levels.ERROR)
         return
@@ -1418,7 +1205,7 @@ function M.edit(buf, opts)
           -- encryption is still in flight.
           cli.run("encrypt", edit_content, encrypt_args, function(enc_success, enc_output)
             if not enc_success then
-              if is_valid_buf(cur_buf) then
+              if buffer.is_valid(cur_buf) then
                 vim.b[cur_buf].vault_write_pending = false
               end
               vim.notify("Encryption failed: " .. enc_output, vim.log.levels.ERROR)
@@ -1426,7 +1213,7 @@ function M.edit(buf, opts)
             end
 
             if not fs.same_signature(orig_signature, fs.signature(orig_file)) then
-              if is_valid_buf(cur_buf) then
+              if buffer.is_valid(cur_buf) then
                 vim.b[cur_buf].vault_write_pending = false
               end
               vim.notify("Original file changed on disk; encrypted output was not written", vim.log.levels.ERROR)
@@ -1435,20 +1222,20 @@ function M.edit(buf, opts)
 
             local write_ok, write_err = fs.atomic_write(orig_file, enc_output)
             if not write_ok then
-              if is_valid_buf(cur_buf) then
+              if buffer.is_valid(cur_buf) then
                 vim.b[cur_buf].vault_write_pending = false
               end
               vim.notify("Failed to write encrypted file: " .. write_err, vim.log.levels.ERROR)
               return
             end
 
-            if is_valid_buf(cur_buf) then
+            if buffer.is_valid(cur_buf) then
               vim.bo[cur_buf].modified = false
             end
 
             notify("Encrypted and saved: " .. orig_file, vim.log.levels.INFO)
             emit_event("save", "file", { buf = orig_buf, file = orig_file })
-            if is_valid_buf(cur_buf) then
+            if buffer.is_valid(cur_buf) then
               cleanup_edit_buffer(cur_buf)
               close_edit_buffer(cur_buf, orig_buf, orig_file, original_win)
             end
@@ -1483,7 +1270,7 @@ local function rekey_file(target, opts)
     return
   end
 
-  local context = buffer_context(target)
+  local context = buffer.capture_context(target)
 
   get_credentials(function(creds)
     if not creds then
@@ -1496,12 +1283,12 @@ local function rekey_file(target, opts)
     -- See credentials.rekey_args.
     local new_args, new_err = credentials.rekey_args(effective_config(opts), context)
     if new_err then
-      run_cleanup(creds.cleanup)
+      buffer.run_cleanup(creds.cleanup)
       vim.notify("VaultRekey: " .. new_err, vim.log.levels.ERROR)
       return
     end
     if not new_args then
-      run_cleanup(creds.cleanup)
+      buffer.run_cleanup(creds.cleanup)
       vim.notify(
         "VaultRekey requires new_vault_id, new_password_file, or a --new-vault-* argument",
         vim.log.levels.ERROR
@@ -1512,25 +1299,25 @@ local function rekey_file(target, opts)
     local rekey_args = vim.deepcopy(creds.args)
     vim.list_extend(rekey_args, new_args)
 
-    if not start_buffer_operation(target, "rekey") then
-      run_cleanup(creds.cleanup)
+    if not buffer.start_operation(target, "rekey") then
+      buffer.run_cleanup(creds.cleanup)
       return
     end
 
     cli.run_file("rekey", file_path, rekey_args, function(success, output)
-      run_cleanup(creds.cleanup)
-      finish_buffer_operation(target, "rekey")
+      buffer.run_cleanup(creds.cleanup)
+      buffer.finish_operation(target, "rekey")
 
       if not success then
         vim.notify("Rekey failed: " .. output, vim.log.levels.ERROR)
         return
       end
 
-      if is_valid_buf(target) then
+      if buffer.is_valid(target) then
         pcall(vim.api.nvim_buf_call, target, function()
           vim.cmd("silent! edit!")
         end)
-        remember_header(target)
+        buffer.remember_header(target)
       end
 
       notify("Vault file rekeyed successfully", vim.log.levels.INFO)
@@ -1604,9 +1391,9 @@ local function decrypt_string_selection(target, selection, mode, opts)
     return
   end
 
-  local planned_tick = changedtick(target)
+  local planned_tick = buffer.changedtick(target)
   local filetype = vim.bo[target].filetype
-  local context = buffer_context(target)
+  local context = buffer.capture_context(target)
   if parsed.header and parsed.header.label then
     context.header_label = parsed.header.label
   end
@@ -1616,21 +1403,21 @@ local function decrypt_string_selection(target, selection, mode, opts)
       return
     end
 
-    if not is_valid_buf(target) then
-      run_cleanup(creds.cleanup)
+    if not buffer.is_valid(target) then
+      buffer.run_cleanup(creds.cleanup)
       vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
       return
     end
 
-    if mode == "replace" and not start_buffer_operation(target, "decrypt_string") then
-      run_cleanup(creds.cleanup)
+    if mode == "replace" and not buffer.start_operation(target, "decrypt_string") then
+      buffer.run_cleanup(creds.cleanup)
       return
     end
 
     cli.run("decrypt", parsed.vault_content, creds.args, function(success, output)
-      run_cleanup(creds.cleanup)
+      buffer.run_cleanup(creds.cleanup)
       if mode == "replace" then
-        finish_buffer_operation(target, "decrypt_string")
+        buffer.finish_operation(target, "decrypt_string")
       end
 
       if not success then
@@ -1641,16 +1428,16 @@ local function decrypt_string_selection(target, selection, mode, opts)
       if mode == "view" then
         local title = parsed.var_name and string.format(" %s (read-only) ", parsed.var_name)
           or " Vault String (read-only) "
-        open_output_window(output:gsub("\n$", ""), title, filetype)
+        ui.open_float(output:gsub("\n$", ""), title, filetype)
         return
       end
 
-      if not is_valid_buf(target) then
+      if not buffer.is_valid(target) then
         vim.notify("Vault operation finished, but the target buffer no longer exists", vim.log.levels.WARN)
         return
       end
 
-      if changedtick(target) ~= planned_tick then
+      if buffer.changedtick(target) ~= planned_tick then
         vim.notify("Vault operation finished, but the buffer changed; result was not applied", vim.log.levels.ERROR)
         return
       end
@@ -1734,8 +1521,8 @@ local function rekey_inline(target, selection, opts)
     vim.list_extend(encrypt_args, { "--vault-password-file", new_args[2] })
   end
 
-  local planned_tick = changedtick(target)
-  local context = buffer_context(target)
+  local planned_tick = buffer.changedtick(target)
+  local context = buffer.capture_context(target)
   if parsed.header and parsed.header.label then
     context.header_label = parsed.header.label
   end
@@ -1745,14 +1532,14 @@ local function rekey_inline(target, selection, opts)
       return
     end
 
-    if not start_buffer_operation(target, "rekey") then
-      run_cleanup(creds.cleanup)
+    if not buffer.start_operation(target, "rekey") then
+      buffer.run_cleanup(creds.cleanup)
       return
     end
 
     local function finish()
-      run_cleanup(creds.cleanup)
-      finish_buffer_operation(target, "rekey")
+      buffer.run_cleanup(creds.cleanup)
+      buffer.finish_operation(target, "rekey")
     end
 
     cli.run("decrypt", parsed.vault_content, creds.args, function(ok, plaintext)
@@ -1778,7 +1565,7 @@ local function rekey_inline(target, selection, opts)
           return
         end
 
-        if not is_valid_buf(target) or changedtick(target) ~= planned_tick then
+        if not buffer.is_valid(target) or buffer.changedtick(target) ~= planned_tick then
           vim.notify("Buffer changed during rekey; the value was left alone", vim.log.levels.ERROR)
           return
         end
@@ -1815,8 +1602,8 @@ end
 ---@param want "ciphertext"|"plain"
 ---@return integer|nil target, table|nil scope
 local function target_and_scope(buf, opts, want)
-  local target = normalize_buf(buf)
-  if not is_valid_buf(target) then
+  local target = buffer.normalize(buf)
+  if not buffer.is_valid(target) then
     vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
     return nil, nil
   end
