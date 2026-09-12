@@ -96,35 +96,6 @@ wait_until(function()
   return vim.api.nvim_buf_get_lines(buf, 0, -1, false)[1] == "password: secret"
 end, "real decrypt_string did not restore inline plaintext")
 
-local target_file = workdir .. "/target.yml"
-write_file(target_file, "plain: target\n")
-local target_buf = vim.api.nvim_create_buf(true, false)
-vim.api.nvim_buf_set_name(target_buf, target_file)
-vim.api.nvim_set_current_buf(target_buf)
-vim.api.nvim_buf_set_lines(target_buf, 0, -1, false, { "plain: target" })
-vault.encrypt(target_buf)
-wait_until(function()
-  return vault.is_buffer_encrypted(target_buf)
-end, "real target encrypt did not finish")
-vim.cmd("silent write!")
-
-vim.api.nvim_set_current_buf(buf)
-vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "plain: current" })
-local tab_count = #vim.api.nvim_list_tabpages()
-vault.diff({ positionals = { target_file } })
-wait_until(function()
-  return #vim.api.nvim_list_tabpages() > tab_count
-end, "real VaultDiff did not open a diff tab")
-
-local diff_contents = {}
-for _, win in ipairs(vim.api.nvim_tabpage_list_wins(vim.api.nvim_get_current_tabpage())) do
-  local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)
-  table.insert(diff_contents, table.concat(lines, "\n"))
-end
-assert_true(vim.tbl_contains(diff_contents, "plain: current"), "real diff missed current plaintext")
-assert_true(vim.tbl_contains(diff_contents, "plain: target"), "real diff missed target plaintext")
-vim.cmd("tabclose!")
-
 local edit_file = workdir .. "/edit.yml"
 vim.cmd("edit " .. vim.fn.fnameescape(edit_file))
 local file_buf = vim.api.nvim_get_current_buf()

@@ -20,7 +20,6 @@ English documentation: [README.md](README.md)
 - `:VaultCreate` 新建加密文件
 - 通过选区或光标位置加密、查看、解密 inline `!vault` 值
 - 对加密文件执行 rekey
-- 将当前 buffer 解密后与另一个文件或 Git 版本做 diff
 - 使用 Telescope 或内置 `vim.ui.select` 查找 vault 文件
 
 **凭据**
@@ -196,8 +195,6 @@ header。
 | `:VaultView` | 在只读浮窗中查看解密内容 |
 | `:VaultEdit` | 在 scratch buffer 中编辑解密内容，`:write` 时重新加密保存 |
 | `:VaultClearPasswordCache` | 清理内存中的交互式密码缓存 |
-| `:VaultDiff {file}` | 将当前 buffer 解密后与另一个文件做 diff |
-| `:VaultDiff --git [ref]` | 将当前文件解密后与某个 Git 版本做 diff |
 | `:VaultFiles [view\|edit\|rekey]` | 选择 vault 文件并查看、编辑或 rekey |
 | `:VaultInfo [args]` | 查看当前 buffer 和插件配置诊断信息 |
 | `:VaultRekey [args]` | 对当前加密文件执行 rekey |
@@ -301,24 +298,6 @@ require("ansible-vault").setup({
 
 执行 `:VaultToggle` 可以在普通内容和 vault 密文之间切换。用它解密同样会进入
 `:VaultDecrypt` 的明文编辑态，所以 `:w` 依然会先重新加密。
-
-### 对解密后的内容做 diff
-
-将当前 buffer 与另一个 vault 文件比较：
-
-```vim
-:VaultDiff ../group_vars/prod/vault.yml
-```
-
-将当前文件与 Git 版本比较：
-
-```vim
-:VaultDiff --git HEAD
-:VaultDiff --git main
-```
-
-两侧内容都会先解密到临时 nofile buffer，然后启用 Neovim diff 模式。普通
-明文文件也可以参与比较，方便迁移或排查时使用。
 
 ### 查找 vault 文件
 
@@ -472,7 +451,6 @@ vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decry
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
 vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
-vim.keymap.set("n", "<leader>vD", "<cmd>VaultDiff --git HEAD<cr>", { desc = "Vault Diff" })
 vim.keymap.set("n", "<leader>vf", "<cmd>VaultFiles view<cr>", { desc = "Vault Files" })
 vim.keymap.set("n", "<leader>vt", "<cmd>VaultToggle<cr>", { desc = "Vault Toggle" })
 vim.keymap.set("v", "<leader>vs", ":VaultEncryptString<cr>", { silent = true, desc = "Vault Encrypt String" })
@@ -516,8 +494,6 @@ vault.decrypt()
 vault.view()
 vault.edit()
 vault.rekey()
-vault.diff({ positionals = { "../other-vault.yml" } })
-vault.diff({ git_ref = "HEAD" })
 vault.files({ positionals = { "view" } })
 vault.info()
 local info_lines = vault.get_info()
@@ -550,8 +526,7 @@ vim.api.nvim_create_autocmd("User", {
 当前事件包括 `AnsibleVaultEncrypt`、`AnsibleVaultDecrypt`、
 `AnsibleVaultView`、`AnsibleVaultCreate`、`AnsibleVaultEditOpen`、
 `AnsibleVaultEditSave`、`AnsibleVaultPlaintextSave`、`AnsibleVaultRekey`、
-`AnsibleVaultStringEncrypt`、`AnsibleVaultStringDecrypt` 和
-`AnsibleVaultDiff`。
+`AnsibleVaultStringEncrypt` 和 `AnsibleVaultStringDecrypt`。
 
 ## 安全说明
 
@@ -588,8 +563,6 @@ Neovim 的 swap、undo、runtime 目录里搜索明文。
 - **`'backup'`** 对不经过本插件的写入仍然生效。
 - **明文在查看/编辑期间位于 Neovim 内存中**，因此可能进入操作系统 swap 分区或 core dump。
   如果这对你重要，请检查其他插件、剪贴板设置，以及终端/会话录制。
-- **`:VaultDiff`** 在设置了 `'diffexpr'` 或 `'diffopt'` 不含 `internal` 时会拒绝执行，
-  因为那种情况下 Neovim 会把两边内容都写到临时文件。
 
 ## 开发
 

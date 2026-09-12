@@ -449,7 +449,6 @@ local function parse_operation_options(args, opts)
     overrides = {},
     positionals = {},
     rekey_args = {},
-    git_ref = nil,
   }
 
   local index = 1
@@ -478,14 +477,6 @@ local function parse_operation_options(args, opts)
       result.overrides.rekey_vault_id = next_arg
       vim.list_extend(result.rekey_args, { arg, next_arg })
       index = index + 2
-    elseif arg == "--git" then
-      if next_arg and not next_arg:match("^%-") then
-        result.git_ref = next_arg
-        index = index + 2
-      else
-        result.git_ref = "HEAD"
-        index = index + 1
-      end
     elseif opts and opts.label_shortcut and not arg:match("^%-") and not result.overrides.encrypt_vault_id then
       result.overrides.encrypt_vault_id = arg
       index = index + 1
@@ -532,21 +523,6 @@ local function complete_operation_args(arg_lead, include_rekey, include_labels)
   end
   if include_labels then
     vim.list_extend(candidates, labels)
-  end
-
-  return vim.tbl_filter(function(candidate)
-    return vim.startswith(candidate, arg_lead)
-  end, candidates)
-end
-
----@param arg_lead string
----@return string[]
-local function complete_diff_args(arg_lead)
-  local candidates = complete_operation_args(arg_lead)
-  table.insert(candidates, "--git")
-
-  if not arg_lead:match("^%-") then
-    vim.list_extend(candidates, vim.fn.getcompletion(arg_lead, "file"))
   end
 
   return vim.tbl_filter(function(candidate)
@@ -2279,201 +2255,6 @@ function M.decrypt_string_under_cursor(opts)
   decrypt_string_selection(target, selection, "replace", opts)
 end
 
----@param path string
----@return string|nil
----@return string|nil
-local function read_text_file(path)
-  local file, err = io.open(path, "r")
-  if not file then
-    return nil, err
-  end
-
-  local content = file:read("*a")
-  file:close()
-  return content, nil
-end
-
----@param file_path string
----@param ref string
----@return string|nil
----@return string|nil
-local function read_git_file(file_path, ref)
-  local dir = vim.fn.fnamemodify(file_path, ":h")
-  local rel = vim.fn.systemlist({ "git", "-C", dir, "ls-files", "--full-name", file_path })
-  if vim.v.shell_error ~= 0 or not rel[1] or rel[1] == "" then
-    return nil, "file is not tracked by git"
-  end
-
-  local lines = vim.fn.systemlist({ "git", "-C", dir, "show", ref .. ":" .. rel[1] })
-  if vim.v.shell_error ~= 0 then
-    return nil, table.concat(lines, "\n")
-  end
-
-  return table.concat(lines, "\n"), nil
-end
-
----@param content string
----@param args string[]|nil
----@param opts? table
----@param callback fun(success: boolean, output: string): nil
-local function decrypt_content_if_needed(content, args, opts, callback, creds)
-  if not M.is_encrypted(content) then
-    callback(true, content)
-    return
-  end
-
-  run_vault("decrypt", content, args or {}, callback, opts, creds)
-end
-
----@param name string
----@param content string
----@param filetype string
----@return integer
-local function create_diff_buffer(name, content, filetype)
-  -- Hardened and made "nofile" before the decrypted content goes in, not after.
-  local buf = secure.create_buffer(false, true)
-  vim.bo[buf].buftype = "nofile"
-  pcall(vim.api.nvim_buf_set_name, buf, string.format("%s#%d", name, buf))
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, output_to_lines(content:gsub("\n$", "")))
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].filetype = filetype
-  vim.bo[buf].modifiable = false
-  return buf
-end
-
----Neovim's diff falls back to writing both buffers to temporary files when it
----cannot use its built-in algorithm. For decrypted content that would put
----plaintext on disk, so refuse instead.
----@return boolean ok
----@return string|nil reason
----Read against the raw option string rather than `vim.opt.diffopt:get()`: the
----structured view of key:value options changed shape between releases, from a
----list of "key:value" strings to a map, and silently reading the wrong shape
----here would disable VaultDiff entirely.
-local function diff_stays_in_memory()
-  if vim.o.diffexpr ~= "" then
-    return false, "'diffexpr' is set, so Neovim would write both sides to temporary files"
-  end
-
-  for item in vim.o.diffopt:gmatch("[^,]+") do
-    if item == "internal" then
-      return true, nil
-    end
-  end
-
-  return false, "'diffopt' does not include \"internal\", so Neovim would write both sides to temporary files"
-end
-
----@param left_name string
----@param left_content string
----@param right_name string
----@param right_content string
----@param filetype string
-local function open_diff_tab(left_name, left_content, right_name, right_content, filetype)
-  local left = create_diff_buffer(left_name, left_content, filetype)
-  local right = create_diff_buffer(right_name, right_content, filetype)
-
-  vim.cmd("tabnew")
-  vim.api.nvim_win_set_buf(0, left)
-  vim.cmd("diffthis")
-  vim.cmd("vsplit")
-  vim.api.nvim_win_set_buf(0, right)
-  vim.cmd("diffthis")
-end
-
----Diff the decrypted current buffer against a file or git revision.
----@param opts? table
-function M.diff(opts)
-  local target = vim.api.nvim_get_current_buf()
-  if not is_valid_buf(target) then
-    vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
-    return
-  end
-
-  local current_name = vim.api.nvim_buf_get_name(target)
-  local target_name
-  local target_content
-  local err
-
-  if opts and opts.git_ref then
-    if current_name == "" then
-      vim.notify("VaultDiff --git requires a file-backed buffer", vim.log.levels.ERROR)
-      return
-    end
-    target_name = string.format("git:%s:%s", opts.git_ref, vim.fn.fnamemodify(current_name, ":t"))
-    target_content, err = read_git_file(current_name, opts.git_ref)
-  elseif opts and opts.positionals and opts.positionals[1] then
-    local path = expand_path(opts.positionals[1])
-    target_name = path
-    target_content, err = read_text_file(path)
-  else
-    vim.notify("VaultDiff requires a file path or --git [ref]", vim.log.levels.ERROR)
-    return
-  end
-
-  if not target_content then
-    vim.notify("VaultDiff failed to read target: " .. (err or "unknown error"), vim.log.levels.ERROR)
-    return
-  end
-
-  local current_content = buffer_content(target)
-  local needs_password = M.is_encrypted(current_content) or M.is_encrypted(target_content)
-
-  if needs_password then
-    local diff_ok, diff_reason = diff_stays_in_memory()
-    if not diff_ok then
-      vim.notify("VaultDiff refused: " .. diff_reason, vim.log.levels.ERROR)
-      return
-    end
-  end
-
-  local filetype = vim.bo[target].filetype
-  local current_title = current_name ~= "" and current_name or "[current buffer]"
-
-  local function open_with_creds(creds)
-    local args = creds and creds.args or {}
-    local cleanup = creds and creds.cleanup or nil
-
-    decrypt_content_if_needed(current_content, args, opts, function(current_ok, current_plain)
-      if not current_ok then
-        run_cleanup(cleanup)
-        clear_password_cache()
-        vim.notify("VaultDiff failed to decrypt current buffer: " .. current_plain, vim.log.levels.ERROR)
-        return
-      end
-
-      decrypt_content_if_needed(target_content, args, opts, function(target_ok, target_plain)
-        run_cleanup(cleanup)
-        if not target_ok then
-          clear_password_cache()
-          vim.notify("VaultDiff failed to decrypt target: " .. target_plain, vim.log.levels.ERROR)
-          return
-        end
-
-        open_diff_tab(
-          "ansible-vault-diff://current/" .. vim.fn.fnamemodify(current_title, ":t"),
-          current_plain,
-          "ansible-vault-diff://target/" .. vim.fn.fnamemodify(target_name, ":t"),
-          target_plain,
-          filetype
-        )
-        emit_event("Diff", { buf = target, target = target_name })
-      end, creds)
-    end, creds)
-  end
-
-  if needs_password then
-    get_credentials(function(creds)
-      if not creds then
-        return
-      end
-      open_with_creds(creds)
-    end, opts, buffer_context(target))
-  else
-    open_with_creds(nil)
-  end
-end
-
 ---@return string[]
 local function discover_vault_files()
   local files
@@ -2806,7 +2587,6 @@ local COMPLETERS = {
   labels = function(arg_lead)
     return complete_operation_args(arg_lead, false, true)
   end,
-  diff = complete_diff_args,
   files = complete_files_args,
   create = complete_create_args,
 }
@@ -2869,14 +2649,6 @@ local COMMANDS = {
     nargs = 0,
     run = function()
       M.clear_password_cache()
-    end,
-  },
-  {
-    name = "VaultDiff",
-    desc = "Diff decrypted vault content",
-    complete = "diff",
-    run = function(_, parsed)
-      M.diff(parsed)
     end,
   },
   {
@@ -3072,10 +2844,8 @@ M._private = {
   parse_vault_from_yaml = parse_vault_from_yaml,
   output_to_lines = output_to_lines,
   complete_operation_args = complete_operation_args,
-  complete_diff_args = complete_diff_args,
   complete_files_args = complete_files_args,
   complete_create_args = complete_create_args,
-  diff_stays_in_memory = diff_stays_in_memory,
   needs_yaml_quoting = needs_yaml_quoting,
   yaml_quote_value = yaml_quote_value,
   redact_argv = redact_argv,

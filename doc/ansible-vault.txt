@@ -96,12 +96,6 @@ All commands accept optional vault credential overrides as arguments.
 :VaultClearPasswordCache
     Clear the in-memory interactive password cache.
 
-                                                 *:VaultDiff*
-:VaultDiff {file}
-:VaultDiff --git [ref]
-    Diff the decrypted current buffer against another vault file or a
-    Git revision. Both sides are decrypted before diffing.
-
                                                  *:VaultFiles*
 :VaultFiles [view|edit|rekey]
     Scan the current working directory for Ansible Vault files and
@@ -402,11 +396,6 @@ on the next attempt.
 `rekey(opts?)` ~
     Rekey the current file-backed encrypted buffer.
 
-                                     *ansible-vault.diff()*
-`diff(opts?)` ~
-    Diff decrypted content. `opts` can contain `positionals`
-    (file path) or `git_ref`.
-
                                      *ansible-vault.files()*
 `files(opts?)` ~
     Pick a vault file. `opts` can contain `positionals` with
@@ -480,7 +469,6 @@ The plugin emits |User| autocommands after successful operations:
     `AnsibleVaultRekey`
     `AnsibleVaultStringEncrypt`
     `AnsibleVaultStringDecrypt`
-    `AnsibleVaultDiff`
     `AnsibleVaultOperation`  (emitted for all operations)
 
 The event `data` contains at least `{ operation = "<name>" }`.
@@ -543,9 +531,6 @@ change. |:VaultInfo| and |:checkhealth| warn when they are enabled.
 - Decrypted content is in Neovim's memory while you view or edit it, so
   it can reach the OS swap partition or a core dump. Review your other
   plugins, clipboard settings and terminal or session recording.
-- |:VaultDiff| refuses to run when 'diffexpr' is set or 'diffopt' lacks
-  "internal", because Neovim would then write both sides to temporary
-  files.
 
 ==============================================================================
 9. HEALTH CHECK                                 *ansible-vault-health*
