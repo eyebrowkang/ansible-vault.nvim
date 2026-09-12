@@ -210,7 +210,7 @@ your global setup:
 ```vim
 :VaultEdit --vault-id prod@~/.ansible/prod-pass
 :VaultView --vault-password-file ~/.ansible/prod-pass
-:VaultEncryptString --encrypt-vault-id prod
+:VaultEncrypt --encrypt-vault-id prod
 :VaultDecrypt --ask-vault-password
 ```
 
@@ -251,20 +251,35 @@ no secret sits in Neovim's memory between operations.
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `:VaultEncrypt` | Encrypt current buffer |
-| `:VaultDecrypt` | Decrypt current buffer for editing; `:w` re-encrypts |
-| `:VaultCreate {file}` | Create a new encrypted file (`!` overwrites) |
-| `:VaultView` | View decrypted content in floating window |
-| `:VaultEdit` | Edit encrypted file in a scratch buffer, encrypt on save |
-| `:VaultRekey [args]` | Rekey the current encrypted file |
-| `:VaultEncryptString` | Encrypt selected text (visual mode) |
-| `:VaultDecryptString` | Decrypt selected inline vault string in place; `:w` restores it |
-| `:VaultViewString` | View selected encrypted string (visual mode) |
-| `:VaultEncryptStringUnderCursor` | Encrypt the YAML value under the cursor |
-| `:VaultViewStringUnderCursor` | View the inline vault block under the cursor |
-| `:VaultDecryptStringUnderCursor` | Decrypt the inline vault block under the cursor |
+Six commands. Each one works on a whole vault file *or* on a single inline
+`!vault` value, and figures out which from the buffer, the range and the cursor.
+
+| Command | Whole file | Inline `!vault` value |
+|---------|------------|-----------------------|
+| `:VaultEncrypt` | encrypt the buffer | `[range]` → turn those lines into a `!vault` value |
+| `:VaultDecrypt` | decrypt for editing; `:w` re-encrypts | decrypt one value in place; `:w` folds it back |
+| `:VaultView` | show decrypted content read-only | show one decrypted value read-only |
+| `:VaultEdit` | edit in a scratch buffer, encrypt on save | — |
+| `:VaultRekey` | `ansible-vault rekey` the file | re-encrypt one value with new credentials |
+| `:VaultCreate[!] {file}` | create a new encrypted file | — |
+
+### How the target is chosen
+
+In order, stopping at the first match:
+
+1. An explicit `[range]` → those lines, as an inline value.
+2. The buffer is mid-edit → whatever it was decrypted as.
+3. Line 1 is an `$ANSIBLE_VAULT` header → the whole file.
+4. Looking for something encrypted → the `!vault` block under the cursor.
+5. Looking for something to encrypt → the whole buffer.
+
+Step 5 is why `:VaultEncrypt` needs a range to encrypt one value: in a YAML file
+almost every line is a `key: value` pair, so guessing from the cursor would
+silently encrypt one line when you meant the file. `:.VaultEncrypt` encrypts the
+current line.
+
+None of this reads the `'<`/`'>` marks, so a command run from normal mode can
+never act on a visual selection you made earlier somewhere else in the buffer.
 
 ## Health Check
 
@@ -350,21 +365,22 @@ closed and the original encrypted file is reloaded.
 If the original file changed on disk while the scratch buffer was open, the save
 is refused to avoid overwriting someone else's changes.
 
-### Encrypt an Inline YAML String
+### Encrypt an Inline YAML Value
 
-Select text in visual mode and run:
+Give the lines to encrypt as a range — the current line, or a visual selection:
 
 ```vim
-:VaultEncryptString
+:.VaultEncrypt
+:'<,'>VaultEncrypt
 ```
 
-For a full YAML line:
+For a `key: value` line:
 
 ```yaml
 password: secret
 ```
 
-the plugin keeps the key and encrypts only the value:
+the key is kept and only the value is encrypted:
 
 ```yaml
 password: !vault |
@@ -372,64 +388,32 @@ password: !vault |
           ...
 ```
 
-You can also select only the value in `password: secret`; the plugin still
-inserts the encrypted value under the same YAML key.
+### View, Edit and Rekey an Inline YAML Value
 
-### View an Inline YAML Vault String
-
-Select a YAML vault block and run:
+Put the cursor anywhere inside a `!vault` block — no selection needed, the
+surrounding block is found for you:
 
 ```vim
-:VaultViewString
+:VaultView     " read-only floating window
+:VaultDecrypt  " decrypt in place for editing
+:VaultRekey    " re-encrypt this one value with new credentials
 ```
 
-The decrypted value opens in a read-only floating window. Press `q` or `<Esc>`
-to close it.
+After `:VaultDecrypt` the buffer enters **inline plaintext mode**: the decrypted
+value is tracked with an extmark, the buffer is hardened exactly as for
+whole-file decryption, and `:w` folds the value back into a `!vault` block before
+writing. Surrounding lines are written unchanged, so this works on files that are
+only partly encrypted. Other values in the same file stay encrypted and can be
+decrypted too.
 
-### Decrypt an Inline YAML Vault String
+`:VaultEncrypt` with no range folds the decrypted values back without writing —
+the inverse of `:VaultDecrypt`, and like the whole-file case it leaves `:w` to
+you.
 
-Select a YAML vault block and run:
-
-```vim
-:VaultDecryptString
-```
-
-For example:
-
-```yaml
-password: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          ...
-```
-
-is replaced with:
-
-```yaml
-password: secret
-```
-
-The buffer enters **inline plaintext mode**: the decrypted value is tracked, the
-buffer is hardened the same way as for whole-file decryption, and `:w` folds the
-value back into a `!vault` block before writing. Surrounding lines are written
-unchanged, so this works on files that are only partly encrypted.
-
-### Work With Inline Vault Strings Under Cursor
-
-When the cursor is on a plain YAML key/value line, run:
-
-```vim
-:VaultEncryptStringUnderCursor
-```
-
-When the cursor is on a YAML `!vault |` block, run:
-
-```vim
-:VaultViewStringUnderCursor
-:VaultDecryptStringUnderCursor
-```
-
-The plugin finds the surrounding vault block automatically, so you do not need
-to select the block by hand.
+`:VaultRekey` on an inline value has to decrypt with the old credentials and
+re-encrypt with the new ones, because `ansible-vault rekey` only accepts file
+paths. The plaintext exists only as a local variable for the duration of the
+call: it never goes into a buffer, a buffer variable, a notification or an event.
 
 ### Rekey an Encrypted File
 
@@ -476,12 +460,16 @@ vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decry
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
 vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
-vim.keymap.set("v", "<leader>vs", ":VaultEncryptString<cr>", { silent = true, desc = "Vault Encrypt String" })
-vim.keymap.set("v", "<leader>vS", ":VaultDecryptString<cr>", { silent = true, desc = "Vault Decrypt String" })
-vim.keymap.set("v", "<leader>vv", ":VaultViewString<cr>", { silent = true, desc = "Vault View String" })
-vim.keymap.set("n", "<leader>vs", "<cmd>VaultEncryptStringUnderCursor<cr>", { desc = "Vault Encrypt String" })
-vim.keymap.set("n", "<leader>vS", "<cmd>VaultDecryptStringUnderCursor<cr>", { desc = "Vault Decrypt String" })
+
+-- Visual mode passes the selection as a range, so these need the `:` form, not
+-- `<cmd>`, which would not carry it.
+vim.keymap.set("x", "<leader>ve", ":VaultEncrypt<cr>", { silent = true, desc = "Vault Encrypt" })
+vim.keymap.set("x", "<leader>vd", ":VaultDecrypt<cr>", { silent = true, desc = "Vault Decrypt" })
+vim.keymap.set("x", "<leader>vv", ":VaultView<cr>", { silent = true, desc = "Vault View" })
 ```
+
+The same six commands serve both scopes, so one keymap per verb covers whole
+files from normal mode and inline values from visual mode.
 
 ## Statusline Integration
 
@@ -540,19 +528,10 @@ vault.edit()
 -- Rekey current encrypted file
 vault.rekey()
 
--- Encrypt selected text
-vault.encrypt_string()
-
--- Decrypt selected text
-vault.decrypt_string()
-
--- View selected encrypted string in floating window
-vault.view_string()
-
--- Cursor-based inline YAML helpers
-vault.encrypt_string_under_cursor()
-vault.view_string_under_cursor()
-vault.decrypt_string_under_cursor()
+-- Each verb takes the same scope hints the commands use. Pass a range to act on
+-- an inline value; omit it for the whole buffer or the block under the cursor.
+vault.encrypt(nil, { range = 1, line1 = 7, line2 = 7 })
+vault.decrypt() -- the !vault block under the cursor
 
 -- Drop every secret this process still holds (also runs on VimLeavePre)
 vault.cleanup()
@@ -576,26 +555,6 @@ The event `data` carries `op` (`"encrypt"`, `"decrypt"`, `"view"`, `"edit"`,
 `"save"`, `"rekey"` or `"create"`), `scope` (`"file"` or `"inline"`) and the
 buffer and file it applied to. One pattern means one autocmd can react to
 everything and filter on `op`/`scope`.
-
-## Inline YAML Strings
-
-`VaultEncryptString` uses `ansible-vault encrypt_string --stdin-name`.
-When the selection is a full YAML key/value line such as:
-
-```yaml
-password: secret
-```
-
-the plugin encrypts only the value and keeps the original key:
-
-```yaml
-password: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          ...
-```
-
-When only the value is selected in `password: secret`, the replacement is also
-inserted as the value for `password`.
 
 ## Security Notes
 
