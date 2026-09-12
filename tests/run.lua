@@ -39,4 +39,5 @@ if filter and ran == 0 then
 end
 
 io.stdout:write(string.format("All tests passed (%d)\n", ran))
+io.stdout:flush()
 vim.cmd("qa!")
