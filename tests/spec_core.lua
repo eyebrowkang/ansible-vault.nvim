@@ -368,10 +368,8 @@ return function(H, tests)
 
     local buf = new_buffer({ "plain" })
 
-    -- `--vault-pass-file` is a real ansible-vault alias, so users will type it.
-    -- Silently treating it as a positional used to fall through to a password
-    -- prompt, which reads as "the credential was not found".
-    vim.cmd("VaultEncrypt --vault-pass-file /nope")
+    -- A misspelled flag must be rejected, not treated as a positional argument.
+    vim.cmd("VaultEncrypt --vault-password-fiel /nope")
     assert_true(notification_contains("unknown or incomplete argument"), "the bad flag was not reported")
     assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "plain" }, "the buffer must be left alone")
 
@@ -384,8 +382,8 @@ return function(H, tests)
     reset_config(fake)
     local good = vim.deepcopy(vault.config)
 
-    vault.setup({ ansible_vault_path = fake.path, notify_success = false })
-    assert_true(notification_contains("unknown option: notify_success"), "an unknown key was accepted")
+    vault.setup({ ansible_vault_path = fake.path, unknown_option = false })
+    assert_true(notification_contains("unknown option: unknown_option"), "an unknown key was accepted")
     assert_eq(vault.config, good, "a rejected setup must not change the configuration")
 
     vault.setup({ ansible_vault_path = fake.path, vault_ids = 42 })
@@ -805,8 +803,7 @@ return function(H, tests)
     write_file(new_pass, "new\n")
     reset_config(fake, { password_files = old_pass, new_password_file = new_pass })
 
-    -- A 1.2 header: this is the case where the plugin used to derive
-    -- --encrypt-vault-id from the label it found.
+    -- A 1.2 label must be preserved without passing --encrypt-vault-id.
     local path = fake.dir .. "/labelled.yml"
     write_file(path, "$ANSIBLE_VAULT;1.2;AES256;prod\nEDITME\n")
     vim.cmd("edit " .. vim.fn.fnameescape(path))

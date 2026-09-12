@@ -302,11 +302,10 @@ assert_true(read_file(created):match("^%$ANSIBLE_VAULT"), "VaultCreate did not w
 
 -- 5. Rekey really changes the password, and keeps a 1.2 label.
 --
--- This is the case the plugin used to get wrong. Passing --encrypt-vault-id on
--- `rekey` makes Ansible seed the NEW secret pool with the OLD identities from
--- ansible.cfg and then pick from that mixed pool by label, so with a `prod`
--- identity configured the file was re-encrypted with the OLD password and
--- ansible-vault still reported success. Nothing but a real binary catches that.
+-- Passing --encrypt-vault-id on `rekey` makes Ansible seed the NEW secret pool
+-- with the OLD identities from ansible.cfg and pick from that pool by label.
+-- With a matching identity, it re-encrypts with the OLD password and reports
+-- success. Only a real binary can verify that the password actually changed.
 local rekey_dir = workdir .. "/rekey-label"
 vim.fn.mkdir(rekey_dir, "p")
 local rekey_old = rekey_dir .. "/old-pass"
@@ -316,8 +315,8 @@ write_file(rekey_new, "new-secret\n")
 vim.fn.setfperm(rekey_old, "rw-------")
 vim.fn.setfperm(rekey_new, "rw-------")
 
--- The old identity is reachable under the same label the file carries, which is
--- exactly the configuration that produced the silent no-op rekey.
+-- Make the old identity reachable under the file's label to catch a silent
+-- no-op rekey.
 write_file(rekey_dir .. "/ansible.cfg", "[defaults]\nvault_identity_list = prod@old-pass\n")
 
 local rekey_file = rekey_dir .. "/secret.yml"
