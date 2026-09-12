@@ -36,9 +36,6 @@ local ASKPASS_SCRIPT = "#!/bin/sh\n# Written by ansible-vault.nvim. Contains no 
 
 local askpass_path = nil
 
----@type { password: string|nil, expires_at: number, timer: userdata|nil }
-local password_cache = { password = nil, expires_at = 0, timer = nil }
-
 ---Temp password files created by the fallback path, so they can be swept if an
 ---operation never completes.
 ---@type table<string, boolean>
@@ -168,55 +165,6 @@ function M.cleanup_all()
     os.remove(path)
   end
   pending_tempfiles = {}
-end
-
---- Password cache ---------------------------------------------------------
-
----@param ttl any
----@return boolean
-local function should_cache(ttl)
-  return type(ttl) == "number" and ttl > 0
-end
-
-function M.clear_password_cache()
-  password_cache.password = nil
-  password_cache.expires_at = 0
-  if password_cache.timer and not password_cache.timer:is_closing() then
-    password_cache.timer:stop()
-    password_cache.timer:close()
-  end
-  password_cache.timer = nil
-end
-
----@param password string
----@param ttl number
-local function cache_password(password, ttl)
-  M.clear_password_cache()
-  password_cache.password = password
-  password_cache.expires_at = os.time() + ttl
-
-  -- Expire eagerly. A lazy check would leave the password in the Lua heap until
-  -- the next vault operation, which may never come.
-  local timer = uv.new_timer()
-  if timer then
-    password_cache.timer = timer
-    timer:start(ttl * 1000, 0, function()
-      vim.schedule(function()
-        M.clear_password_cache()
-      end)
-    end)
-  end
-end
-
----@return string|nil
-local function cached_password(ttl)
-  if not should_cache(ttl) then
-    return nil
-  end
-  if password_cache.password and password_cache.expires_at > os.time() then
-    return password_cache.password
-  end
-  return nil
 end
 
 --- Planning ---------------------------------------------------------------
@@ -364,23 +312,17 @@ function M.resolve(config, context, callback)
     return
   end
 
-  local password = cached_password(config.password_cache_ttl)
-  if not password then
-    local ok, entered = pcall(vim.fn.inputsecret, "Ansible Vault Password: ")
-    vim.cmd("redraw")
+  -- Never held beyond the operation that needs it: the prompt runs per
+  -- operation, and the password lives only in this local and the child's
+  -- environment. Caching it would put a secret in the Lua heap for a window the
+  -- user cannot see or audit.
+  local ok, password = pcall(vim.fn.inputsecret, "Ansible Vault Password: ")
+  vim.cmd("redraw")
 
-    if not ok or not is_nonempty_string(entered) then
-      vim.notify("Password is required", vim.log.levels.ERROR)
-      callback(nil)
-      return
-    end
-
-    password = entered
-    if should_cache(config.password_cache_ttl) then
-      cache_password(password, config.password_cache_ttl)
-    else
-      M.clear_password_cache()
-    end
+  if not ok or not is_nonempty_string(password) then
+    vim.notify("Password is required", vim.log.levels.ERROR)
+    callback(nil)
+    return
   end
 
   local creds, err = credentials_for_password(plan, password)

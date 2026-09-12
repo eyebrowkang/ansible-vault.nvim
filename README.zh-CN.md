@@ -26,7 +26,6 @@ English documentation: [README.md](README.md)
 - 像 ansible 一样读取 `ansible.cfg` 和 `ANSIBLE_*` 环境变量，并从当前文件向上查找
 - 支持 password file、一个或多个 vault ID，或交互式输入
 - 支持命令级凭据覆盖和命令行补全
-- 可选：在内存中短时缓存交互式密码
 
 **保真**
 
@@ -37,12 +36,11 @@ English documentation: [README.md](README.md)
 
 - `:checkhealth ansible-vault` 诊断
 - 通过一个 `User` autocmd event 集成 statusline 或其他插件
-- 支持通过 `conda run` 调用 Conda 环境中的 `ansible-vault`
 
 ## 依赖
 
 - Neovim >= 0.12
-- `ansible-vault` 可执行文件在 `PATH` 中，或通过配置指定路径/Conda 环境
+- `ansible-vault` 可执行文件在 `PATH` 中，或通过 `setup()` 指定路径
 
 ### 版本支持策略
 
@@ -105,24 +103,17 @@ require("ansible-vault").setup({
   -- 读取加密文件后自动使用 :VaultEdit 打开安全编辑 buffer
   auto_edit = false,
 
-  -- 交互式密码在内存中的缓存秒数。0 表示每次操作都重新询问。
-  password_cache_ttl = 0,
-
-  -- ansible-vault 命令超时时间，单位毫秒。0 表示关闭超时。
-  timeout_ms = 30000,
-
-  -- 操作成功后是否显示 info 级通知
-  notify_success = true,
-
-  -- ansible-vault 所在的 Conda 环境名
-  -- 插件会执行：conda run -n <env> ansible-vault ...
-  conda_env = nil,
-
   -- 自定义 ansible-vault 可执行文件路径
   ansible_vault_path = nil,
+})
+```
 
-  -- 开启调试日志
-  debug = false,
+Conda 环境不需要专门的配置项，直接把 `ansible_vault_path` 指向该环境里的
+可执行文件即可：
+
+```lua
+require("ansible-vault").setup({
+  ansible_vault_path = "~/miniconda3/envs/ansible-dev/bin/ansible-vault",
 })
 ```
 
@@ -188,7 +179,6 @@ header。
 | `:VaultCreate {file}` | 新建加密文件（`!` 覆盖已有文件）|
 | `:VaultView` | 在只读浮窗中查看解密内容 |
 | `:VaultEdit` | 在 scratch buffer 中编辑解密内容，`:write` 时重新加密保存 |
-| `:VaultClearPasswordCache` | 清理内存中的交互式密码缓存 |
 | `:VaultRekey [args]` | 对当前加密文件执行 rekey |
 | `:VaultEncryptString` | 加密视觉选择的文本 |
 | `:VaultDecryptString` | 原地解密选中的 inline vault 字符串，`:w` 会还原 |
@@ -207,7 +197,7 @@ header。
 
 健康检查会报告：
 
-- `ansible-vault` 可执行文件，包括 `conda run` 包装
+- `ansible-vault` 可执行文件
 - 当前**实际生效**的凭据来源（与真实操作走同一份解析代码）
 - 命中的 `ansible.cfg`、命中方式，以及 `ansible-vault` 将在哪个目录下运行
 - password file 的可读性和权限，并把可执行的密码脚本识别为受支持的配置
@@ -284,20 +274,6 @@ require("ansible-vault").setup({
 ```
 
 保存后插件会重新载入原始加密 buffer，并避免因为重新载入而再次触发自动编辑。
-
-### 调整通知和超时
-
-默认情况下，vault 命令 30 秒后超时。可以设置 `timeout_ms = 0` 关闭超时，
-或者降低这个值以更快得到失败反馈：
-
-```lua
-require("ansible-vault").setup({
-  timeout_ms = 10000,
-  notify_success = false,
-})
-```
-
-`notify_success = false` 只会静音成功后的 info 通知；错误和警告仍然会显示。
 
 ### 加密 YAML inline 字符串
 
@@ -459,7 +435,6 @@ vault.decrypt()
 vault.view()
 vault.edit()
 vault.rekey()
-vault.clear_password_cache()
 vault.encrypt_string()
 vault.decrypt_string()
 vault.view_string()
@@ -504,7 +479,7 @@ buffer 和文件路径。只有一个 pattern，因此一个 autocmd 就能响�
   `stdpath("run")` 下一个**不含任何密钥**的静态辅助脚本读回。在无法这样做的平台上会退回到
   `0600` 临时文件，退出时删除，`:checkhealth` 会告诉你当前用的是哪种方式。
 - **错误信息里不含密文/明文。** 子进程 stdout 绝不会被回显 —— `ansible-vault decrypt`
-  可能先把明文写到 stdout 再以非零码退出。debug 日志会对凭据参数脱敏，且只走
+  可能先把明文写到 stdout 再以非零码退出。插件确实会展示的 argv 都已对凭据值脱敏，且只走
   `vim.notify`，不往 stdout 打印。
 - **argv 里没有明文。** 内容走 stdin，密码按引用传递，`ps` 里都看不到。
 - **原子写入。** 密文先写到同目录的临时文件，`fsync` 后再 rename 就位，并继承原文件权限。
