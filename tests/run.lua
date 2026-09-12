@@ -203,12 +203,12 @@ local function reset_config(fake, opts)
     ansible_vault_path = fake.path,
   }
 
-  if not opts or opts.password_file ~= false then
-    config.password_file = opts and opts.password_file or make_password_file(fake.dir)
+  if not opts or opts.password_files ~= false then
+    config.password_files = opts and opts.password_files or make_password_file(fake.dir)
   end
 
   for key, value in pairs(opts or {}) do
-    if not (key == "password_file" and value == false) then
+    if not (key == "password_files" and value == false) then
       config[key] = value
     end
   end
@@ -271,7 +271,7 @@ tests["encrypt uses argv and supports paths with spaces"] = function()
     return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
   end, "encrypt did not update target buffer")
 
-  assert_true(log_contains(fake.log, "ARG:" .. config.password_file), "password path was not passed as one argv item")
+  assert_true(log_contains(fake.log, "ARG:" .. config.password_files), "password path was not passed as one argv item")
   assert_false(log_contains(fake.log, "ARG:--encrypt-vault-id"), "default encryption must not force --encrypt-vault-id")
   assert_true(vault.is_buffer_encrypted(buf), "buffer should report itself encrypted")
 end
@@ -318,7 +318,7 @@ end
 tests["vault_id does not imply default encrypt vault id"] = function()
   local fake = create_fake_vault()
   local pass = make_password_file(fake.dir)
-  reset_config(fake, { password_file = false, vault_id = "prod@" .. pass, encrypt_vault_id = nil })
+  reset_config(fake, { password_files = false, vault_ids = "prod@" .. pass, encrypt_vault_id = nil })
 
   local buf = new_buffer({ "plain" })
   vault.encrypt(buf)
@@ -330,7 +330,7 @@ tests["vault_id does not imply default encrypt vault id"] = function()
   assert_true(log_contains(fake.log, "ARG:prod@" .. pass), "vault_id was not passed")
   assert_false(log_contains(fake.log, "ARG:--encrypt-vault-id"), "encrypt_vault_id should be opt-in")
 
-  reset_config(fake, { password_file = false, vault_id = "prod@" .. pass, encrypt_vault_id = "prod" })
+  reset_config(fake, { password_files = false, vault_ids = "prod@" .. pass, encrypt_vault_id = "prod" })
   local other = new_buffer({ "plain" })
   vault.encrypt(other)
 
@@ -347,7 +347,7 @@ tests["vault_ids pass multiple vault identities"] = function()
   local dev_pass = make_password_file(fake.dir)
   local prod_pass = make_password_file(fake.dir)
   reset_config(fake, {
-    password_file = false,
+    password_files = false,
     vault_ids = { "dev@" .. dev_pass, "prod@" .. prod_pass },
     encrypt_vault_id = "prod",
   })
@@ -511,7 +511,7 @@ tests["command args can override encrypt vault id"] = function()
   local dev_pass = make_password_file(fake.dir)
   local prod_pass = make_password_file(fake.dir)
   reset_config(fake, {
-    password_file = false,
+    password_files = false,
     vault_ids = { "dev@" .. dev_pass, "prod@" .. prod_pass },
   })
 
@@ -520,14 +520,148 @@ tests["command args can override encrypt vault id"] = function()
   vim.fn.setpos("'<", { 0, 1, 1, 0 })
   vim.fn.setpos("'>", { 0, 1, #line, 0 })
 
-  vim.cmd("VaultEncryptString prod")
+  vim.cmd("VaultEncryptString --encrypt-vault-id prod")
 
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
   end, "VaultEncryptString command arg did not encrypt")
 
-  assert_true(log_contains(fake.log, "ARG:--encrypt-vault-id"), "shortcut encrypt vault id flag was not passed")
-  assert_true(log_has_line(fake.log, "ARG:prod"), "shortcut encrypt vault id value was not passed")
+  assert_true(log_contains(fake.log, "ARG:--encrypt-vault-id"), "encrypt vault id flag was not passed")
+  assert_true(log_has_line(fake.log, "ARG:prod"), "encrypt vault id value was not passed")
+end
+
+tests["--vault-password-file can be repeated"] = function()
+  local fake = create_fake_vault()
+  local first = fake.dir .. "/first-pass"
+  local second = fake.dir .. "/second-pass"
+  write_file(first, "one\n")
+  write_file(second, "two\n")
+  reset_config(fake, { password_files = false })
+
+  local buf = new_buffer({ "plain" })
+  vim.cmd(
+    string.format(
+      "VaultEncrypt --vault-password-file %s --vault-password-file %s",
+      vim.fn.fnameescape(first),
+      vim.fn.fnameescape(second)
+    )
+  )
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
+  end, "encrypt with two password files did not finish")
+
+  assert_true(log_has_line(fake.log, "ARG:" .. first), "the first password file was dropped")
+  assert_true(log_has_line(fake.log, "ARG:" .. second), "the second password file was dropped")
+end
+
+tests["password_files accepts a single string or a list"] = function()
+  local fake = create_fake_vault()
+  local pass = make_password_file(fake.dir)
+  reset_config(fake, { password_files = { pass } })
+
+  local buf = new_buffer({ "plain" })
+  vault.encrypt(buf)
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
+  end, "encrypt with a one-element list did not finish")
+
+  assert_true(log_has_line(fake.log, "ARG:" .. pass), "a one-element list should behave like a bare string")
+end
+
+tests["a command password-file override replaces the configured list"] = function()
+  local fake = create_fake_vault()
+  local first = fake.dir .. "/configured-one"
+  local second = fake.dir .. "/configured-two"
+  local override = fake.dir .. "/override-pass"
+  for _, path in ipairs({ first, second, override }) do
+    write_file(path, "secret\n")
+  end
+  reset_config(fake, { password_files = { first, second } })
+
+  local buf = new_buffer({ "plain" })
+  vim.cmd("VaultEncrypt --vault-password-file " .. vim.fn.fnameescape(override))
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
+  end, "encrypt with an overridden password file did not finish")
+
+  assert_true(log_has_line(fake.log, "ARG:" .. override), "the override was not passed")
+  -- A merged list would leave the second configured entry in place and pass a
+  -- credential the user did not name on the command line.
+  assert_false(log_has_line(fake.log, "ARG:" .. first), "the configured list must be replaced, not merged")
+  assert_false(log_has_line(fake.log, "ARG:" .. second), "the configured list must be replaced, not merged")
+end
+
+tests["--ask-vault-password forces a prompt over configured credentials"] = function()
+  local fake = create_fake_vault()
+  local pass = make_password_file(fake.dir)
+  reset_config(fake, { password_files = pass })
+
+  local original_inputsecret = vim.fn.inputsecret
+  local prompted = false
+  vim.fn.inputsecret = function()
+    prompted = true
+    return "typed"
+  end
+
+  local buf = new_buffer({ "plain" })
+  vim.cmd("VaultEncrypt --ask-vault-password")
+
+  wait_until(function()
+    return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
+  end, "encrypt with a forced prompt did not finish")
+
+  vim.fn.inputsecret = original_inputsecret
+  assert_true(prompted, "the flag must prompt even though a password file is configured")
+  assert_false(log_has_line(fake.log, "ARG:" .. pass), "the configured password file must not also be passed")
+  -- The flag is plugin-level: ansible-vault puts --ask-vault-password and
+  -- --vault-password-file in one mutually exclusive group, and the child has no
+  -- tty to prompt on anyway.
+  assert_false(log_has_line(fake.log, "ARG:--ask-vault-password"), "the flag must not reach ansible-vault")
+  assert_true(log_has_line(fake.log, "ENVPW:set"), "the typed password should go through the environment")
+end
+
+tests["an unknown argument is rejected instead of ignored"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+
+  local buf = new_buffer({ "plain" })
+
+  -- `--vault-pass-file` is a real ansible-vault alias, so users will type it.
+  -- Silently treating it as a positional used to fall through to a password
+  -- prompt, which reads as "the credential was not found".
+  vim.cmd("VaultEncrypt --vault-pass-file /nope")
+  assert_true(notification_contains("unknown or incomplete argument"), "the bad flag was not reported")
+  assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "plain" }, "the buffer must be left alone")
+
+  vim.cmd("VaultEncrypt stray-positional")
+  assert_true(notification_contains("unexpected argument"), "a stray positional was not reported")
+end
+
+tests["setup rejects unknown keys and impossible combinations"] = function()
+  local fake = create_fake_vault()
+  reset_config(fake)
+  local good = vim.deepcopy(vault.config)
+
+  vault.setup({ ansible_vault_path = fake.path, notify_success = false })
+  assert_true(notification_contains("unknown option: notify_success"), "an unknown key was accepted")
+  assert_eq(vault.config, good, "a rejected setup must not change the configuration")
+
+  vault.setup({ ansible_vault_path = fake.path, vault_ids = 42 })
+  assert_true(notification_contains("vault_ids must be string or table"), "a wrong type was accepted")
+
+  vault.setup({ ask_password = true, password_files = "/some/pass" })
+  assert_true(
+    notification_contains("ask_password cannot be combined with password_files"),
+    "ansible-vault treats these as mutually exclusive"
+  )
+
+  vault.setup({ new_vault_id = "new@/a", new_password_file = "/b" })
+  assert_true(
+    notification_contains("new_vault_id and new_password_file are mutually exclusive"),
+    "ansible-vault puts these in one mutually exclusive group"
+  )
 end
 
 tests["command vault-id override replaces configured password file"] = function()
@@ -537,7 +671,7 @@ tests["command vault-id override replaces configured password file"] = function(
   write_file(old_pass, "old\n")
   write_file(prod_pass, "prod\n")
 
-  reset_config(fake, { password_file = old_pass })
+  reset_config(fake, { password_files = old_pass })
 
   new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "TARGET" })
   vim.cmd("VaultView --vault-id prod@" .. prod_pass)
@@ -557,7 +691,7 @@ tests["command completion exposes override flags and inline labels"] = function(
   local fake = create_fake_vault()
   local prod_pass = make_password_file(fake.dir)
   reset_config(fake, {
-    password_file = false,
+    password_files = false,
     vault_ids = { "prod@" .. prod_pass },
   })
 
@@ -571,7 +705,7 @@ end
 
 tests["an interactive password is never reused across operations"] = function()
   local fake = create_fake_vault()
-  reset_config(fake, { password_file = false })
+  reset_config(fake, { password_files = false })
 
   local original_inputsecret = vim.fn.inputsecret
   local prompt_count = 0
@@ -715,7 +849,7 @@ end
 tests["VaultRekey rekeys a file-backed encrypted buffer"] = function()
   local fake = create_fake_vault()
   local new_pass = make_password_file(fake.dir)
-  reset_config(fake, { rekey_password_file = new_pass })
+  reset_config(fake, { new_password_file = new_pass })
 
   local original_file = fake.dir .. "/rekey.yml"
   write_file(original_file, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
@@ -787,7 +921,7 @@ end
 
 tests["B5 a failed password is re-prompted"] = function()
   local fake = create_fake_vault()
-  reset_config(fake, { password_file = false })
+  reset_config(fake, { password_files = false })
 
   local original_inputsecret = vim.fn.inputsecret
   local prompt_count = 0
@@ -924,7 +1058,7 @@ tests["B9 command args support quoted paths with spaces"] = function()
   vim.fn.mkdir(fake.dir .. "/path with spaces", "p")
   write_file(pass_path, "secret\n")
   vim.fn.setfperm(pass_path, "rw-------")
-  reset_config(fake, { password_file = false })
+  reset_config(fake, { password_files = false })
 
   new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
   local cmd = "VaultView --vault-password-file '" .. pass_path .. "'"
@@ -944,7 +1078,7 @@ tests["B9 command args support escaped spaces"] = function()
   vim.fn.mkdir(fake.dir .. "/path with spaces", "p")
   write_file(pass_path, "secret\n")
   vim.fn.setfperm(pass_path, "rw-------")
-  reset_config(fake, { password_file = false })
+  reset_config(fake, { password_files = false })
 
   new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
   local escaped_path = pass_path:gsub(" ", "\\ ")
@@ -1361,7 +1495,7 @@ end
 
 tests["ansible.cfg found upward supplies credentials without extra flags"] = function()
   local fake = create_fake_vault()
-  reset_config(fake, { password_file = false })
+  reset_config(fake, { password_files = false })
 
   local root = make_project({ "[defaults]", "vault_password_file = .vault_pass" })
   local buf = new_file_buffer(root .. "/group_vars/prod", "vault.yml", { "plain" })
@@ -1387,7 +1521,7 @@ tests["configured credentials name an identity when ansible.cfg adds one"] = fun
   local fake = create_fake_vault()
   local root = make_project({ "[defaults]", "vault_password_file = .vault_pass" })
   local own_pass = make_password_file(fake.dir)
-  reset_config(fake, { password_file = own_pass })
+  reset_config(fake, { password_files = own_pass })
 
   local buf = new_file_buffer(root .. "/group_vars/prod", "vault.yml", { "plain" })
 
@@ -1406,7 +1540,7 @@ end
 
 tests["ANSIBLE_VAULT_PASSWORD_FILE is honoured and outranks ansible.cfg"] = function()
   local fake = create_fake_vault()
-  reset_config(fake, { password_file = false })
+  reset_config(fake, { password_files = false })
 
   local root = make_project({ "[defaults]", "vault_password_file = .vault_pass" })
   local env_pass = make_password_file(fake.dir)
@@ -1425,7 +1559,7 @@ end
 
 tests["ansible.cfg relative paths resolve against the config directory"] = function()
   local fake = create_fake_vault()
-  reset_config(fake, { password_file = false })
+  reset_config(fake, { password_files = false })
 
   local root = make_project({ "[defaults]", "vault_password_file = .vault_pass" })
   local cfg = require("ansible-vault.ansible_cfg")
@@ -1443,7 +1577,7 @@ tests["a command vault-id override replaces the configured list"] = function()
   local fake = create_fake_vault()
   local dev = make_password_file(fake.dir)
   local prod = make_password_file(fake.dir)
-  reset_config(fake, { password_file = false, vault_ids = { "dev@" .. dev, "prod@" .. prod } })
+  reset_config(fake, { password_files = false, vault_ids = { "dev@" .. dev, "prod@" .. prod } })
 
   local buf = new_buffer({ "plain" })
   vim.cmd("VaultEncrypt --vault-id only@" .. vim.fn.fnameescape(dev))
@@ -1458,7 +1592,7 @@ end
 
 tests["interactive passwords never reach the filesystem"] = function()
   local fake = create_fake_vault()
-  reset_config(fake, { password_file = false })
+  reset_config(fake, { password_files = false })
 
   local original = vim.fn.inputsecret
   vim.fn.inputsecret = function()

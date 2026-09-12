@@ -1,11 +1,17 @@
+---Plugin configuration.
+---
+---One key per `ansible-vault` flag, named after it, so there is nothing to learn
+---twice: whatever the Ansible documentation tells you to pass, the key is here
+---under the same name. `vault_ids` and `password_files` accept a single string or
+---a list, because the flags they stand for are repeatable.
 ---@class AnsibleVaultConfig
----@field password_file? string Path to ansible-vault password file
----@field vault_id? string Vault ID to use, for example "prod@~/.vault_pass"
----@field vault_ids? string[] Vault IDs to use, for example { "dev@~/.dev-pass", "prod@~/.prod-pass" }
----@field encrypt_vault_id? string Vault ID label to use for encryption
----@field rekey_password_file? string New vault password file for VaultRekey
----@field rekey_vault_id? string New vault ID for VaultRekey, for example "prod@~/.ansible/new-pass"
----@field ansible_vault_path? string Custom path to ansible-vault executable
+---@field vault_ids? string|string[] `--vault-id`, for example "prod@~/.vault_pass"
+---@field password_files? string|string[] `--vault-password-file`
+---@field ask_password? boolean Always prompt, ignoring any configured or discovered credential
+---@field encrypt_vault_id? string `--encrypt-vault-id`: which identity to encrypt with
+---@field new_vault_id? string `--new-vault-id` for VaultRekey
+---@field new_password_file? string `--new-vault-password-file` for VaultRekey
+---@field ansible_vault_path? string Path to the ansible-vault executable
 
 local ansible_cfg = require("ansible-vault.ansible_cfg")
 local credentials = require("ansible-vault.credentials")
@@ -34,13 +40,23 @@ local remember_header
 
 ---@type AnsibleVaultConfig
 local DEFAULT_CONFIG = {
-  password_file = nil,
-  vault_id = nil,
   vault_ids = nil,
+  password_files = nil,
+  ask_password = false,
   encrypt_vault_id = nil,
-  rekey_password_file = nil,
-  rekey_vault_id = nil,
+  new_vault_id = nil,
+  new_password_file = nil,
   ansible_vault_path = nil,
+}
+
+local CONFIG_TYPES = {
+  vault_ids = { "string", "table" },
+  password_files = { "string", "table" },
+  ask_password = { "boolean" },
+  encrypt_vault_id = { "string" },
+  new_vault_id = { "string" },
+  new_password_file = { "string" },
+  ansible_vault_path = { "string" },
 }
 
 ---@type AnsibleVaultConfig
@@ -79,16 +95,19 @@ end
 
 ---Merge per-command overrides over the configured defaults.
 ---
----`vault_ids` is replaced wholesale rather than merged: `tbl_deep_extend` merges
----list-like tables element by element, so a single `--vault-id x` against a
----configured list would leave the remaining configured entries in place.
+---The list-valued keys are replaced wholesale rather than merged:
+---`tbl_deep_extend` merges list-like tables element by element, so a single
+---`--vault-id x` against a configured list of two would leave the second
+---configured entry in place and silently pass a credential the user did not name.
 ---@param opts? table
 ---@return table
 local function effective_config(opts)
   local overrides = opts and (opts.overrides or opts) or {}
   local config = vim.tbl_deep_extend("force", M.config, overrides)
-  if overrides.vault_ids ~= nil then
-    config.vault_ids = overrides.vault_ids
+  for _, key in ipairs({ "vault_ids", "password_files" }) do
+    if overrides[key] ~= nil then
+      config[key] = overrides[key]
+    end
   end
   return config
 end
@@ -250,12 +269,12 @@ local function with_rekey_target_args(extra_args, opts)
     return args
   end
 
-  if is_nonempty_string(config.rekey_password_file) then
-    table.insert(args, "--new-vault-password-file")
-    table.insert(args, expand_path(config.rekey_password_file))
-  elseif is_nonempty_string(config.rekey_vault_id) then
+  if is_nonempty_string(config.new_vault_id) then
     table.insert(args, "--new-vault-id")
-    table.insert(args, expand_vault_id(config.rekey_vault_id))
+    table.insert(args, expand_vault_id(config.new_vault_id))
+  elseif is_nonempty_string(config.new_password_file) then
+    table.insert(args, "--new-vault-password-file")
+    table.insert(args, expand_path(config.new_password_file))
   end
 
   return args
@@ -406,6 +425,13 @@ end
 ---@param args string[]|nil
 ---@param opts? table
 ---@return table
+---Parse command arguments into config overrides.
+---
+---Credential flags are spelled exactly as `ansible-vault` spells them, and an
+---unrecognised one is an error rather than a silently ignored positional: a typo
+---like `--vault-pasword-file` used to fall through to an interactive prompt,
+---which looks like the credential simply was not found.
+---@return table|nil parsed, string|nil err
 local function parse_operation_options(args, opts)
   local result = {
     overrides = {},
@@ -413,42 +439,63 @@ local function parse_operation_options(args, opts)
     rekey_args = {},
   }
 
+  -- A command-line credential replaces the configured ones outright rather than
+  -- adding to them; `false` is the sentinel `effective_config` reads as "unset".
+  local function exclusive(key)
+    for _, other in ipairs({ "password_files", "vault_ids", "ask_password" }) do
+      if other ~= key and result.overrides[other] == nil then
+        result.overrides[other] = false
+      end
+    end
+  end
+
   local index = 1
   while index <= #(args or {}) do
     local arg = args[index]
     local next_arg = args[index + 1]
 
-    if (arg == "--vault-password-file" or arg == "--vault-pass-file" or arg == "--password-file") and next_arg then
-      result.overrides.password_file = next_arg
-      result.overrides.vault_id = false
-      result.overrides.vault_ids = false
+    if arg == "--vault-password-file" and next_arg then
+      exclusive("password_files")
+      result.overrides.password_files = result.overrides.password_files or {}
+      table.insert(result.overrides.password_files, next_arg)
       index = index + 2
     elseif arg == "--vault-id" and next_arg then
-      result.overrides.password_file = false
+      exclusive("vault_ids")
       result.overrides.vault_ids = result.overrides.vault_ids or {}
       table.insert(result.overrides.vault_ids, next_arg)
       index = index + 2
+    elseif arg == "--ask-vault-password" then
+      exclusive("ask_password")
+      result.overrides.ask_password = true
+      index = index + 1
     elseif arg == "--encrypt-vault-id" and next_arg then
       result.overrides.encrypt_vault_id = next_arg
       index = index + 2
     elseif arg == "--new-vault-password-file" and next_arg then
-      result.overrides.rekey_password_file = next_arg
+      result.overrides.new_password_file = next_arg
+      result.overrides.new_vault_id = false
       vim.list_extend(result.rekey_args, { arg, next_arg })
       index = index + 2
     elseif arg == "--new-vault-id" and next_arg then
-      result.overrides.rekey_vault_id = next_arg
+      result.overrides.new_vault_id = next_arg
+      result.overrides.new_password_file = false
       vim.list_extend(result.rekey_args, { arg, next_arg })
       index = index + 2
-    elseif opts and opts.label_shortcut and not arg:match("^%-") and not result.overrides.encrypt_vault_id then
-      result.overrides.encrypt_vault_id = arg
-      index = index + 1
-    else
+    elseif arg:match("^%-") then
+      return nil, string.format("unknown or incomplete argument: %s", arg)
+    elseif opts and opts.positionals then
       table.insert(result.positionals, arg)
       index = index + 1
+    else
+      return nil, string.format("unexpected argument: %s", arg)
     end
   end
 
-  return result
+  if #result.rekey_args > 2 then
+    return nil, "--new-vault-id and --new-vault-password-file are mutually exclusive"
+  end
+
+  return result, nil
 end
 
 ---@param arg_lead string
@@ -459,7 +506,7 @@ local function complete_operation_args(arg_lead, include_rekey, include_labels)
   local candidates = {
     "--vault-id",
     "--vault-password-file",
-    "--password-file",
+    "--ask-vault-password",
     "--encrypt-vault-id",
   }
 
@@ -468,23 +515,13 @@ local function complete_operation_args(arg_lead, include_rekey, include_labels)
     table.insert(candidates, "--new-vault-id")
   end
 
-  local labels = {}
-  if is_nonempty_string(M.config.vault_id) then
-    local label = M.config.vault_id:match("^([^@]+)@")
-    if label then
-      table.insert(labels, label)
-    end
-  end
-  if type(M.config.vault_ids) == "table" then
-    for _, vault_id in ipairs(M.config.vault_ids) do
-      local label = type(vault_id) == "string" and vault_id:match("^([^@]+)@")
+  if include_labels then
+    for _, vault_id in ipairs(credentials.as_list(M.config.vault_ids)) do
+      local label = vault_id:match("^([^@]+)@")
       if label then
-        table.insert(labels, label)
+        table.insert(candidates, label)
       end
     end
-  end
-  if include_labels then
-    vim.list_extend(candidates, labels)
   end
 
   return vim.tbl_filter(function(candidate)
@@ -1945,7 +1982,7 @@ function M.rekey(opts)
     if not has_rekey_target(rekey_args) then
       run_cleanup(creds.cleanup)
       vim.notify(
-        "VaultRekey requires rekey_password_file, rekey_vault_id, or --new-vault-* command args",
+        "VaultRekey requires new_vault_id, new_password_file, or a --new-vault-* argument",
         vim.log.levels.ERROR
       )
       return
@@ -2279,6 +2316,7 @@ local COMMANDS = {
     desc = "Create a new Ansible Vault file",
     complete = "create",
     bang = true,
+    parse = { positionals = true },
     run = function(cmd_opts, parsed)
       parsed.bang = cmd_opts.bang
       M.create(parsed)
@@ -2297,7 +2335,6 @@ local COMMANDS = {
     desc = "Encrypt selected string",
     complete = "labels",
     range = true,
-    parse = { label_shortcut = true },
     run = function(cmd_opts, parsed)
       M.encrypt_string(cmd_opts, parsed)
     end,
@@ -2324,7 +2361,6 @@ local COMMANDS = {
     name = "VaultEncryptStringUnderCursor",
     desc = "Encrypt YAML value under cursor",
     complete = "labels",
-    parse = { label_shortcut = true },
     run = function(_, parsed)
       M.encrypt_string_under_cursor(parsed)
     end,
@@ -2360,7 +2396,7 @@ local function ensure_configured()
   end
 
   if not M._configured then
-    M.setup(vim.g.ansible_vault_config or {})
+    M.setup({})
   end
 end
 
@@ -2369,7 +2405,12 @@ function M.register_commands()
   for _, command in ipairs(COMMANDS) do
     vim.api.nvim_create_user_command(command.name, function(cmd_opts)
       ensure_configured()
-      command.run(cmd_opts, parse_operation_options(parse_command_args(cmd_opts.args), command.parse))
+      local parsed, err = parse_operation_options(parse_command_args(cmd_opts.args), command.parse)
+      if not parsed then
+        vim.notify(string.format(":%s: %s", command.name, err), vim.log.levels.ERROR)
+        return
+      end
+      command.run(cmd_opts, parsed)
     end, {
       nargs = command.nargs or "*",
       range = command.range or nil,
@@ -2381,10 +2422,49 @@ function M.register_commands()
   end
 end
 
+---Check a user-supplied config, reporting everything wrong with it at once.
+---
+---An unknown key is an error, not something to ignore: a typo or a key left over
+---from an older version otherwise looks like it took effect.
+---@param opts table
+---@return string[] errors
+local function validate_config(opts)
+  local errors = {}
+
+  for key, value in pairs(opts) do
+    local expected = CONFIG_TYPES[key]
+    if not expected then
+      table.insert(errors, string.format("unknown option: %s", key))
+    elseif not vim.tbl_contains(expected, type(value)) then
+      table.insert(errors, string.format("%s must be %s, got %s", key, table.concat(expected, " or "), type(value)))
+    end
+  end
+
+  -- `ansible-vault` puts --ask-vault-password and --vault-password-file in a
+  -- mutually exclusive group, so configuring both cannot mean anything.
+  if opts.ask_password == true and (opts.password_files ~= nil or opts.vault_ids ~= nil) then
+    table.insert(errors, "ask_password cannot be combined with password_files or vault_ids")
+  end
+
+  if opts.new_vault_id ~= nil and opts.new_password_file ~= nil then
+    table.insert(errors, "new_vault_id and new_password_file are mutually exclusive")
+  end
+
+  return errors
+end
+
 ---Setup the plugin.
 ---@param opts? AnsibleVaultConfig
 function M.setup(opts)
-  M.config = vim.tbl_deep_extend("force", vim.deepcopy(DEFAULT_CONFIG), opts or {})
+  opts = opts or {}
+
+  local errors = validate_config(opts)
+  if #errors > 0 then
+    vim.notify("ansible-vault.nvim setup: " .. table.concat(errors, "; "), vim.log.levels.ERROR)
+    return
+  end
+
+  M.config = vim.tbl_deep_extend("force", vim.deepcopy(DEFAULT_CONFIG), opts)
   M._configured = true
 
   ansible_cfg.clear_cache()

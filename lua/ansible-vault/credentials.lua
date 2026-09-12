@@ -65,6 +65,29 @@ function M.expand_vault_id(vault_id)
   return label .. "@" .. M.expand_path(source)
 end
 
+---Normalize a "string or list" config value to a list of non-empty strings.
+---
+---The flags these stand for are repeatable, so the plural form is the real
+---shape; accepting a bare string keeps the common single-credential case from
+---having to be written as a one-element table.
+---@param value any
+---@return string[]
+function M.as_list(value)
+  if is_nonempty_string(value) then
+    return { value }
+  end
+  if type(value) ~= "table" then
+    return {}
+  end
+  local result = {}
+  for _, item in ipairs(value) do
+    if is_nonempty_string(item) then
+      table.insert(result, item)
+    end
+  end
+  return result
+end
+
 ---@param vault_id any
 ---@return string|nil
 local function vault_id_label(vault_id)
@@ -194,37 +217,35 @@ function M.plan(config, context)
     source = "interactive",
   }
 
-  if is_nonempty_string(config.password_file) then
-    plan.source = "password_file"
-    plan.args = { "--vault-password-file", M.expand_path(config.password_file) }
-    plan.our_label = cfg.settings.vault_identity or "default"
-  else
-    local vault_ids = {}
-    if type(config.vault_ids) == "table" then
-      for _, vault_id in ipairs(config.vault_ids) do
-        if is_nonempty_string(vault_id) then
-          table.insert(vault_ids, M.expand_vault_id(vault_id))
-        end
-      end
-    end
-    if #vault_ids == 0 and is_nonempty_string(config.vault_id) then
-      table.insert(vault_ids, M.expand_vault_id(config.vault_id))
-    end
+  local password_files = M.as_list(config.password_files)
+  local vault_ids = M.as_list(config.vault_ids)
 
-    if #vault_ids > 0 then
-      plan.source = #vault_ids > 1 and string.format("vault_ids (%d)", #vault_ids) or "vault_id"
-      for _, vault_id in ipairs(vault_ids) do
-        table.insert(plan.args, "--vault-id")
-        table.insert(plan.args, vault_id)
-      end
-      plan.our_label = vault_id_label(vault_ids[1])
-    elseif cfg.has_credentials then
-      -- Ansible resolves these itself; adding flags would create a second identity.
-      plan.source = cfg.credential_source or "ansible.cfg"
-      plan.our_label = cfg.label
-    else
-      plan.needs_password = true
+  -- An explicit ask beats everything, including what Ansible's own config would
+  -- supply. This is the only way to reach a vault whose password is not written
+  -- down anywhere the plugin or Ansible can find it.
+  if config.ask_password == true or cfg.settings.ask_vault_pass == true then
+    plan.needs_password = true
+    plan.source = config.ask_password == true and "ask_password" or "ansible.cfg ask_vault_pass"
+  elseif #password_files > 0 then
+    plan.source = #password_files > 1 and string.format("password_files (%d)", #password_files) or "password_files"
+    for _, path in ipairs(password_files) do
+      table.insert(plan.args, "--vault-password-file")
+      table.insert(plan.args, M.expand_path(path))
     end
+    plan.our_label = cfg.settings.vault_identity or "default"
+  elseif #vault_ids > 0 then
+    plan.source = #vault_ids > 1 and string.format("vault_ids (%d)", #vault_ids) or "vault_ids"
+    for _, vault_id in ipairs(vault_ids) do
+      table.insert(plan.args, "--vault-id")
+      table.insert(plan.args, M.expand_vault_id(vault_id))
+    end
+    plan.our_label = vault_id_label(M.expand_vault_id(vault_ids[1]))
+  elseif cfg.has_credentials then
+    -- Ansible resolves these itself; adding flags would create a second identity.
+    plan.source = cfg.credential_source or "ansible.cfg"
+    plan.our_label = cfg.label
+  else
+    plan.needs_password = true
   end
 
   plan.needs_disambiguation = #plan.args > 0 and cfg.has_credentials
@@ -272,7 +293,7 @@ local function credentials_for_password(plan, password)
   if helper then
     return {
       args = { "--vault-password-file", helper },
-      env = { [PASSWORD_ENV] = password },
+      env = { [PASSWORD_ENV] = password, ANSIBLE_ASK_VAULT_PASS = "False" },
       cwd = plan.cwd,
       plan = plan,
     },
@@ -287,6 +308,7 @@ local function credentials_for_password(plan, password)
   local cleaned = false
   return {
     args = { "--vault-password-file", tmpfile },
+    env = { ANSIBLE_ASK_VAULT_PASS = "False" },
     cwd = plan.cwd,
     plan = plan,
     cleanup = function()
@@ -308,7 +330,15 @@ function M.resolve(config, context, callback)
   local plan = M.plan(config, context)
 
   if not plan.needs_password then
-    callback({ args = plan.args, cwd = plan.cwd, plan = plan })
+    -- The plugin is supplying the secret, so the child must not also try to
+    -- prompt: `ansible.cfg` may set `ask_vault_pass`, and with piped stdin and no
+    -- tty that either blocks until the timeout or reads the content as a password.
+    callback({
+      args = plan.args,
+      env = { ANSIBLE_ASK_VAULT_PASS = "False" },
+      cwd = plan.cwd,
+      plan = plan,
+    })
     return
   end
 

@@ -42,7 +42,7 @@ vim.o.swapfile = true
 
 require("ansible-vault").setup({
   ansible_vault_path = "$VAULT_BIN",
-  password_file = "$WORK/pass",
+  password_files = "$WORK/pass",
 })
 
 vim.cmd("edit $WORK/vault.yml")

@@ -47,24 +47,8 @@ local function parse_vault_label(vault_id)
   return vault_id:match("^([^@]+)@")
 end
 
-local function collect_vault_ids(config)
-  local result = {}
-
-  if type(config.vault_ids) == "table" and #config.vault_ids > 0 then
-    for _, vault_id in ipairs(config.vault_ids) do
-      if is_nonempty_string(vault_id) then
-        table.insert(result, vault_id)
-      end
-    end
-  elseif is_nonempty_string(config.vault_id) then
-    table.insert(result, config.vault_id)
-  end
-
-  return result
-end
-
 local function check_vault_ids(config)
-  local vault_ids = collect_vault_ids(config)
+  local vault_ids = credentials.as_list(config.vault_ids)
   if #vault_ids == 0 then
     return
   end
@@ -141,22 +125,29 @@ function M.check()
     )
   end
 
-  if is_nonempty_string(config.password_file) then
-    check_password_file(config.password_file, "password_file")
-    if is_nonempty_string(config.vault_id) or (type(config.vault_ids) == "table" and #config.vault_ids > 0) then
-      health.info("password_file takes precedence over vault_id/vault_ids")
+  local password_files = credentials.as_list(config.password_files)
+  if #password_files > 0 then
+    for _, path in ipairs(password_files) do
+      check_password_file(path, "password_files")
+    end
+    if #credentials.as_list(config.vault_ids) > 0 then
+      health.info("password_files takes precedence over vault_ids")
     end
   else
     check_vault_ids(config)
-    if resolved.source == "interactive" then
-      health.warn("No password_file, vault_id, ANSIBLE_* variable or ansible.cfg found; commands will prompt")
+    if resolved.source == "interactive" and config.ask_password ~= true then
+      health.warn("No password_files, vault_ids, ANSIBLE_* variable or ansible.cfg found; commands will prompt")
     end
   end
 
-  if is_nonempty_string(config.rekey_password_file) then
-    check_password_file(config.rekey_password_file, "rekey_password_file")
-  elseif is_nonempty_string(config.rekey_vault_id) then
-    health.info("VaultRekey new vault ID configured: " .. config.rekey_vault_id)
+  if config.ask_password == true then
+    health.ok("ask_password is set: every operation prompts, ignoring other credentials")
+  end
+
+  if is_nonempty_string(config.new_vault_id) then
+    health.info("VaultRekey new vault ID configured: " .. config.new_vault_id)
+  elseif is_nonempty_string(config.new_password_file) then
+    check_password_file(config.new_password_file, "new_password_file")
   else
     health.info("VaultRekey requires --new-vault-* command args when no rekey target is configured")
   end

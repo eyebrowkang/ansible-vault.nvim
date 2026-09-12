@@ -24,7 +24,7 @@ English documentation: [README.md](README.md)
 **凭据**
 
 - 像 ansible 一样读取 `ansible.cfg` 和 `ANSIBLE_*` 环境变量，并从当前文件向上查找
-- 支持 password file、一个或多个 vault ID，或交互式输入
+- 支持一个或多个 password file / vault ID，或交互式输入
 - 支持命令级凭据覆盖和命令行补全
 
 **保真**
@@ -57,7 +57,7 @@ English documentation: [README.md](README.md)
   "eyebrowkang/ansible-vault.nvim",
   config = function()
     require("ansible-vault").setup({
-      password_file = "~/.ansible/vault-pass",
+      password_files = "~/.ansible/vault-pass",
     })
   end,
 }
@@ -78,24 +78,26 @@ use {
 
 ```lua
 require("ansible-vault").setup({
-  -- ansible-vault password file 路径
-  password_file = nil,
-
-  -- vault ID，例如 "prod@~/.ansible/prod-pass"
-  vault_id = nil,
-
-  -- 多个 vault ID。设置后优先于 vault_id。
+  -- --vault-id，可以是单个字符串，也可以是列表
   vault_ids = nil,
 
-  -- 加密时使用的 vault ID label。
+  -- --vault-password-file，可以是单个字符串，也可以是列表
+  password_files = nil,
+
+  -- 总是交互式询问密码，忽略其他已配置或自动发现的凭据。
+  -- 不能与 vault_ids / password_files 同时使用。
+  ask_password = false,
+
+  -- --encrypt-vault-id：加密时使用哪个身份。
   -- 保持 nil 时，由 ansible-vault 根据已配置的 vault IDs 自行选择。
   encrypt_vault_id = nil,
 
-  -- :VaultRekey 使用的新 password file
-  rekey_password_file = nil,
+  -- :VaultRekey 使用的 --new-vault-id，例如 "prod@~/.ansible/new-pass"
+  new_vault_id = nil,
 
-  -- :VaultRekey 使用的新 vault ID，例如 "prod@~/.ansible/new-pass"
-  rekey_vault_id = nil,
+  -- :VaultRekey 使用的 --new-vault-password-file。
+  -- 与 new_vault_id 互斥，和 ansible-vault 本身一致。
+  new_password_file = nil,
 
   -- 自定义 ansible-vault 可执行文件路径
   ansible_vault_path = nil,
@@ -116,7 +118,7 @@ require("ansible-vault").setup({
 插件按以下顺序解析凭据：
 
 1. 命令级覆盖，例如 `:VaultEncrypt --vault-id prod@~/.prod-pass`
-2. `setup()` 配置：先 `password_file`，再 `vault_ids`，再 `vault_id`
+2. `setup()` 配置：先 `ask_password`，再 `password_files`，再 `vault_ids`
 3. `ANSIBLE_*` 环境变量
 4. `ansible.cfg`
 5. 交互式密码输入
@@ -145,7 +147,7 @@ ansible 只在**进程 cwd** 里找 `ansible.cfg`，不会向上递归。而在�
 
 会从 `[defaults]` 读取这些键，对应的环境变量优先级更高：`vault_password_file`、
 `vault_identity_list`、`vault_identity`、`vault_encrypt_identity`、
-`vault_id_match`、`ask_vault_pass`。
+`ask_vault_pass`。
 
 执行 `:checkhealth ansible-vault` 可以看到命中了哪个配置文件、以及当前实际生效的凭据来源。
 
@@ -337,8 +339,8 @@ password: secret
 
 ```lua
 require("ansible-vault").setup({
-  password_file = "~/.ansible/old-pass",
-  rekey_password_file = "~/.ansible/new-pass",
+  password_files = "~/.ansible/old-pass",
+  new_password_file = "~/.ansible/new-pass",
 })
 ```
 
