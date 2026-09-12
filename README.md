@@ -1,67 +1,53 @@
 # ansible-vault.nvim
 
-A Neovim plugin for working with Ansible Vault files and inline `!vault` YAML
-values, built so that decrypted content never reaches the disk.
+Work with Ansible Vault files and inline `!vault` YAML values in Neovim, with
+explicit save semantics and protection against unintended plaintext copies.
 
 中文文档: [README.zh-CN.md](README.zh-CN.md)
 
 ## Features
 
-**Privacy**
+- The capabilities of all seven `ansible-vault` subcommands through six editor
+  commands: create, encrypt, decrypt, view, edit, rekey, and inline
+  `encrypt_string` through a range on `:VaultEncrypt`.
+- **Decrypt means plaintext.** Whole-file and inline `:VaultDecrypt` replace
+  ciphertext in the current buffer; `:w` saves plaintext without re-encryption,
+  another password prompt, or an extra confirmation.
+- **Edit keeps the vault encrypted.** `:VaultEdit` uses a separate protected
+  scratch buffer. Whole-file saves encrypt to the original file; inline saves
+  encrypt one value back into the source buffer, leaving the source file for
+  you to save.
+- Read-only whole-file and inline views, encrypted file creation, and password
+  rotation for both scopes.
+- Inline YAML keys, indentation, list items and multiline scalar values are
+  preserved through encryption, decryption, editing and rekeying.
+- Upward `ansible.cfg` discovery from the current file, `ANSIBLE_*` settings,
+  multiple password files or vault IDs, and per-command credential overrides.
+- Protected plaintext buffers, no plaintext editor temporary files, no
+  interactive password files, and a minimal `:checkhealth ansible-vault` report.
 
-- Decrypted buffers disable `'swapfile'` and `'undofile'` *before* the plaintext
-  arrives, so nothing survives a crash
-- Every write is routed through the plugin, which means `:w` re-encrypts instead
-  of writing plaintext, and Neovim makes no backup or undo file
-- Interactive passwords are passed to `ansible-vault` through its environment;
-  no secret is ever written to disk
-- Process output is never echoed into error messages
-
-**Vault operations**
-
-- Encrypt, decrypt, view and edit whole files
-- Create a new encrypted file with `:VaultCreate`
-- Encrypt, view and decrypt inline `!vault` values, by selection or under the cursor
-- Rekey encrypted files
-
-**Credentials**
-
-- Reads `ansible.cfg` and the `ANSIBLE_*` environment variables the way Ansible
-  does, searching upward from the current file
-- One or more password files or vault IDs, or an interactive prompt
-- Per-command credential overrides with command-line completion
-
-**Fidelity**
-
-- Preserves the vault ID label in a `1.2` header instead of silently rewriting
-  the file as `1.1`
-- Handles every inline shape Ansible accepts: `|`, `|-`, `>`, `|2`, quoted keys,
-  list items and arbitrary nesting
-
-**Integration**
-
-- `:checkhealth ansible-vault`
-- A `User` autocmd event for statuslines and other plugins
+These are editor workflows, not wrappers that launch Ansible's `$EDITOR` or
+create a plaintext temporary file for native `edit` or `create`. Viewing also
+keeps plaintext in memory. See [Security](#security).
 
 ## Requirements
 
-- Neovim >= 0.12
-- `ansible-vault` command available in PATH, or its path given to `setup()`
+- The current Neovim release (currently 0.12).
+- `ansible-vault` on `PATH`, or its path supplied to `setup()`.
 
 ### Version support policy
 
 This plugin tracks the **current Neovim release only**. Older versions are not
-worked around and are not tested; they may happen to work, but that is not a
-promise. Keeping a single target is what keeps the plugin maintainable with the
-effort available. `:checkhealth ansible-vault` tells you whether your version is
-supported.
+worked around or tested; they may happen to work, but that is not a promise.
+Keeping a single target keeps the maintenance effort manageable.
+`:checkhealth ansible-vault` reports whether your version is supported.
 
 ### Stability policy before v1.0.0
 
 **Before v1.0.0, this plugin provides no compatibility or migration guarantees.**
-Commands, configuration, Lua APIs, events and behaviour may change or be removed
-in any release. There is no guaranteed deprecation period, compatibility alias,
-migration tool or migration guide.
+Commands, configuration and behaviour may change or be removed in any release.
+There is no guaranteed deprecation period, compatibility alias, migration tool
+or migration guide.
 
 ## Installation
 
@@ -72,14 +58,7 @@ migration tool or migration guide.
   "eyebrowkang/ansible-vault.nvim",
   config = function()
     require("ansible-vault").setup({
-      -- Optional: --vault-password-file (a string or a list)
-      password_files = "~/.vault_pass",
-      -- Optional: --vault-id (a string or a list)
-      vault_ids = nil,
-      -- Optional: --encrypt-vault-id
-      encrypt_vault_id = nil,
-      -- Optional: custom ansible-vault path
-      ansible_vault_path = nil,
+      password_files = "~/.ansible/vault-pass",
     })
   end,
 }
@@ -96,88 +75,240 @@ use {
 }
 ```
 
-## Configuration
+The six commands are available as soon as the plugin is loaded; calling
+`setup()` is optional, and `require("ansible-vault").setup(opts)` is the only
+function the module exports. For the full reference, see
+`:help ansible-vault.nvim`.
+
+## Commands
+
+| Command | Whole file | Inline YAML value |
+|---------|------------|-------------------|
+| `:VaultCreate[!] {file}` | Protected empty buffer; `:w` encrypts to the target | — |
+| `:VaultEncrypt` | Replace the entire buffer with ciphertext; you save it | Explicit `[range]` encrypts one YAML value; you save the source |
+| `:VaultDecrypt` | Replace ciphertext with plaintext; `:w` saves plaintext | Replace one `!vault` block with a plaintext value; `:w` saves the source as shown |
+| `:VaultView` | Read-only floating view | Read-only floating view of one value |
+| `:VaultEdit` | Separate scratch; `:w` encrypts to the original file | Separate scratch; `:w` encrypts one block back into the source buffer only |
+| `:VaultRekey` | Native rekey, publishing the new ciphertext to the file | Re-encrypt one block with new credentials; you save the source |
+
+### How the target is chosen
+
+- `:VaultCreate` always takes a filename.
+- `:VaultEncrypt` **without a range always encrypts the whole buffer**, even
+  after inline decryption. With an explicit range it encrypts one YAML value.
+- For Decrypt, View, Edit and Rekey: an explicit range selects one inline block;
+  otherwise a vault header on line 1 selects the whole file; otherwise the
+  command finds the `!vault` block under the cursor.
+
+An inline range must contain one complete value or block, not a truncated block,
+multiple values, or neighbouring YAML entries. To encrypt the current line use
+`:.VaultEncrypt`; for a multiline scalar, select its key and all its content.
+Unparseable selections fail before changing the buffer.
+
+Commands do not read stale `'<`/`'>` marks. A visual command such as
+`:'<,'>VaultEncrypt` passes a range explicitly; a later normal-mode command does
+not reuse that selection.
+
+## Usage
+
+### Encrypt or decrypt a whole file
+
+To encrypt a plain file, run `:VaultEncrypt`, inspect the ciphertext, then `:w`.
+Encryption changes the buffer, not the file on disk.
+
+To write a vault as plaintext:
+
+1. Open the encrypted file and run `:VaultDecrypt`.
+2. Edit the plaintext if desired.
+3. Run `:w` to save **plaintext** to the file.
+
+There is no re-encryption, second password prompt, or extra confirmation on
+that write. If the file changed on disk since it was decrypted, the save is
+refused until you confirm with `:w!`.
+
+From a buffer that has a file name, `:w another-file.yml` writes a plaintext
+copy and leaves the buffer unsaved: the copy is not the buffer's own file. From
+a buffer with no name there is nothing for the write to be "other" than, so
+`:w some-file.yml` is that buffer being saved — it adopts the name and is
+marked saved, the way an ordinary buffer would be.
+
+The current buffer stays protected after a plaintext save. A normal plaintext
+file opened in a later session is just a normal file: the plugin keeps no
+history or metadata to identify it as a former vault.
+
+Run `:VaultEncrypt` followed by `:w` if you want ciphertext on disk again. A
+buffer that has been decrypted and re-encrypted in place keeps persistent undo
+disabled for the rest of its life, so it has no cross-session undo; see
+[Security](#security) for why, and why `:edit!` does not lift it. If you want
+to edit while keeping the file encrypted throughout, use `:VaultEdit` instead.
+`:edit!` discards buffer changes and reloads whatever is currently on disk;
+after a plaintext save, that is plaintext.
+
+### Create an encrypted file
+
+```vim
+:VaultCreate group_vars/prod/vault.yml
+```
+
+This opens an empty protected buffer. The target file is not created until
+`:w`, and saves from this buffer write ciphertext only. Use `:VaultCreate!` to
+allow replacing an existing file; it still does not overwrite it before the
+first successful save. If the path is already open in another buffer, the
+command reports that instead of emptying it.
+
+### View without modifying the source
+
+Run `:VaultView` on a whole vault or with the cursor inside an inline `!vault`
+block. Plaintext opens in a protected, read-only floating window. Press `q` or
+`<Esc>` to close and discard it. Viewing does not change the source buffer or
+write plaintext to a temporary file.
+
+The window refuses to write itself anywhere: `:w`, `:w {path}`, `:saveas` and
+`:%w {path}` are all errors, the same as from an Edit or Create buffer. View is
+a read-only verb, so if you want the decrypted content on disk, ask for it with
+`:VaultDecrypt`.
+
+### Edit while keeping the file encrypted
+
+Run `:VaultEdit` on an unmodified, file-backed whole vault. The plugin opens the
+plaintext in a separate protected scratch buffer. `:w` encrypts and atomically
+writes to the original file; the scratch stays open so you can continue editing
+and save again. Use `:q` or `:wq` when you are done.
+
+The target is fixed: for both Edit and Create buffers, redirecting a write with
+`:w other-file` is an error, not an export and not a request silently
+redirected to the real target. Changes to the source buffer or file while an
+edit is in progress cause the save to be refused rather than overwriting them.
+Decrypting an inline value *inside* an Edit scratch adds plaintext to
+plaintext; it does not turn the scratch into a buffer that saves itself in the
+clear.
+
+Opening Edit and each subsequent save are separate credential operations.
+Interactive passwords are not cached, so opening and saving can each prompt.
+`:wq` and `:x` wait for encryption and writing to finish; a failed save must not
+close the scratch or discard its changes.
+
+### Encrypt an inline YAML value
+
+Pass the current line or a visual selection as a range:
+
+```vim
+:.VaultEncrypt
+:'<,'>VaultEncrypt
+```
+
+For example, `password: secret` becomes:
+
+```yaml
+password: !vault |
+  $ANSIBLE_VAULT;1.1;AES256
+  3132333435...
+```
+
+The key is retained and only the value is encrypted. Select the complete scalar
+for a multiline value:
+
+```yaml
+service:
+  "private key": |-
+    first line
+    second line
+```
+
+Select `"private key"` and both content lines, not `service:` or its neighbours.
+The inline workflow preserves quoted keys, nesting, list prefixes and value
+content, including meaningful leading whitespace and trailing newlines. YAML
+scalar presentation can change while preserving the value; decryption may use
+a literal scalar to represent multiline content. A complete decrypted scalar
+can be selected and encrypted again. Save the source YAML yourself with `:w`.
+
+### Decrypt, edit or rekey one inline value
+
+Place the cursor anywhere inside the `!vault` block, or explicitly select the
+whole block:
+
+```vim
+:VaultView
+:VaultDecrypt
+:VaultEdit
+:VaultRekey --new-vault-password-file ~/.ansible/new-pass
+```
+
+**Decrypt** replaces that block with a plaintext YAML value in the source
+buffer. Other values are unchanged. `:w` writes the YAML as shown, including the
+decrypted value; it does not automatically turn values back into `!vault`
+blocks. To encrypt just that value again, select its complete scalar and use
+`[range]VaultEncrypt`. Without a range, `:VaultEncrypt` encrypts the entire YAML
+buffer.
+
+**Edit** opens just one value in a separate protected scratch. `:w` encrypts it
+back into the source buffer, **without writing the source YAML file**. You must
+return to the source buffer and save it yourself. Other unsaved YAML edits that
+were already present when Edit opened are preserved.
+
+After Edit opens, any change to the source buffer is conservatively treated as
+a conflict, even outside the selected block. Source identity changes or removal
+also prevent write-back. The plugin does not try to relocate the block through
+intervening edits.
+
+There is deliberately no `:w!` escape from that particular refusal. `:w!` does
+override the *source file* check, because an inline write-back only touches the
+buffer, so a changed file on disk cannot be damaged by it. The block snapshot
+check is a different question — is the block still where it was? — and `!`
+cannot supply the right position; forcing the write would overwrite whatever
+value now sits there. The way out is to reopen `:VaultEdit` on the block: the
+plaintext in the scratch is not lost, so you can carry it across.
+
+After a successful write-back, you can continue editing and save the scratch
+again against the updated snapshot.
+
+**Rekey** decrypts the value in memory and encrypts it with the new credentials,
+then replaces only that ciphertext block. Intermediate plaintext is never
+inserted into the source buffer. Save the resulting YAML yourself.
+
+Edit and Rekey need a YAML key to put the re-encrypted value back under, so a
+`!vault` block that has none is refused. View and Decrypt still work on it.
+
+### Rotate a whole file's password
+
+Open an unmodified, file-backed whole vault and supply a new credential:
+
+```vim
+:VaultRekey --new-vault-password-file ~/.ansible/new-pass
+:VaultRekey --new-vault-id prod@~/.ansible/new-pass
+```
+
+The two new-credential flags are mutually exclusive. Old credentials come from
+the normal sources or command overrides. Rekey runs Ansible's native `rekey`
+on a restricted ciphertext staging file and atomically publishes the result
+only if the original file is unchanged. The buffer then shows the new
+ciphertext. A failure leaves the original vault intact.
+
+A `1.2` header label is preserved when using a new password file; an explicit
+`--new-vault-id` selects the new label. Native rekey does not use
+`--encrypt-vault-id`: its label is supplied on the **new** identity so that
+rotation actually uses the new password. Inherited encryption-identity defaults
+are isolated for this child operation, without changing your configuration or
+global environment.
+
+## Configuration and credentials
+
+`setup()` accepts these four settings:
 
 ```lua
 require("ansible-vault").setup({
-  -- --vault-id. A single string, or a list for multi-vault setups.
-  vault_ids = nil,
-
-  -- --vault-password-file. A single string, or a list.
-  password_files = nil,
-
-  -- Always prompt, ignoring any configured or discovered credential.
-  -- Cannot be combined with vault_ids or password_files.
-  ask_password = false,
-
-  -- --encrypt-vault-id: which identity to encrypt with.
-  -- Leave nil to let ansible-vault choose from the configured vault IDs.
-  encrypt_vault_id = nil,
-
-  -- --new-vault-id for :VaultRekey, for example "prod@~/.ansible/new-pass"
-  new_vault_id = nil,
-
-  -- --new-vault-password-file for :VaultRekey.
-  -- Mutually exclusive with new_vault_id, as in ansible-vault itself.
-  new_password_file = nil,
-
-  -- Custom path to ansible-vault executable
-  ansible_vault_path = nil,
+  ansible_vault_path = nil, -- executable path; nil uses PATH
+  password_files = nil,    -- --vault-password-file: string or list
+  vault_ids = nil,         -- --vault-id: string or list
+  encrypt_vault_id = nil,  -- encryption identity label
 })
 ```
 
-Unknown configuration keys or invalid combinations are errors and leave the
-current configuration unchanged.
+Unknown keys and invalid values are errors and leave the current configuration
+unchanged. To use a Conda or other environment, point `ansible_vault_path` at
+`<env>/bin/ansible-vault`.
 
-### Password Sources
-
-The plugin resolves credentials in this order:
-
-1. per-command overrides, such as `:VaultEncrypt --vault-id prod@~/.prod-pass`
-2. `setup()` configuration: `ask_password`, then `password_files`, then
-   `vault_ids`
-3. `ANSIBLE_*` environment variables
-4. `ansible.cfg`
-5. interactive password prompt
-
-Layers 3 and 4 are Ansible's own. When credentials come from there the plugin
-passes no credential flags at all and simply runs `ansible-vault` in the right
-directory, letting it resolve them. This matters: passing `--vault-password-file`
-on top of an `ansible.cfg` that already sets one makes `ansible-vault encrypt`
-fail with `The vault-ids default,default are available to encrypt`.
-
-#### ansible.cfg discovery
-
-Ansible only looks for `ansible.cfg` in the process working directory and does
-not search upward. In an editor the working directory is rarely the playbook
-directory, so this plugin walks up from the current file instead:
-
-1. `$ANSIBLE_CONFIG` (a file, or a directory containing `ansible.cfg`)
-2. `ansible.cfg` or `.ansible.cfg`, searching upward from the current file
-3. `~/.ansible.cfg`
-4. `/etc/ansible/ansible.cfg`
-
-`ansible-vault` is then run with its working directory set to wherever the
-config was found, so relative paths inside it resolve exactly as Ansible
-resolves them, which is relative to the config file itself.
-
-These keys are read from `[defaults]`, and the matching environment variables
-override them: `vault_password_file`, `vault_identity_list`, `vault_identity`,
-`vault_encrypt_identity` and `ask_vault_pass`.
-
-Run `:checkhealth ansible-vault` to see which config was found and which
-credential source is actually in effect.
-
-Use `password_files` for a single vault password:
-
-```lua
-require("ansible-vault").setup({
-  password_files = "~/.ansible/vault-pass",
-})
-```
-
-Use `vault_ids` for Ansible multi-vault setups. Both keys take a single string
-or a list, because the flags they stand for are repeatable:
+For multiple vault identities:
 
 ```lua
 require("ansible-vault").setup({
@@ -189,440 +320,225 @@ require("ansible-vault").setup({
 })
 ```
 
-Set `ask_password = true` to always prompt, for a vault whose password is not
-written down anywhere:
+`password_files` also accepts a string or list. If both credential settings are
+present, `password_files` takes precedence. With no explicit encryption label,
+Ansible chooses the identity; specify `encrypt_vault_id` to disambiguate multiple
+identities. Edit preserves the existing `1.2` vault label unless you explicitly
+choose another encryption identity. Decrypt writes plaintext, so its save has
+no vault header to preserve.
 
-```lua
-require("ansible-vault").setup({
-  ask_password = true,
-})
-```
+### Credential precedence
 
-Leave `encrypt_vault_id = nil` if you want `ansible-vault` to choose the
-encryption identity from the configured vault IDs.
+1. Per-command credential overrides.
+2. `setup()` credentials: `password_files`, then `vault_ids`.
+3. `ANSIBLE_*` environment variables.
+4. `ansible.cfg`.
+5. An interactive password prompt when no credential source is available.
 
-#### Vault ID labels are preserved
+A command credential override replaces the configured credential selection,
+not adds to it. Repeated flags build the list for that operation; they do not
+retain unused entries from a configured list. Overrides do not mutate setup.
+The plugin lets Ansible resolve environment/config-file credentials rather
+than redundantly passing those credentials again as CLI flags.
 
-A file encrypted with a vault ID carries the label in its header:
+### Command flags
 
-```
-$ANSIBLE_VAULT;1.2;AES256;prod
-```
+| Flag | Use |
+|------|-----|
+| `--vault-password-file {path}` | Credential file; repeatable |
+| `--vault-id {label@source}` | Vault identity; repeatable |
+| `--ask-vault-password` | Prompt for this command, ignoring configured/discovered credentials |
+| `--encrypt-vault-id {label}` | Encryption identity for Encrypt, Create or Edit |
+| `--new-vault-password-file {path}` | Rekey's new password file |
+| `--new-vault-id {label@source}` | Rekey's new identity |
 
-Re-encrypting such a file with a plain `--vault-password-file` would rewrite it
-as `$ANSIBLE_VAULT;1.1;AES256` and drop the label. The plugin reads the label
-before decrypting and names it again on the way back, so `:VaultEdit`,
-`:VaultDecrypt` + `:w` and `:VaultRekey` all leave the header intact.
+Each flag is accepted only by the commands it can mean something for, so a flag
+that would be a silent no-op is an error instead. `:VaultRekey` in particular
+does not accept `--encrypt-vault-id`: on Ansible's `rekey` that flag chooses
+from a pool seeded with the **old** identities, so accepting it would let a
+rotation report success with the file still on its old password.
 
-Most commands also accept temporary credential overrides. These do not mutate
-your global setup:
+Prompting and new rekey credentials are command flags, not persistent setup
+options. Do not combine competing credential selectors, or both new-credential
+flags. Unknown flags, missing values, flags inappropriate for the command and
+stray arguments are errors; Create takes one filename.
+
+Paths may be quoted or backslash-escaped:
 
 ```vim
-:VaultEdit --vault-id prod@~/.ansible/prod-pass
-:VaultView --vault-password-file ~/.ansible/prod-pass
-:VaultEncrypt --encrypt-vault-id prod
+:VaultView --vault-password-file '/path with spaces/pass'
+:VaultEdit --vault-password-file /path\ with\ spaces/pass
+:VaultEncrypt --vault-id dev@~/.dev-pass --vault-id prod@~/.prod-pass --encrypt-vault-id prod
 :VaultDecrypt --ask-vault-password
+:VaultCreate 'group_vars/prod/private vault.yml'
 ```
 
-Flags are spelled exactly as `ansible-vault` spells them. An unrecognised
-argument is an error.
+Completion offers the command's supported flags and filenames for Create.
 
-Configure `VaultRekey` with a new password file or a new vault ID:
+### ansible.cfg discovery
 
-```lua
-require("ansible-vault").setup({
-  password_files = "~/.ansible/old-pass",
-  new_password_file = "~/.ansible/new-pass",
-})
-```
+Upward discovery is a core editor adaptation: Ansible checks the process
+working directory, but that need not be the directory of the file you are
+editing. The plugin searches in this order:
 
-```lua
-require("ansible-vault").setup({
-  vault_ids = "old@~/.ansible/old-pass",
-  new_vault_id = "new@~/.ansible/new-pass",
-})
-```
+1. `$ANSIBLE_CONFIG` (a file, or a directory containing `ansible.cfg`).
+2. `ansible.cfg` or `.ansible.cfg`, walking upward from the current file.
+3. `~/.ansible.cfg`.
+4. `/etc/ansible/ansible.cfg`.
 
-If `ansible-vault` is not on `PATH`, point to the executable directly:
+The child process runs in the discovered config directory, and relative paths
+in that config resolve as Ansible expects, relative to the config file itself.
+The relevant `[defaults]` settings are `vault_password_file`,
+`vault_identity_list`, `vault_identity`, `vault_encrypt_identity` and
+`ask_vault_pass`; matching environment variables take precedence.
 
-```lua
-require("ansible-vault").setup({
-  ansible_vault_path = "/opt/homebrew/bin/ansible-vault",
-  password_files = "~/.ansible/vault-pass",
-})
-```
-
-The same option covers a Conda environment — point it at
-`<env>/bin/ansible-vault`.
-
-Interactive passwords are never cached. Each operation prompts for its own, so
-no secret sits in Neovim's memory between operations.
-
-## Commands
-
-Six commands. Each one works on a whole vault file *or* on a single inline
-`!vault` value, and figures out which from the buffer, the range and the cursor.
-
-| Command | Whole file | Inline `!vault` value |
-|---------|------------|-----------------------|
-| `:VaultEncrypt` | encrypt the buffer | `[range]` → turn those lines into a `!vault` value |
-| `:VaultDecrypt` | decrypt for editing; `:w` re-encrypts | decrypt one value in place; `:w` folds it back |
-| `:VaultView` | show decrypted content read-only | show one decrypted value read-only |
-| `:VaultEdit` | edit in a scratch buffer, encrypt on save | — |
-| `:VaultRekey` | `ansible-vault rekey` the file | re-encrypt one value with new credentials |
-| `:VaultCreate[!] {file}` | create a new encrypted file | — |
-
-### How the target is chosen
-
-In order, stopping at the first match:
-
-1. An explicit `[range]` → those lines, as an inline value.
-2. The buffer is mid-edit → whatever it was decrypted as.
-3. Line 1 is an `$ANSIBLE_VAULT` header → the whole file.
-4. Looking for something encrypted → the `!vault` block under the cursor.
-5. Looking for something to encrypt → the whole buffer.
-
-Step 5 is why `:VaultEncrypt` needs a range to encrypt one value: in a YAML file
-almost every line is a `key: value` pair, so guessing from the cursor would
-silently encrypt one line when you meant the file. `:.VaultEncrypt` encrypts the
-current line.
-
-None of this reads the `'<`/`'>` marks, so a command run from normal mode can
-never act on a visual selection you made earlier somewhere else in the buffer.
-
-## Health Check
-
-Run:
+### Health check
 
 ```vim
 :checkhealth ansible-vault
 ```
 
-The health check reports:
-
-- the configured executable and whether it is available
-- which credential source is actually in effect, resolved through the same code
-  the real operations use
-- the `ansible.cfg` that was found, how it was found, and the directory
-  `ansible-vault` will run in
-- password file readability and permissions, recognising executable password
-  scripts as the supported configuration they are
-- vault ID labels, `encrypt_vault_id`, and the `VaultRekey` target
-- whether interactive passwords can be kept off disk entirely
-- global options that could still persist decrypted content, such as `'shada'`
-
-## Usage
-
-### Encrypt a Plain File
-
-1. Open a plain YAML or text file.
-2. Run `:VaultEncrypt`.
-3. Save the buffer with `:write`.
-
-The buffer content is replaced with Ansible Vault ciphertext. The plugin does
-not write the file automatically after `:VaultEncrypt`, so you can inspect the
-result before saving.
-
-### Decrypt a File for Editing
-
-1. Open a file that starts with `$ANSIBLE_VAULT`.
-2. Run `:VaultDecrypt`.
-3. Edit the decrypted buffer.
-4. Run `:write`.
-
-`:VaultDecrypt` puts the buffer into **plaintext editing mode**. The buffer
-shows the decrypted content, but the file on disk only ever holds ciphertext:
-
-- `'swapfile'` and `'undofile'` are turned off before the plaintext arrives, and
-  any swap file that already existed is deleted
-- `'buftype'` becomes `acwrite`, so `:w`, `:wq`, `:x` and even
-  `:w some-other-file` are all handled by the plugin, which encrypts first
-- because Neovim never runs its own write path, no backup file is created and no
-  undo file is written
-
-The buffer stays decrypted after a write so you can keep editing. Run
-`:VaultEncrypt` to turn it back into ciphertext and restore normal buffer
-behaviour, or `:edit!` to reload the encrypted file.
-
-`:VaultEdit` opens a separate scratch buffer for editing, leaving the original
-buffer untouched.
-
-### Create a New Encrypted File
-
-```vim
-:VaultCreate group_vars/prod/vault.yml
-```
-
-This opens an empty, hardened buffer. The file is not created until you run
-`:write`, and it is only ever written encrypted. Use `:VaultCreate!` to replace
-an existing file.
-
-### View an Encrypted File Without Modifying It
-
-Run `:VaultView` on an encrypted buffer. The decrypted content opens in a
-read-only floating window. Press `q` or `<Esc>` to close it.
-
-### Edit an Encrypted File Safely
-
-Run `:VaultEdit` on a file-backed encrypted buffer.
-
-The plugin opens decrypted content in a scratch buffer with swap and persistent
-undo disabled. When you run `:write` from that scratch buffer, the content is
-encrypted and written back to the original file. The scratch buffer is then
-closed and the original encrypted file is reloaded.
-
-If the original file changed on disk while the scratch buffer was open, the save
-is refused to avoid overwriting someone else's changes.
-
-### Encrypt an Inline YAML Value
-
-Give the lines to encrypt as a range — the current line, or a visual selection:
-
-```vim
-:.VaultEncrypt
-:'<,'>VaultEncrypt
-```
-
-For a `key: value` line:
-
-```yaml
-password: secret
-```
-
-the key is kept and only the value is encrypted:
-
-```yaml
-password: !vault |
-          $ANSIBLE_VAULT;1.1;AES256
-          ...
-```
-
-### View, Edit and Rekey an Inline YAML Value
-
-Put the cursor anywhere inside a `!vault` block — no selection needed, the
-surrounding block is found for you:
-
-```vim
-:VaultView     " read-only floating window
-:VaultDecrypt  " decrypt in place for editing
-:VaultRekey    " re-encrypt this one value with new credentials
-```
-
-After `:VaultDecrypt` the buffer enters **inline plaintext mode**: the decrypted
-value is tracked with an extmark, the buffer is hardened exactly as for
-whole-file decryption, and `:w` folds the value back into a `!vault` block before
-writing. Surrounding lines are written unchanged, so this works on files that are
-only partly encrypted. Other values in the same file stay encrypted and can be
-decrypted too.
-
-`:VaultEncrypt` with no range folds the decrypted values back without writing —
-the inverse of `:VaultDecrypt`, and like the whole-file case it leaves `:w` to
-you.
-
-`:VaultRekey` on an inline value has to decrypt with the old credentials and
-re-encrypt with the new ones, because `ansible-vault rekey` only accepts file
-paths. The plaintext exists only as a local variable for the duration of the
-call: it never goes into a buffer, a buffer variable, a notification or an event.
-
-### Rekey an Encrypted File
-
-Configure a rekey target first:
-
-```lua
-require("ansible-vault").setup({
-  password_files = "~/.ansible/old-pass",
-  new_password_file = "~/.ansible/new-pass",
-})
-```
-
-Then open an encrypted file and run:
-
-```vim
-:VaultRekey
-```
-
-You can also pass Ansible Vault rekey arguments directly:
-
-```vim
-:VaultRekey --new-vault-password-file ~/.ansible/new-pass
-:VaultRekey --new-vault-id prod@~/.ansible/prod-pass
-```
-
-The buffer must be file-backed, encrypted, and unmodified. After a successful
-rekey, the plugin reloads the encrypted file.
-
-A `1.2` vault ID label survives the rekey: the plugin names it on the new
-identity, as `--new-vault-id prod@<new-password-file>`. It never passes
-`--encrypt-vault-id` to `rekey`, because on that subcommand the flag selects the
-*new* secret from a pool seeded with the *old* identities from `ansible.cfg` —
-which either fails outright or re-encrypts the file with the old password and
-still reports success.
+The report covers Neovim support, executable availability, configuration and
+credential sources, and necessary privacy warnings. It does not prompt for a
+password or create the interactive-password helper just to run diagnostics.
 
 ## Keymaps
 
-The plugin doesn't set any keymaps by default. You can add your own:
+No keymaps are installed by default. For example:
 
 ```lua
-vim.keymap.set("n", "<leader>vc", "<cmd>VaultCreate<cr>", { desc = "Vault Create" })
+vim.keymap.set("n", "<leader>vc", ":VaultCreate ", { desc = "Vault Create" })
 vim.keymap.set("n", "<leader>ve", "<cmd>VaultEncrypt<cr>", { desc = "Vault Encrypt" })
 vim.keymap.set("n", "<leader>vd", "<cmd>VaultDecrypt<cr>", { desc = "Vault Decrypt" })
 vim.keymap.set("n", "<leader>vv", "<cmd>VaultView<cr>", { desc = "Vault View" })
 vim.keymap.set("n", "<leader>vE", "<cmd>VaultEdit<cr>", { desc = "Vault Edit" })
-vim.keymap.set("n", "<leader>vr", "<cmd>VaultRekey<cr>", { desc = "Vault Rekey" })
+vim.keymap.set("n", "<leader>vr", ":VaultRekey ", { desc = "Vault Rekey" })
 
--- Visual mode passes the selection as a range, so these need the `:` form, not
--- `<cmd>`, which would not carry it.
-vim.keymap.set("x", "<leader>ve", ":VaultEncrypt<cr>", { silent = true, desc = "Vault Encrypt" })
-vim.keymap.set("x", "<leader>vd", ":VaultDecrypt<cr>", { silent = true, desc = "Vault Decrypt" })
-vim.keymap.set("x", "<leader>vv", ":VaultView<cr>", { silent = true, desc = "Vault View" })
+-- Use `:` in visual mode to pass the selection as an explicit range.
+vim.keymap.set("x", "<leader>ve", ":VaultEncrypt<cr>", { silent = true })
+vim.keymap.set("x", "<leader>vd", ":VaultDecrypt<cr>", { silent = true })
+vim.keymap.set("x", "<leader>vv", ":VaultView<cr>", { silent = true })
+vim.keymap.set("x", "<leader>vE", ":VaultEdit<cr>", { silent = true })
 ```
 
-The same six commands serve both scopes, so one keymap per verb covers whole
-files from normal mode and inline values from visual mode.
+Create and Rekey mappings leave the command line open for the filename or new
+credential. Normal-mode Decrypt, View, Edit and Rekey use the target rules above;
+`<cmd>` visual mappings would not pass a range.
 
-## Statusline Integration
+## Security
 
-Use `is_buffer_encrypted()`, which inspects the buffer every time rather than
-relying on state left behind by an earlier operation:
+The privacy goal is to avoid **unintended copies**, not to prohibit an explicit
+plaintext save. `:VaultDecrypt` followed by `:w` intentionally writes plaintext.
+View has no plaintext save path, and temporary Edit/Create buffers save only
+ciphertext through their controlled writers.
 
-```lua
--- For lualine
-require("lualine").setup({
-  sections = {
-    lualine_x = {
-      {
-        function()
-          return require("ansible-vault").is_buffer_encrypted() and "[VAULT]" or ""
-        end,
-      },
-    },
-  },
-})
+- **Harden before insertion.** Managed plaintext buffers have `'swapfile'` and
+  `'undofile'` disabled before plaintext arrives. Clearing `'swapfile'` removes
+  that buffer's existing swap file. The guarantee across plaintext/ciphertext
+  transitions is that plaintext does not reach the undo *file* — sometimes by
+  clearing the undo history, sometimes by leaving `'undofile'` off for good.
+  After `[range]VaultEncrypt`, for instance, `:undo` can still bring the value
+  you just encrypted back **in memory**; that buffer's `'undofile'` is off
+  permanently, so it cannot be written out.
+- **Controlled writes, no Neovim backup copies.** Writable managed buffers use
+  `'buftype'` `acwrite`, bypassing Neovim's ordinary write/backup path. Decrypt's
+  writer saves plaintext by design; Edit/Create writers encrypt. Saving a
+  decrypted buffer as plaintext does not remove its current buffer protection.
+  Encrypting a single range does not prove the rest of the buffer is free of
+  plaintext; only a successful whole-buffer encryption restores ordinary write
+  behaviour, and even then not `'undofile'` (see the next point).
+- **No partial or appending writes.** `acwrite` covers `:w`, `:w {file}` and
+  `:saveas`, but not a partial-range write or an append. With no handler for
+  those, Neovim writes the lines out itself: unencrypted, not atomically, and
+  with the umask's permissions rather than `0600`. So `:1w {file}` and
+  `:w >> {file}` are refused outright, on managed buffers and on the View
+  window. A **whole-buffer** `:w {path}` from a decrypted buffer is a save you
+  asked for and still goes through the atomic writer, which creates a new file
+  `0600` but leaves an existing target's mode alone.
 
--- Manual check
-if require("ansible-vault").is_buffer_encrypted() then
-  -- buffer is encrypted
-end
-```
+  This interception is not total, and the gap is worth naming since the rest of
+  this list enumerates what *is* covered: piping the buffer through a shell —
+  `:w !cat > f`, `:1,2w !cat > f`, `:%!tee f` — raises no event the plugin can
+  hook, so those write the plaintext out at the shell's discretion, typically
+  `0644`. That is treated as your explicit instruction rather than a leak, in
+  the same category as yanking out of a decrypted buffer with `'shada'` on.
+- **Persistent undo comes back only when it is provably safe.**
+  Turning `'undofile'` off while the plaintext is in the buffer is not enough on
+  its own: on the next ordinary write Neovim serializes the text a change
+  *replaced*, so a buffer that was decrypted and then re-encrypted in place
+  would write the plaintext it had just encrypted away into the persistent undo
+  file — while the file on disk never held anything but ciphertext. Restoring
+  `'undofile'` is therefore safe only once the undo history itself is gone, and
+  that, not anything else, is what gates it: the plugin discards the history and
+  only then hands persistent undo back. A read replacing the buffer's contents
+  does **not** make it safe by itself, because the reload is one more undoable
+  change still holding the plaintext it replaced.
 
-## API
-
-```lua
-local vault = require("ansible-vault")
-
--- Check if content is encrypted
-vault.is_encrypted(content)  -- string or table of lines
-
--- Parse a $ANSIBLE_VAULT header -> { version, cipher, label } or nil
-vault.parse_header(content)
-
--- Check if current buffer is encrypted
-vault.is_buffer_encrypted()
-
--- Create a new encrypted file
-vault.create({ positionals = { "group_vars/prod/vault.yml" } })
-
--- Encrypt current buffer
-vault.encrypt()
-
--- Decrypt current buffer
-vault.decrypt()
-
--- View encrypted buffer in floating window
-vault.view()
-
--- Edit encrypted buffer in a no-swap scratch buffer
-vault.edit()
-
--- Rekey current encrypted file
-vault.rekey()
-
--- Each verb takes the same scope hints the commands use. Pass a range to act on
--- an inline value; omit it for the whole buffer or the block under the cursor.
-vault.encrypt(nil, { range = 1, line1 = 7, line2 = 7 })
-vault.decrypt() -- the !vault block under the cursor
-
--- Drop every secret this process still holds (also runs on VimLeavePre)
-vault.cleanup()
-```
-
-## User Events
-
-The plugin emits one `User` autocommand pattern, `AnsibleVaultOperation`, after
-every successful operation:
-
-```lua
-vim.api.nvim_create_autocmd("User", {
-  pattern = "AnsibleVaultOperation",
-  callback = function(event)
-    vim.print(event.data.op, event.data.scope)
-  end,
-})
-```
-
-The event `data` carries `op` (`"encrypt"`, `"decrypt"`, `"view"`, `"edit"`,
-`"save"`, `"rekey"` or `"create"`), `scope` (`"file"` or `"inline"`) and the
-buffer and file it applied to. One pattern means one autocmd can react to
-everything and filter on `op`/`scope`.
-
-## Security Notes
-
-The goal is that decrypted content never reaches the disk, including after
-`kill -9` or a power loss. What the plugin guarantees:
-
-- **No swap file.** `'swapfile'` is reset before plaintext enters a buffer, which
-  also deletes any swap file that already existed for it.
-- **No undo file.** `'undofile'` is off for decrypted buffers, and the undo
-  history is cleared across every encrypt/decrypt transition.
-- **No backup file.** Decrypted buffers use `'buftype'` `acwrite`, so Neovim
-  skips its own write path entirely; `'backup'` and `'writebackup'` never apply.
-- **No accidental plaintext write.** Every form of `:w` goes through the plugin
-  and encrypts first. There is no way to write plaintext to disk by hand.
-- **No password on disk.** Interactive passwords are passed to `ansible-vault`
-  through the child process environment and read back by a static helper script
-  in `stdpath("run")` that contains no secret. On platforms where that is not
-  possible the plugin falls back to a `0600` temporary file, removes it on exit,
-  and `:checkhealth` tells you which mode is in use.
-- **Nothing secret in messages.** Process stdout is never echoed into an error,
-  because `ansible-vault decrypt` can write plaintext to stdout and still exit
-  non-zero. Any argv the plugin does surface has its credential values
-  redacted.
-- **No plaintext argv.** Content goes over stdin and passwords are passed by
-  reference, so neither appears in `ps`.
-- **Atomic writes.** Encrypted output is written to a sibling temporary file,
-  `fsync`ed, then renamed into place, inheriting the original file's mode.
-
-`make test-leak` enforces the first four: it kills Neovim while a file is
-decrypted and searches Neovim's swap, undo and runtime directories for the
-plaintext.
+  The net effect has two halves. A buffer reloaded while the plugin was still
+  managing it gets cross-session undo back, because its history is cleared
+  first. A buffer that was decrypted and re-encrypted **in place** keeps
+  `'undofile'` off for the rest of its life and has no cross-session undo;
+  `:edit!` does not bring it back, because that restore only runs for a reload
+  that still had a live session. These are buffer-local options, so a buffer
+  opened fresh for the same file later is unaffected. Undo *within* a session is
+  never affected either way.
+- **Protection outlasts a failed reload.** Reloading a managed buffer drops the
+  plugin's write handler immediately, but restores the hardened options only
+  once a read has actually replaced the plaintext. If that read fails, the
+  buffer keeps `'buftype'` `acwrite` with no handler behind it, so `:w` fails
+  with `E676` rather than falling back to Neovim's own write path. Nothing is
+  lost: the buffer is already empty at that point, because Neovim frees its
+  contents before reading. Use `:bd`, or edit the file again successfully —
+  including re-editing a file that has since been deleted — and the buffer
+  returns to normal.
+- **No historical tracking.** A deliberately saved plaintext file reopened
+  later is an ordinary file. There is no database, sidecar or metadata recording
+  its former vault status, and no promise to protect unrelated future buffers.
+- **No plaintext editor temporary files.** View/Edit do not hand secrets to an
+  external editor. Ciphertext operations stage ciphertext only. An explicit
+  Decrypt save uses an atomic plaintext replacement, so its intended output,
+  including that replacement's temporary staging file, can contain plaintext.
+- **No interactive password files or cache.** A static, non-secret helper reads
+  the password from the child process environment. The password is not put in
+  argv, log messages or a file. If the safe helper is unavailable, prompting
+  fails explicitly; user-supplied credential files remain usable. Interactive
+  passwords are not retained for reuse between operations, including Edit saves.
+- **Safe error summaries.** CLI errors do not include raw stdout/stderr,
+  environment or complete command arguments, which may contain secrets.
+- **Guarded writes.** Operations check for intervening buffer/file changes.
+  Atomic replacement preserves existing file permissions; failed encryption or
+  conflicting saves must not overwrite the source or discard unsaved edits.
 
 ### What is still up to you
 
-These are global Neovim settings the plugin deliberately does not change.
-`:checkhealth ansible-vault` warns when they are enabled:
+The plugin does not change global `'shada'`, `'backup'` or `'writebackup'`
+settings; the health check warns about relevant persistence risks instead.
+Registers you yank into may be saved in ShaDa, copied to the clipboard or used
+by another plugin. Backups still apply to writes outside the plugin's managed
+buffers. Review these settings and other plugins when handling secrets.
 
-- **`'shada'`** persists registers, so text you *yank* out of a decrypted buffer
-  or the `:VaultView` window is written to the shada file on exit. Consider
-  `:set shada=` while working with secrets.
-- **`'backup'`** applies to files written outside this plugin.
-- **Decrypted content is in Neovim's memory** while you view or edit it, so it
-  can reach the OS swap partition or a core dump. Review your other plugins,
-  clipboard settings and terminal or session recording if that matters to you.
+Explicit plaintext writes, manual exports, registers, other plugins, external
+processes and terminal/session recording are outside this protection. Plaintext
+and passwords necessarily exist in process memory while used; the plugin does
+not promise memory erasure or protection against OS swap, core dumps or another
+process with access to that memory or the child environment.
+
+The crash-leak checks distinguish a requested plaintext output from unexpected
+swap, undo, backup and runtime copies. They are not a guarantee against every
+form of system-level persistence.
 
 ## Development
 
 ```sh
-make test        # unit tests against a fake ansible-vault, no Ansible needed
-make test-real   # end-to-end against a real ansible-core in .venv (needs uv)
-make test-leak   # kills Neovim mid-decryption and greps for plaintext
+make test        # command-driven tests with a fake ansible-vault
+make test-real   # end-to-end with real ansible-core in .venv (needs uv)
+make test-leak   # crash checks for unintended plaintext copies
 make lint        # stylua --check and luacheck
 make format      # stylua
 ```
 
 `make test-real` and `make test-leak` create `.venv` and install `ansible-core`
-on first run.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the test workflow and the commit
+on first run. See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and commit
 message convention used to generate release notes.
 
 ## License
