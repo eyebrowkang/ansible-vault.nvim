@@ -19,7 +19,6 @@ local uv = vim.uv
 local AUGROUP = "AnsibleVault"
 local NAMESPACE = vim.api.nvim_create_namespace("ansible-vault")
 local parse_vault_from_yaml
-local has_rekey_target
 local write_plaintext_buffer
 local restore_inline_regions
 local leave_plaintext_mode
@@ -51,7 +50,6 @@ local function emit_event(op, scope, data)
 end
 
 local expand_path = credentials.expand_path
-local expand_vault_id = credentials.expand_vault_id
 
 ---Context describing which file an operation applies to, so credentials and the
 ---encryption label can be resolved the way Ansible would resolve them there.
@@ -113,38 +111,6 @@ local function with_encrypt_vault_id(args, opts, creds, context)
     table.insert(result, label)
   end
   return result
-end
-
----@param extra_args string[]|nil
----@param opts? table
----@return string[]
-local function with_rekey_target_args(extra_args, opts)
-  local config = effective_config(opts)
-  local args = vim.deepcopy(extra_args or {})
-  if has_rekey_target(args) then
-    return args
-  end
-
-  if is_nonempty_string(config.new_vault_id) then
-    table.insert(args, "--new-vault-id")
-    table.insert(args, expand_vault_id(config.new_vault_id))
-  elseif is_nonempty_string(config.new_password_file) then
-    table.insert(args, "--new-vault-password-file")
-    table.insert(args, expand_path(config.new_password_file))
-  end
-
-  return args
-end
-
----@param args string[]
----@return boolean
-has_rekey_target = function(args)
-  for _, arg in ipairs(args or {}) do
-    if arg == "--new-vault-password-file" or arg == "--new-vault-id" then
-      return true
-    end
-  end
-  return false
 end
 
 ---@param args string|nil
@@ -219,7 +185,6 @@ local function parse_operation_options(args, opts)
   local result = {
     overrides = {},
     positionals = {},
-    rekey_args = {},
   }
 
   -- A command-line credential replaces the configured ones outright rather than
@@ -257,12 +222,10 @@ local function parse_operation_options(args, opts)
     elseif arg == "--new-vault-password-file" and next_arg then
       result.overrides.new_password_file = next_arg
       result.overrides.new_vault_id = false
-      vim.list_extend(result.rekey_args, { arg, next_arg })
       index = index + 2
     elseif arg == "--new-vault-id" and next_arg then
       result.overrides.new_vault_id = next_arg
       result.overrides.new_password_file = false
-      vim.list_extend(result.rekey_args, { arg, next_arg })
       index = index + 2
     elseif arg:match("^%-") then
       return nil, string.format("unknown or incomplete argument: %s", arg)
@@ -272,10 +235,6 @@ local function parse_operation_options(args, opts)
     else
       return nil, string.format("unexpected argument: %s", arg)
     end
-  end
-
-  if #result.rekey_args > 2 then
-    return nil, "--new-vault-id and --new-vault-password-file are mutually exclusive"
   end
 
   return result, nil
@@ -499,6 +458,11 @@ remember_header = function(buf, content)
   end
 
   local header = M.parse_header(content or vim.api.nvim_buf_get_lines(buf, 0, 1, false))
+
+  -- Deliberately no else branch. This runs again once the buffer holds plaintext,
+  -- and that content has no header to read a label from; keeping the last one
+  -- seen is exactly what lets `:VaultDecrypt` + `:VaultEncrypt` put the 1.2 label
+  -- back instead of silently rewriting the file as 1.1.
   if header then
     vim.b[buf].ansible_vault_version = header.version
     vim.b[buf].ansible_vault_label = header.label
@@ -1635,7 +1599,7 @@ function M.edit(buf, opts)
 end
 
 ---Rekey the current encrypted file.
----@param opts? { args?: string[], overrides?: table, rekey_args?: string[] }
+---@param opts? { overrides?: table }
 function M.rekey(opts)
   local target = vim.api.nvim_get_current_buf()
   if not is_valid_buf(target) then
@@ -1666,10 +1630,17 @@ function M.rekey(opts)
       return
     end
 
-    local rekey_args = with_encrypt_vault_id(creds.args, opts, creds, context)
-    vim.list_extend(rekey_args, with_rekey_target_args(opts and (opts.rekey_args or opts.args) or {}, opts))
-
-    if not has_rekey_target(rekey_args) then
+    -- Old credentials open the file; the new identity is named separately. No
+    -- --encrypt-vault-id: on `rekey` that flag selects from a pool seeded with
+    -- the OLD identities, so it can silently re-encrypt with the old password.
+    -- See credentials.rekey_args.
+    local new_args, new_err = credentials.rekey_args(effective_config(opts), context)
+    if new_err then
+      run_cleanup(creds.cleanup)
+      vim.notify("VaultRekey: " .. new_err, vim.log.levels.ERROR)
+      return
+    end
+    if not new_args then
       run_cleanup(creds.cleanup)
       vim.notify(
         "VaultRekey requires new_vault_id, new_password_file, or a --new-vault-* argument",
@@ -1677,6 +1648,9 @@ function M.rekey(opts)
       )
       return
     end
+
+    local rekey_args = vim.deepcopy(creds.args)
+    vim.list_extend(rekey_args, new_args)
 
     if not start_buffer_operation(target, "rekey") then
       run_cleanup(creds.cleanup)

@@ -91,6 +91,7 @@ shift
 name="encrypted_string"
 file_arg=""
 label=""
+new_label=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --stdin-name)
@@ -101,7 +102,11 @@ while [ "$#" -gt 0 ]; do
       shift
       label="$1"
       ;;
-    --vault-id|--vault-password-file|--new-vault-id|--new-vault-password-file)
+    --new-vault-id)
+      shift
+      new_label="${1%%@*}"
+      ;;
+    --vault-id|--vault-password-file|--new-vault-password-file)
       shift
       ;;
     *)
@@ -153,7 +158,13 @@ case "$action" in
       printf 'missing file arg\n' >&2
       exit 2
     fi
-    printf '$ANSIBLE_VAULT;1.1;AES256\nREKEYED\n' > "$file_arg"
+    # Mirror ansible-vault: the NEW identity decides the envelope, so a labelled
+    # --new-vault-id produces a 1.2 header carrying that label.
+    if [ -n "$new_label" ] && [ "$new_label" != "default" ]; then
+      printf '$ANSIBLE_VAULT;1.2;AES256;%s\nREKEYED\n' "$new_label" > "$file_arg"
+    else
+      printf '$ANSIBLE_VAULT;1.1;AES256\nREKEYED\n' > "$file_arg"
+    fi
     ;;
   *)
     printf 'unknown action: %s\n' "$action" >&2
@@ -844,6 +855,53 @@ tests["under cursor vault lookup does not select a previous block"] = function()
 
   assert_eq(vim.api.nvim_get_current_buf(), buf, "view should not open for a cursor outside the vault block")
   assert_true(notification_contains("No text selected"), "missing warning for cursor outside a vault block")
+end
+
+tests["VaultRekey never passes --encrypt-vault-id"] = function()
+  local fake = create_fake_vault()
+  local old_pass = make_password_file(fake.dir)
+  local new_pass = fake.dir .. "/new-pass"
+  write_file(new_pass, "new\n")
+  reset_config(fake, { password_files = old_pass, new_password_file = new_pass })
+
+  -- A 1.2 header: this is the case where the plugin used to derive
+  -- --encrypt-vault-id from the label it found.
+  local path = fake.dir .. "/labelled.yml"
+  write_file(path, "$ANSIBLE_VAULT;1.2;AES256;prod\nEDITME\n")
+  vim.cmd("edit " .. vim.fn.fnameescape(path))
+
+  vault.rekey()
+  wait_until(function()
+    return read_file(path):find("REKEYED", 1, true) ~= nil
+  end, "VaultRekey did not rewrite the file")
+
+  -- On `rekey` this flag selects the new secret from a pool seeded with the OLD
+  -- identities, so it either errors out or silently re-encrypts with the old
+  -- password. The label is carried by the new identity instead.
+  assert_false(log_contains(fake.log, "ARG:--encrypt-vault-id"), "--encrypt-vault-id must never reach rekey")
+  assert_true(log_has_line(fake.log, "ARG:--new-vault-id"), "the label should ride on the new identity")
+  assert_true(log_has_line(fake.log, "ARG:prod@" .. new_pass), "the new identity should carry the old label")
+  assert_eq(vim.fn.readfile(path, "", 1)[1], "$ANSIBLE_VAULT;1.2;AES256;prod", "the 1.2 label must survive the rekey")
+end
+
+tests["VaultRekey without a label stays on format 1.1"] = function()
+  local fake = create_fake_vault()
+  local new_pass = fake.dir .. "/new-pass-plain"
+  write_file(new_pass, "new\n")
+  reset_config(fake, { new_password_file = new_pass })
+
+  local path = fake.dir .. "/plain.yml"
+  write_file(path, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
+  vim.cmd("edit " .. vim.fn.fnameescape(path))
+
+  vault.rekey()
+  wait_until(function()
+    return read_file(path):find("REKEYED", 1, true) ~= nil
+  end, "VaultRekey did not rewrite the file")
+
+  assert_true(log_has_line(fake.log, "ARG:--new-vault-password-file"), "a plain rekey should pass the password file")
+  assert_false(log_contains(fake.log, "ARG:--new-vault-id"), "nothing should invent a label for a 1.1 file")
+  assert_eq(vim.fn.readfile(path, "", 1)[1], "$ANSIBLE_VAULT;1.1;AES256", "a 1.1 file should stay 1.1")
 end
 
 tests["VaultRekey rekeys a file-backed encrypted buffer"] = function()

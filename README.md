@@ -458,6 +458,13 @@ You can also pass Ansible Vault rekey arguments directly:
 The buffer must be file-backed, encrypted, and unmodified. After a successful
 rekey, the plugin reloads the encrypted file.
 
+A `1.2` vault ID label survives the rekey: the plugin names it on the new
+identity, as `--new-vault-id prod@<new-password-file>`. It never passes
+`--encrypt-vault-id` to `rekey`, because on that subcommand the flag selects the
+*new* secret from a pool seeded with the *old* identities from `ansible.cfg` —
+which either fails outright or re-encrypts the file with the old password and
+still reports success.
+
 ## Keymaps
 
 The plugin doesn't set any keymaps by default. You can add your own:

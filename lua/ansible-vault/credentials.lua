@@ -387,6 +387,55 @@ function M.describe(config, context)
   }
 end
 
+---Build the `--new-*` argv for `ansible-vault rekey`.
+---
+---`--encrypt-vault-id` must NOT appear here, even though it is correct for
+---`encrypt` and `encrypt_string`. For `rekey` alone, passing it makes Ansible seed
+---the *new* secret pool with the *old* identities from `ansible.cfg`
+---(`cli/vault.py`: `if encrypt_vault_id: new_vault_ids = default_vault_ids`) and
+---then pick from that mixed pool by label. So a 1.2 file labelled `prod` either
+---fails with "Did not find a match for --encrypt-vault-id=prod" when no old
+---identity carries the label, or — worse — is silently re-encrypted with the OLD
+---password when one does, and reports success.
+---
+---A label is preserved instead by naming it on the new identity itself:
+---`--new-vault-id <label>@<source>` makes the new id non-default, which is what
+---makes Ansible write a 1.2 envelope carrying that label.
+---@param config table Effective plugin configuration
+---@param context? { header_label?: string }
+---@return string[]|nil args, string|nil err
+function M.rekey_args(config, context)
+  local new_vault_id = config.new_vault_id
+  local new_password_file = config.new_password_file
+
+  if is_nonempty_string(new_vault_id) and is_nonempty_string(new_password_file) then
+    return nil, "new_vault_id and new_password_file are mutually exclusive"
+  end
+
+  if is_nonempty_string(new_vault_id) then
+    return { "--new-vault-id", M.expand_vault_id(new_vault_id) }, nil
+  end
+
+  if is_nonempty_string(new_password_file) then
+    local path = M.expand_path(new_password_file)
+
+    -- Keep a 1.2 label alive across the rekey. Without a label on the new
+    -- identity, a password file resolves to the id "default" and Ansible writes
+    -- a 1.1 envelope, dropping the label the file used to carry.
+    local label = config.encrypt_vault_id
+    if not is_nonempty_string(label) then
+      label = context and context.header_label or nil
+    end
+    if is_nonempty_string(label) and label ~= "default" then
+      return { "--new-vault-id", label .. "@" .. path }, nil
+    end
+
+    return { "--new-vault-password-file", path }, nil
+  end
+
+  return nil, nil
+end
+
 M._private = {
   ensure_askpass = ensure_askpass,
   password_env = PASSWORD_ENV,

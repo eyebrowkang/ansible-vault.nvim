@@ -262,4 +262,65 @@ wait_until(function()
 end, "VaultCreate write did not produce a file")
 assert_true(read_file(created):match("^%$ANSIBLE_VAULT"), "VaultCreate did not write ciphertext")
 
+-- 5. Rekey really changes the password, and keeps a 1.2 label.
+--
+-- This is the case the plugin used to get wrong. Passing --encrypt-vault-id on
+-- `rekey` makes Ansible seed the NEW secret pool with the OLD identities from
+-- ansible.cfg and then pick from that mixed pool by label, so with a `prod`
+-- identity configured the file was re-encrypted with the OLD password and
+-- ansible-vault still reported success. Nothing but a real binary catches that.
+local rekey_dir = workdir .. "/rekey-label"
+vim.fn.mkdir(rekey_dir, "p")
+local rekey_old = rekey_dir .. "/old-pass"
+local rekey_new = rekey_dir .. "/new-pass"
+write_file(rekey_old, "old-secret\n")
+write_file(rekey_new, "new-secret\n")
+vim.fn.setfperm(rekey_old, "rw-------")
+vim.fn.setfperm(rekey_new, "rw-------")
+
+-- The old identity is reachable under the same label the file carries, which is
+-- exactly the configuration that produced the silent no-op rekey.
+write_file(rekey_dir .. "/ansible.cfg", "[defaults]\nvault_identity_list = prod@old-pass\n")
+
+local rekey_file = rekey_dir .. "/secret.yml"
+write_file(rekey_file, "token: original\n")
+assert_eq(
+  vim.fn.system({ ansible_vault, "encrypt", "--vault-id", "prod@" .. rekey_old, rekey_file }) and vim.v.shell_error,
+  0,
+  "failed to create the labelled fixture"
+)
+assert_true(
+  read_file(rekey_file):match("^%$ANSIBLE_VAULT;1%.2;AES256;prod"),
+  "the fixture should start out as a labelled 1.2 file"
+)
+
+vault.setup({
+  ansible_vault_path = ansible_vault,
+  vault_ids = "prod@" .. rekey_old,
+  new_password_file = rekey_new,
+})
+vim.cmd("edit " .. vim.fn.fnameescape(rekey_file))
+
+-- The fixture is already ciphertext, so "has the plaintext gone" proves nothing
+-- here: the only honest signal that the rekey landed is the ciphertext changing.
+local before_rekey = read_file(rekey_file)
+vault.rekey()
+wait_until(function()
+  return read_file(rekey_file) ~= before_rekey
+end, "real VaultRekey did not rewrite the file")
+assert_true(read_file(rekey_file):match("^%$ANSIBLE_VAULT"), "real VaultRekey left the file unencrypted")
+
+assert_true(
+  read_file(rekey_file):match("^%$ANSIBLE_VAULT;1%.2;AES256;prod"),
+  "the 1.2 vault id label must survive a rekey"
+)
+
+-- The decisive assertions: the new password opens the file, the old one does not.
+local with_new = vim.fn.system({ ansible_vault, "view", "--vault-password-file", rekey_new, rekey_file })
+assert_eq(vim.v.shell_error, 0, "the new password should open the rekeyed file")
+assert_true(with_new:find("token: original", 1, true) ~= nil, "the rekeyed file should still hold its content")
+
+vim.fn.system({ ansible_vault, "view", "--vault-password-file", rekey_old, rekey_file })
+assert_true(vim.v.shell_error ~= 0, "the OLD password must no longer open the file after a rekey")
+
 io.stdout:write("REAL_SMOKE_OK\n")
