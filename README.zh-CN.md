@@ -97,12 +97,6 @@ require("ansible-vault").setup({
   -- :VaultRekey 使用的新 vault ID，例如 "prod@~/.ansible/new-pass"
   rekey_vault_id = nil,
 
-  -- 读取文件后自动识别 Ansible Vault 文件
-  auto_detect = true,
-
-  -- 读取加密文件后自动使用 :VaultEdit 打开安全编辑 buffer
-  auto_edit = false,
-
   -- 自定义 ansible-vault 可执行文件路径
   ansible_vault_path = nil,
 })
@@ -262,18 +256,6 @@ buffer 的常规行为，或者用 `:edit!` 重新载入加密文件。
 
 如果 scratch buffer 打开期间原文件在磁盘上发生了变化，插件会拒绝保存，
 避免覆盖外部修改。
-
-### 自动安全编辑加密文件
-
-如果希望打开加密文件时直接进入 `:VaultEdit` scratch 流程：
-
-```lua
-require("ansible-vault").setup({
-  auto_edit = true,
-})
-```
-
-保存后插件会重新载入原始加密 buffer，并避免因为重新载入而再次触发自动编辑。
 
 ### 加密 YAML inline 字符串
 

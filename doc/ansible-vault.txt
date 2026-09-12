@@ -171,8 +171,6 @@ Call |ansible-vault.setup()| with your settings: >
       encrypt_vault_id = nil,
       rekey_password_file = nil,
       rekey_vault_id = nil,
-      auto_detect = true,
-      auto_edit = false,
       ansible_vault_path = nil,
     })
 <
@@ -202,18 +200,6 @@ Call |ansible-vault.setup()| with your settings: >
                                                  *ansible-vault-config-rekey_vault_id*
 `rekey_vault_id` ~
     New vault ID target for |:VaultRekey|.
-
-                                                 *ansible-vault-config-auto_detect*
-`auto_detect` ~
-    (boolean, default `true`)
-    Automatically detect vault-encrypted files on |BufReadPost|
-    and record the vault ID label carried by the header.
-
-                                                 *ansible-vault-config-auto_edit*
-`auto_edit` ~
-    (boolean, default `false`)
-    Automatically open encrypted files with |:VaultEdit| after
-    |BufReadPost|.
 
                                                  *ansible-vault-config-ansible_vault_path*
 `ansible_vault_path` ~

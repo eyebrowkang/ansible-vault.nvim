@@ -201,7 +201,6 @@ local function reset_config(fake, opts)
 
   local config = {
     ansible_vault_path = fake.path,
-    auto_detect = false,
   }
 
   if not opts or opts.password_file ~= false then
@@ -383,15 +382,23 @@ tests["view preserves source filetype"] = function()
   vim.api.nvim_win_close(0, true)
 end
 
-tests["setup clears autodetect autocmd when disabled"] = function()
+tests["opening a vault file does nothing until a command is run"] = function()
   local fake = create_fake_vault()
-  reset_config(fake, { auto_detect = true })
-  reset_config(fake, { auto_detect = false })
+  reset_config(fake)
+
   assert_eq(
     #vim.api.nvim_get_autocmds({ group = "AnsibleVault", event = "BufReadPost" }),
     0,
-    "autodetect autocmd was not cleared"
+    "the plugin must not act on files merely being opened"
   )
+
+  local path = fake.dir .. "/untouched.yml"
+  write_file(path, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
+  vim.cmd("edit " .. vim.fn.fnameescape(path))
+  local buf = vim.api.nvim_get_current_buf()
+
+  assert_eq(vim.bo[buf].buftype, "", "the buffer should be left alone")
+  assert_true(vault.is_buffer_encrypted(buf), "and still be recognisable as a vault file")
 end
 
 tests["VaultEdit uses a no-swap acwrite buffer and saves atomically"] = function()
@@ -655,24 +662,6 @@ tests["VaultDecryptString replaces selected YAML vault block"] = function()
   assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "password: secret" })
 end
 
-tests["auto_edit opens encrypted files in a scratch buffer"] = function()
-  local fake = create_fake_vault()
-  reset_config(fake, { auto_edit = true })
-
-  local original_file = fake.dir .. "/auto-edit.yml"
-  write_file(original_file, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
-
-  vim.cmd("edit " .. vim.fn.fnameescape(original_file))
-  local original_buf = vim.api.nvim_get_current_buf()
-
-  wait_until(function()
-    return vim.api.nvim_get_current_buf() ~= original_buf
-      and vim.bo[vim.api.nvim_get_current_buf()].buftype == "acwrite"
-  end, "auto_edit did not open VaultEdit scratch buffer")
-
-  vim.api.nvim_buf_delete(vim.api.nvim_get_current_buf(), { force = true })
-end
-
 tests["under cursor commands encrypt view and decrypt YAML vault strings"] = function()
   local fake = create_fake_vault()
   reset_config(fake)
@@ -926,7 +915,7 @@ tests["B8 re-setup clears previous config"] = function()
 
   vault.setup({})
   assert_eq(vault.config.encrypt_vault_id, nil, "encrypt_vault_id should reset to nil on re-setup")
-  assert_eq(vault.config.auto_detect, true, "default value should be restored")
+  assert_eq(vault.config.ansible_vault_path, nil, "the executable set by the previous setup should be cleared")
 end
 
 tests["B9 command args support quoted paths with spaces"] = function()
@@ -1339,7 +1328,7 @@ tests["a 1.2 vault id label survives re-encryption"] = function()
   local dir = temp_dir()
   local buf = new_file_buffer(dir, "vault.yml", { "$ANSIBLE_VAULT;1.2;AES256;prod", "ENC:plain" })
 
-  -- BufReadPost records the label; auto_detect is off in tests, so do it here.
+  -- Any operation records the header label before decrypting.
   vault.decrypt(buf)
   wait_until(function()
     return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "plain: value"
