@@ -3,6 +3,14 @@
 ---A read-only float for `:VaultView`. The buffer is created through `secure` and
 ---marked `bufhidden = "wipe"` because it holds decrypted content: it must not
 ---persist to disk and must not outlive the window.
+---
+---`nofile` is not enough to keep it off disk. It stops `:w`, but only because the
+---buffer has no file of its own — `:w {path}` from a `nofile` buffer is not
+---intercepted at all and writes the decrypted content out with the umask's
+---permissions. So the buffer is `acwrite` instead, which routes every write into
+---a handler that refuses, exactly as the `:VaultEdit` and `:VaultCreate` buffers
+---do. Viewing is a read-only verb; `:VaultDecrypt` is how a user who wants the
+---plaintext on disk asks for it.
 local M = {}
 
 local cli = require("ansible-vault.cli")
@@ -15,11 +23,34 @@ function M.open_float(output, title, filetype)
   -- Explicitly hardened rather than relying on the implicit scratch defaults;
   -- this window shows decrypted content.
   local buf = secure.create_buffer(false, true)
+
+  -- Every guard goes on before the decrypted lines do, and each one is read back
+  -- rather than assumed: a view whose writes are not refused would put the
+  -- decrypted content on disk, which is the one thing this window must not do.
+  local REFUSED = "the vault view is read-only; use :VaultDecrypt if you want the decrypted content saved"
+  pcall(function()
+    vim.bo[buf].buftype = "acwrite"
+    vim.bo[buf].bufhidden = "wipe"
+  end)
+  local guarded = pcall(vim.api.nvim_create_autocmd, "BufWriteCmd", {
+    buffer = buf,
+    desc = "Refuse to write a read-only vault view",
+    callback = function()
+      error(REFUSED, 0)
+    end,
+  }) and pcall(secure.refuse_partial_writes, buf, REFUSED) and vim.bo[buf].buftype == "acwrite"
+
+  if not guarded then
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    vim.notify("VaultView: the view buffer could not be secured; nothing was shown", vim.log.levels.ERROR)
+    return
+  end
+
   local lines = cli.output_to_lines(output)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].filetype = filetype or ""
   vim.bo[buf].modifiable = false
+  vim.bo[buf].readonly = true
 
   local max_line_width = 0
   for _, line in ipairs(lines) do

@@ -6,20 +6,25 @@
 ---
 ---Precedence, highest first:
 ---
----  1. per-command overrides (`:VaultEncrypt --vault-id prod@...`)
+---  1. per-command arguments (`:VaultEncrypt --vault-id prod@...`)
 ---  2. `setup()` configuration
 ---  3. `ANSIBLE_*` environment variables
 ---  4. `ansible.cfg`
 ---  5. interactive prompt
 ---
----Layers 3 and 4 are Ansible's own; for those the plugin passes no credential
----flags at all and just runs in the right directory, letting `ansible-vault`
----resolve them. Passing flags on top of them is what triggers
----"The vault-ids default,default are available to encrypt".
+---Layers 3 and 4 are Ansible's own; when nothing above them supplies a credential
+---the plugin passes no credential flags at all and just runs in the right
+---directory, letting `ansible-vault` resolve them. Passing flags on top of them is
+---what triggers "The vault-ids default,default are available to encrypt".
+---
+---When something above them *does* supply a credential, the precedence has to be
+---enforced rather than assumed — see `identity_list_env`, which exists because
+---`ansible-vault` otherwise lets `ansible.cfg` outrank the command line.
 ---
 ---Interactively entered passwords are handed to the child process through its
----environment and read back by a static helper script that contains no secret.
----Nothing secret is ever written to disk.
+---environment and read back by a static helper script that contains no secret. If
+---that helper cannot be installed the operation fails; there is no fallback that
+---writes the password to a file.
 local ansible_cfg = require("ansible-vault.ansible_cfg")
 
 local M = {}
@@ -27,7 +32,10 @@ local M = {}
 local uv = vim.uv
 
 local PASSWORD_ENV = "ANSIBLE_VAULT_NVIM_PASSWORD"
-local PASSWORD_FILE_MODE = 384 -- 0600
+local IDENTITY_LIST_ENV = "ANSIBLE_VAULT_IDENTITY_LIST"
+local ENCRYPT_IDENTITY_ENV = "ANSIBLE_VAULT_ENCRYPT_IDENTITY"
+local ASK_ENV = "ANSIBLE_ASK_VAULT_PASS"
+
 local DIR_MODE = 448 -- 0700
 local ASKPASS_SCRIPT = "#!/bin/sh\n# Written by ansible-vault.nvim. Contains no secret.\nprintf '%s' \"${"
   .. PASSWORD_ENV
@@ -35,10 +43,32 @@ local ASKPASS_SCRIPT = "#!/bin/sh\n# Written by ansible-vault.nvim. Contains no 
 
 local askpass_path = nil
 
----Temp password files created by the fallback path, so they can be swept if an
----operation never completes.
----@type table<string, boolean>
-local pending_tempfiles = {}
+---Extra environment a specific subcommand needs, whatever the credentials are.
+---
+---`rekey` must not inherit an encrypt identity. `ansible-vault rekey` reads
+---`--encrypt-vault-id` *or* `DEFAULT_VAULT_ENCRYPT_IDENTITY`, and if either is
+---set it seeds the pool of *new* secrets with the *old* identities from
+---`ansible.cfg` (`cli/vault.py`: `if encrypt_vault_id: new_vault_ids =
+---default_vault_ids`) before matching by label. With `vault_encrypt_identity` or
+---`ANSIBLE_VAULT_ENCRYPT_IDENTITY` set to a label the old configuration also
+---carries, the rekey reports "Rekey successful", writes the same 1.2 header back,
+---and leaves the file encrypted with the OLD password. Verified against
+---ansible-core 2.21.4.
+---
+---An empty string is the clean way to switch it off: Ansible reads it as a set
+---but falsy value, so the default is gone while `DEFAULT_VAULT_IDENTITY_LIST` —
+---which is what still decrypts the old content — is untouched. Emptying the
+---identity list the same way does not work: `ANSIBLE_VAULT_IDENTITY_LIST=""`
+---parses as one empty entry and warns about an unreadable password file.
+local ACTION_ENV = {
+  rekey = { [ENCRYPT_IDENTITY_ENV] = "" },
+}
+
+---@param action string
+---@return table|nil
+function M.action_env(action)
+  return ACTION_ENV[action]
+end
 
 ---@param value any
 ---@return boolean
@@ -87,13 +117,19 @@ function M.as_list(value)
   return result
 end
 
+---The label half of a `label@source` vault id.
+---
+---A vault id with no `@` is a bare password file, which `ansible-vault` files
+---under `DEFAULT_VAULT_IDENTITY` — not under its own path, which is what reading
+---the whole string as a label would claim.
 ---@param vault_id any
----@return string|nil
-local function vault_id_label(vault_id)
+---@param default_identity string
+---@return string
+local function vault_id_label(vault_id, default_identity)
   if not is_nonempty_string(vault_id) then
-    return nil
+    return default_identity
   end
-  return vault_id:match("^([^@]+)@") or vault_id
+  return vault_id:match("^([^@]+)@") or default_identity
 end
 
 --- Password helper script -------------------------------------------------
@@ -151,73 +187,68 @@ local function ensure_askpass()
   return path, nil
 end
 
----Fallback for platforms where the helper script cannot be used. The file is
----named after the owning process so a stale one can be identified and swept.
----@param contents string
----@return string|nil path
----@return string|nil err
-local function write_password_tempfile(contents)
-  local path = string.format("%s.ansible-vault-nvim.%d", vim.fn.tempname(), uv.getpid())
-  local fd, open_err = uv.fs_open(path, "wx", PASSWORD_FILE_MODE)
-  if not fd then
-    return nil, open_err or "failed to create temp file"
-  end
-
-  local written, write_err = uv.fs_write(fd, contents)
-  uv.fs_close(fd)
-
-  if type(written) ~= "number" or written < #contents then
-    os.remove(path)
-    return nil, write_err or "failed to write temp file"
-  end
-
-  pending_tempfiles[path] = true
-  return path, nil
-end
-
----@param path string
-local function remove_password_tempfile(path)
-  pending_tempfiles[path] = nil
-  os.remove(path)
-end
-
----Remove every temp password file this process still owns.
-function M.cleanup_all()
-  for path in pairs(pending_tempfiles) do
-    os.remove(path)
-  end
-  pending_tempfiles = {}
-end
-
 --- Planning ---------------------------------------------------------------
 
 ---@class AnsibleVaultPlan
 ---@field args string[] Credential flags to pass to ansible-vault
+---@field identities string[] `label@source` for each credential the plugin supplies
 ---@field cwd string|nil Directory the child process should run in
 ---@field source string Human-readable credential source
----@field our_label string|nil Vault id label the plugin's own credential carries
+---@field our_label string Vault id label the plugin's own credential carries
+---@field default_identity string Label a bare password file lands under
 ---@field needs_password boolean Whether an interactive prompt is required
 ---@field needs_disambiguation boolean Whether Ansible would supply a second identity
 ---@field cfg AnsibleVaultCfg Resolved ansible.cfg/environment state
 
+---The flags that hand `source` to `ansible-vault` under `label`.
+---
+---`--vault-password-file` always lands under `DEFAULT_VAULT_IDENTITY`, so it can
+---only be used when that is the label we want. Naming any other label needs
+---`--vault-id`, which is also what makes `ansible-vault` write a 1.2 envelope
+---carrying it.
+---@param label string
+---@param source string
+---@param default_identity string
+---@return string[] args
+local function credential_flags(label, source, default_identity)
+  if label == default_identity then
+    return { "--vault-password-file", source }
+  end
+  return { "--vault-id", label .. "@" .. source }
+end
+
 ---Work out where credentials come from, without prompting for anything.
 ---@param config table Effective plugin configuration
----@param context? { file_path?: string }
+---@param context? { file_path?: string, header_label?: string }
 ---@return AnsibleVaultPlan
 function M.plan(config, context)
   local cfg = ansible_cfg.resolve(context and context.file_path or nil)
+  local default_identity = is_nonempty_string(cfg.settings.vault_identity) and cfg.settings.vault_identity or "default"
+
   local plan = {
     args = {},
+    identities = {},
     cwd = cfg.cwd,
     cfg = cfg,
     needs_password = false,
     needs_disambiguation = false,
-    our_label = nil,
+    our_label = default_identity,
+    default_identity = default_identity,
     source = "interactive",
   }
 
   local password_files = M.as_list(config.password_files)
   local vault_ids = M.as_list(config.vault_ids)
+
+  -- The label the result should carry, when the caller knows one. A password
+  -- file has no label of its own, so this is what decides whether re-encrypting
+  -- keeps the file's 1.2 identity or quietly rewrites it as 1.1.
+  local wanted
+  if is_nonempty_string(config.encrypt_vault_id) then
+    wanted = config.encrypt_vault_id
+  elseif context and is_nonempty_string(context.header_label) then
+    wanted = context.header_label
+  end
 
   -- An explicit ask beats everything, including what Ansible's own config would
   -- supply. This is the only way to reach a vault whose password is not written
@@ -225,38 +256,72 @@ function M.plan(config, context)
   if config.ask_password == true or cfg.settings.ask_vault_pass == true then
     plan.needs_password = true
     plan.source = config.ask_password == true and "ask_password" or "ansible.cfg ask_vault_pass"
+    plan.our_label = wanted or default_identity
   elseif #password_files > 0 then
     plan.source = #password_files > 1 and string.format("password_files (%d)", #password_files) or "password_files"
+    plan.our_label = wanted or default_identity
     for _, path in ipairs(password_files) do
-      table.insert(plan.args, "--vault-password-file")
-      table.insert(plan.args, M.expand_path(path))
+      local expanded = M.expand_path(path)
+      vim.list_extend(plan.args, credential_flags(plan.our_label, expanded, default_identity))
+      table.insert(plan.identities, plan.our_label .. "@" .. expanded)
     end
-    plan.our_label = cfg.settings.vault_identity or "default"
   elseif #vault_ids > 0 then
     plan.source = #vault_ids > 1 and string.format("vault_ids (%d)", #vault_ids) or "vault_ids"
     for _, vault_id in ipairs(vault_ids) do
+      local expanded = M.expand_vault_id(vault_id)
       table.insert(plan.args, "--vault-id")
-      table.insert(plan.args, M.expand_vault_id(vault_id))
+      table.insert(plan.args, expanded)
+      table.insert(plan.identities, expanded)
     end
-    plan.our_label = vault_id_label(M.expand_vault_id(vault_ids[1]))
+    plan.our_label = vault_id_label(M.expand_vault_id(vault_ids[1]), default_identity)
   elseif cfg.has_credentials then
     -- Ansible resolves these itself; adding flags would create a second identity.
     plan.source = cfg.credential_source or "ansible.cfg"
-    plan.our_label = cfg.label
+    plan.our_label = cfg.label or default_identity
   else
     plan.needs_password = true
+    plan.our_label = wanted or default_identity
   end
 
-  plan.needs_disambiguation = #plan.args > 0 and cfg.has_credentials
+  -- True whenever the child's secret pool can hold more than the one identity
+  -- the plugin supplies, which is exactly when the identity to encrypt with has
+  -- to be named rather than left to "the only one there is".
+  plan.needs_disambiguation = (#plan.args > 0 or plan.needs_password) and cfg.has_credentials
 
   return plan
 end
 
+---Whether the credential the plugin is about to pass carries `label`.
+---@param plan AnsibleVaultPlan
+---@param label string
+---@return boolean
+local function carries_label(plan, label)
+  if #plan.identities == 0 and not plan.needs_password then
+    -- Ansible's own configuration supplies the secrets and we cannot enumerate
+    -- them, so name the label and let `ansible-vault` say whether it matched.
+    return true
+  end
+  if plan.our_label == label then
+    return true
+  end
+  for _, identity in ipairs(plan.identities) do
+    if vault_id_label(identity, plan.default_identity) == label then
+      return true
+    end
+  end
+  return false
+end
+
 ---Label to encrypt with, or nil to let `ansible-vault` decide.
 ---
----An explicit setting always wins. Otherwise the label already recorded in the
----file's own `$ANSIBLE_VAULT;1.2;AES256;<label>` header is reused, so re-encrypting
----does not silently downgrade the file to format 1.1 and drop its label.
+---An explicit setting always wins, even if nothing carries it: the user named an
+---identity, and failing is better than encrypting with a different one. Otherwise
+---the label already recorded in the file's own
+---`$ANSIBLE_VAULT;1.2;AES256;<label>` header is reused, so re-encrypting does not
+---silently downgrade the file to format 1.1 and drop its label — but only when
+---the credential in hand actually carries that label, because naming one it does
+---not carry would either fail outright or match some *other* identity that
+---happens to share the name.
 ---@param config table
 ---@param plan AnsibleVaultPlan
 ---@param context? { header_label?: string }
@@ -265,12 +330,30 @@ function M.encrypt_label(config, plan, context)
   if is_nonempty_string(config.encrypt_vault_id) then
     return config.encrypt_vault_id
   end
-  if context and is_nonempty_string(context.header_label) then
-    return context.header_label
+
+  local header = context and context.header_label
+  if is_nonempty_string(header) and carries_label(plan, header) then
+    return header
   end
+
   if plan.needs_disambiguation then
-    return plan.our_label or "default"
+    return plan.our_label
   end
+
+  -- Several password files are one credential set under one label, so there is
+  -- nothing for the user to choose between — but `ansible-vault` counts secrets,
+  -- not labels, and refuses with "The vault-ids default,default are available to
+  -- encrypt" unless the label is spelled out. Several vault ids under *different*
+  -- labels is a real choice, and is left to fail rather than picking one.
+  if #plan.identities > 1 then
+    for _, identity in ipairs(plan.identities) do
+      if vault_id_label(identity, plan.default_identity) ~= plan.our_label then
+        return nil
+      end
+    end
+    return plan.our_label
+  end
+
   return nil
 end
 
@@ -280,64 +363,77 @@ end
 ---@field args string[] Credential flags
 ---@field env table|nil Extra environment for the child process
 ---@field cwd string|nil Working directory for the child process
----@field plan AnsibleVaultPlan
----@field cleanup fun()|nil
+---@field plan? AnsibleVaultPlan Absent for the rekey target's own credentials
+
+---Put the plugin's own identities ahead of Ansible's own, for the child only.
+---
+---`ansible-vault` builds its secret pool as `DEFAULT_VAULT_IDENTITY_LIST` first
+---and the `--vault-id` flags after it, then encrypts with the FIRST secret whose
+---label matches. So an `ansible.cfg` that happens to use the same label as the
+---credential the user named on the command line wins, and the file is encrypted
+---with a password the user did not choose — exit 0, the expected header, the
+---wrong key. Verified against ansible-core 2.21.4.
+---
+---Prepending our identities restores the documented precedence without touching
+---the user's `ansible.cfg` or this process's environment. The configured entries
+---are kept after ours, so content encrypted with one of them still decrypts.
+---@param plan AnsibleVaultPlan
+---@param identities string[]
+---@return table|nil env
+---@return string|nil err
+local function identity_list_env(plan, identities)
+  local configured = plan.cfg.settings.vault_identity_list
+  if #identities == 0 or type(configured) ~= "table" or #configured == 0 then
+    return nil, nil
+  end
+
+  local entries = vim.list_extend(vim.deepcopy(identities), configured)
+  for _, entry in ipairs(entries) do
+    if entry:find(",", 1, true) then
+      -- The variable is comma separated with no escape, so a source containing
+      -- one cannot be expressed. Failing is the only safe answer: continuing
+      -- would encrypt with ansible.cfg's password instead of the named one.
+      return nil, string.format("a vault id source contains a comma, which %s cannot express", IDENTITY_LIST_ENV)
+    end
+  end
+
+  return { [IDENTITY_LIST_ENV] = table.concat(entries, ",") }, nil
+end
 
 ---@param plan AnsibleVaultPlan
----@param password string
----@return AnsibleVaultCredentials|nil
+---@param identities string[]
+---@param extra? table
+---@return table|nil env
 ---@return string|nil err
-local function credentials_for_password(plan, password)
-  local helper, helper_err = ensure_askpass()
-  if helper then
-    return {
-      args = { "--vault-password-file", helper },
-      env = { [PASSWORD_ENV] = password, ANSIBLE_ASK_VAULT_PASS = "False" },
-      cwd = plan.cwd,
-      plan = plan,
-    },
-      nil
+local function child_env(plan, identities, extra)
+  -- The plugin is supplying the secret, so the child must not also try to
+  -- prompt: `ansible.cfg` may set `ask_vault_pass`, and with piped stdin and no
+  -- tty that either blocks until the timeout or reads the content as a password.
+  local env = { [ASK_ENV] = "False" }
+
+  local isolation, err = identity_list_env(plan, identities)
+  if err then
+    return nil, err
   end
 
-  local tmpfile, temp_err = write_password_tempfile(password .. "\n")
-  if not tmpfile then
-    return nil, temp_err or helper_err
-  end
-
-  local cleaned = false
-  return {
-    args = { "--vault-password-file", tmpfile },
-    env = { ANSIBLE_ASK_VAULT_PASS = "False" },
-    cwd = plan.cwd,
-    plan = plan,
-    cleanup = function()
-      if cleaned then
-        return
-      end
-      cleaned = true
-      remove_password_tempfile(tmpfile)
-    end,
-  },
-    nil
+  return vim.tbl_extend("force", env, isolation or {}, extra or {}), nil
 end
 
 ---Resolve credentials, prompting only when nothing else supplies them.
 ---@param config table Effective plugin configuration
----@param context? { file_path?: string }
+---@param context? { file_path?: string, header_label?: string }
 ---@param callback fun(creds: AnsibleVaultCredentials|nil)
 function M.resolve(config, context, callback)
   local plan = M.plan(config, context)
 
   if not plan.needs_password then
-    -- The plugin is supplying the secret, so the child must not also try to
-    -- prompt: `ansible.cfg` may set `ask_vault_pass`, and with piped stdin and no
-    -- tty that either blocks until the timeout or reads the content as a password.
-    callback({
-      args = plan.args,
-      env = { ANSIBLE_ASK_VAULT_PASS = "False" },
-      cwd = plan.cwd,
-      plan = plan,
-    })
+    local env, err = child_env(plan, plan.identities, nil)
+    if not env then
+      vim.notify("Cannot run ansible-vault: " .. err, vim.log.levels.ERROR)
+      callback(nil)
+      return
+    end
+    callback({ args = plan.args, env = env, cwd = plan.cwd, plan = plan })
     return
   end
 
@@ -354,34 +450,36 @@ function M.resolve(config, context, callback)
     return
   end
 
-  local creds, err = credentials_for_password(plan, password)
-  if not creds then
-    vim.notify("Failed to prepare vault password: " .. (err or "unknown error"), vim.log.levels.ERROR)
+  -- Fail closed. The only other way to hand a typed password to `ansible-vault`
+  -- is a file, and a file is exactly what this plugin promises never to write.
+  local helper, helper_err = ensure_askpass()
+  if not helper then
+    vim.notify(
+      "Cannot pass the vault password without writing it to disk ("
+        .. (helper_err or "unknown reason")
+        .. "); use password_files or vault_ids instead",
+      vim.log.levels.ERROR
+    )
     callback(nil)
     return
   end
 
-  callback(creds)
-end
+  local env, env_err = child_env(plan, { plan.our_label .. "@" .. helper }, { [PASSWORD_ENV] = password })
+  if not env then
+    vim.notify("Cannot run ansible-vault: " .. env_err, vim.log.levels.ERROR)
+    callback(nil)
+    return
+  end
 
---- Diagnostics ------------------------------------------------------------
-
----Describe credential resolution for `:checkhealth` without side effects.
----@param config table
----@param context? { file_path?: string }
----@return table
-function M.describe(config, context)
-  local plan = M.plan(config, context)
-  return {
-    source = plan.source,
+  callback({
+    args = credential_flags(plan.our_label, helper, plan.default_identity),
+    env = env,
     cwd = plan.cwd,
-    cfg_path = plan.cfg.cfg_path,
-    cfg_source = plan.cfg.cfg_source,
-    needs_disambiguation = plan.needs_disambiguation,
-    encrypt_label = M.encrypt_label(config, plan, context),
-    settings = plan.cfg.settings,
-  }
+    plan = plan,
+  })
 end
+
+--- Rekey -----------------------------------------------------------------
 
 ---Build the `--new-*` argv for `ansible-vault rekey`.
 ---
@@ -392,7 +490,8 @@ end
 ---then pick from that mixed pool by label. So a 1.2 file labelled `prod` either
 ---fails with "Did not find a match for --encrypt-vault-id=prod" when no old
 ---identity carries the label, or — worse — is silently re-encrypted with the OLD
----password when one does, and reports success.
+---password when one does, and reports success. `ACTION_ENV.rekey` closes the same
+---hole for the inherited default.
 ---
 ---A label is preserved instead by naming it on the new identity itself:
 ---`--new-vault-id <label>@<source>` makes the new id non-default, which is what
@@ -432,9 +531,70 @@ function M.rekey_args(config, context)
   return nil, nil
 end
 
-M._private = {
-  ensure_askpass = ensure_askpass,
-  password_env = PASSWORD_ENV,
-}
+---Credentials that encrypt with the rekey target, and with nothing else.
+---
+---`ansible-vault rekey` does the two halves itself, but inline rekey cannot use
+---it: the ciphertext lives inside a YAML file that must keep its structure, so
+---the value is decrypted and re-encrypted as two runs. The second run must not
+---inherit the first one's secret pool — with `ansible.cfg` supplying an identity
+---under the same label, "encrypt with the new password" would resolve to the old
+---one, and the rekey would appear to succeed while changing nothing.
+---
+---So the new identity is the only one the child can see, and it is named
+---explicitly rather than left to a pool of one.
+---@param config table Effective plugin configuration
+---@param context? { file_path?: string, header_label?: string }
+---@return AnsibleVaultCredentials|nil creds, string|nil err
+function M.new_credentials(config, context)
+  local args, err = M.rekey_args(config, context)
+  if err then
+    return nil, err
+  end
+  if not args then
+    return nil, nil
+  end
+
+  local cfg = ansible_cfg.resolve(context and context.file_path or nil)
+  local default_identity = is_nonempty_string(cfg.settings.vault_identity) and cfg.settings.vault_identity or "default"
+
+  local identity = args[1] == "--new-vault-id" and args[2] or (default_identity .. "@" .. args[2])
+  local label = vault_id_label(identity, default_identity)
+
+  if identity:find(",", 1, true) then
+    return nil, string.format("a vault id source contains a comma, which %s cannot express", IDENTITY_LIST_ENV)
+  end
+
+  return {
+    args = { "--vault-id", identity, "--encrypt-vault-id", label },
+    env = {
+      [ASK_ENV] = "False",
+      -- Replaces whatever `ansible.cfg` configured, so the old identities cannot
+      -- take the label ahead of this one.
+      [IDENTITY_LIST_ENV] = identity,
+      [ENCRYPT_IDENTITY_ENV] = "",
+    },
+    cwd = cfg.cwd,
+  },
+    nil
+end
+
+--- Diagnostics ------------------------------------------------------------
+
+---Describe credential resolution for `:checkhealth` without side effects.
+---@param config table
+---@param context? { file_path?: string }
+---@return table
+function M.describe(config, context)
+  local plan = M.plan(config, context)
+  return {
+    source = plan.source,
+    cwd = plan.cwd,
+    cfg_path = plan.cfg.cfg_path,
+    cfg_source = plan.cfg.cfg_source,
+    needs_disambiguation = plan.needs_disambiguation,
+    encrypt_label = M.encrypt_label(config, plan, context),
+    settings = plan.cfg.settings,
+  }
+end
 
 return M

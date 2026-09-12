@@ -1,1073 +1,811 @@
----@param H table Shared helpers from tests/helpers.lua
----@param tests table Registry the driver runs
+---Command semantics: what each of the six commands acts on, and what `:w` then
+---saves. Driven entirely through `vim.cmd`, because the commands are the whole
+---public interface.
+---@param H table
+---@param tests table
 return function(H, tests)
-  local vault = require("ansible-vault")
-  local assert_eq = H.assert_eq
-  local assert_true = H.assert_true
-  local assert_false = H.assert_false
-  local wait_until = H.wait_until
-  local write_file = H.write_file
-  local read_file = H.read_file
-  local temp_dir = H.temp_dir
-  local create_fake_vault = H.create_fake_vault
-  local make_password_file = H.make_password_file
-  local reset_config = H.reset_config
-  local new_file_buffer = H.new_file_buffer
-  local new_buffer = H.new_buffer
-  local log_contains = H.log_contains
-  local log_has_line = H.log_has_line
-  local notification_contains = H.notification_contains
+  local eq, yes, no = H.assert_eq, H.assert_true, H.assert_false
 
-  tests["encrypt uses argv and supports paths with spaces"] = function()
-    local fake = create_fake_vault()
-    local config = reset_config(fake)
-    local buf = new_buffer({ "plain" })
-
-    vault.encrypt(buf)
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
-    end, "encrypt did not update target buffer")
-
-    assert_true(
-      log_contains(fake.log, "ARG:" .. config.password_files),
-      "password path was not passed as one argv item"
-    )
-    assert_false(
-      log_contains(fake.log, "ARG:--encrypt-vault-id"),
-      "default encryption must not force --encrypt-vault-id"
-    )
-    assert_true(vault.is_buffer_encrypted(buf), "buffer should report itself encrypted")
+  local function fixture(value, label)
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local buf, path = H.new_file_buffer(fake.dir, "vault.yml", H.envelope(value or "plain: old\n", nil, label))
+    return fake, buf, path
   end
 
-  tests["async encrypt writes back to the original buffer"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-    vim.env.FAKE_VAULT_SLEEP = "0.2"
+  --- Public surface ---------------------------------------------------------
 
-    local first = new_buffer({ "first" })
-    local second = vim.api.nvim_create_buf(true, false)
-    vim.api.nvim_buf_set_lines(second, 0, -1, false, { "second" })
-
-    vault.encrypt(first)
-    vim.api.nvim_set_current_buf(second)
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(first, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
-    end, "original buffer was not encrypted")
-
-    assert_eq(
-      vim.api.nvim_buf_get_lines(second, 0, -1, false),
-      { "second" },
-      "current buffer was modified by async callback"
-    )
-  end
-
-  tests["async encrypt does not clobber a changed buffer"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-    vim.env.FAKE_VAULT_SLEEP = "0.2"
-
-    local buf = new_buffer({ "plain" })
-    vault.encrypt(buf)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "user edit" })
-
-    wait_until(function()
-      return vim.b[buf].ansible_vault_pending == nil
-    end, "encrypt operation did not finish")
-
-    assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "user edit" }, "changed buffer was clobbered")
-  end
-
-  tests["vault_id does not imply default encrypt vault id"] = function()
-    local fake = create_fake_vault()
-    local pass = make_password_file(fake.dir)
-    reset_config(fake, { password_files = false, vault_ids = "prod@" .. pass, encrypt_vault_id = nil })
-
-    local buf = new_buffer({ "plain" })
-    vault.encrypt(buf)
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
-    end, "encrypt with vault_id did not finish")
-
-    assert_true(log_contains(fake.log, "ARG:prod@" .. pass), "vault_id was not passed")
-    assert_false(log_contains(fake.log, "ARG:--encrypt-vault-id"), "encrypt_vault_id should be opt-in")
-
-    reset_config(fake, { password_files = false, vault_ids = "prod@" .. pass, encrypt_vault_id = "prod" })
-    local other = new_buffer({ "plain" })
-    vault.encrypt(other)
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(other, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.2;AES256;prod"
-    end, "encrypt with explicit encrypt_vault_id did not finish")
-
-    assert_true(log_contains(fake.log, "ARG:--encrypt-vault-id"), "explicit encrypt_vault_id flag was not passed")
-    assert_true(log_has_line(fake.log, "ARG:prod"), "explicit encrypt_vault_id value was not passed")
-  end
-
-  tests["vault_ids pass multiple vault identities"] = function()
-    local fake = create_fake_vault()
-    local dev_pass = make_password_file(fake.dir)
-    local prod_pass = make_password_file(fake.dir)
-    reset_config(fake, {
-      password_files = false,
-      vault_ids = { "dev@" .. dev_pass, "prod@" .. prod_pass },
-      encrypt_vault_id = "prod",
-    })
-
-    local buf = new_buffer({ "plain" })
-    vault.encrypt(buf)
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.2;AES256;prod"
-    end, "encrypt with vault_ids did not finish")
-
-    assert_true(log_contains(fake.log, "ARG:dev@" .. dev_pass), "dev vault_id was not passed")
-    assert_true(log_contains(fake.log, "ARG:prod@" .. prod_pass), "prod vault_id was not passed")
-    assert_true(log_contains(fake.log, "ARG:--encrypt-vault-id"), "encrypt_vault_id flag was not passed")
-    assert_true(log_has_line(fake.log, "ARG:prod"), "encrypt_vault_id value was not passed")
-  end
-
-  tests["view preserves source filetype"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local buf = new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
-    vim.bo[buf].filetype = "yaml"
-
-    vault.view(buf)
-
-    wait_until(function()
-      return vim.api.nvim_get_current_buf() ~= buf
-    end, "view window did not open")
-
-    assert_eq(vim.bo[vim.api.nvim_get_current_buf()].filetype, "yaml", "view buffer filetype was not preserved")
-    vim.api.nvim_win_close(0, true)
-  end
-
-  tests["opening a vault file does nothing until a command is run"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    assert_eq(
-      #vim.api.nvim_get_autocmds({ group = "AnsibleVault", event = "BufReadPost" }),
-      0,
-      "the plugin must not act on files merely being opened"
-    )
-
-    local path = fake.dir .. "/untouched.yml"
-    write_file(path, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
-    vim.cmd("edit " .. vim.fn.fnameescape(path))
-    local buf = vim.api.nvim_get_current_buf()
-
-    assert_eq(vim.bo[buf].buftype, "", "the buffer should be left alone")
-    assert_true(vault.is_buffer_encrypted(buf), "and still be recognisable as a vault file")
-  end
-
-  tests["VaultEdit uses a no-swap acwrite buffer and saves atomically"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local original_file = fake.dir .. "/secret.yml"
-    write_file(original_file, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
-
-    vim.cmd("edit " .. vim.fn.fnameescape(original_file))
-    local original_buf = vim.api.nvim_get_current_buf()
-
-    vault.edit(original_buf)
-
-    wait_until(function()
-      return vim.api.nvim_get_current_buf() ~= original_buf
-    end, "VaultEdit buffer did not open")
-
-    local edit_buf = vim.api.nvim_get_current_buf()
-    assert_true(vim.api.nvim_buf_is_valid(original_buf), "original buffer was deleted")
-    assert_eq(vim.bo[edit_buf].buftype, "acwrite", "edit buffer must be acwrite")
-    assert_eq(vim.bo[edit_buf].swapfile, false, "edit buffer must not use swapfile")
-    assert_eq(vim.bo[edit_buf].undofile, false, "edit buffer must not use undofile")
-    assert_eq(vim.bo[edit_buf].bufhidden, "wipe", "edit buffer should wipe on close")
-
-    vim.api.nvim_buf_set_lines(edit_buf, 0, -1, false, { "plain: new" })
-    vim.cmd("write")
-
-    wait_until(function()
-      return not vim.api.nvim_buf_is_valid(edit_buf) or vim.api.nvim_get_current_buf() == original_buf
-    end, "VaultEdit save did not close the edit buffer")
-
-    assert_true(read_file(original_file):match("^%$ANSIBLE_VAULT;1.1;AES256"), "encrypted file was not written")
-    assert_true(vim.api.nvim_buf_is_valid(original_buf), "original buffer was not restored")
-  end
-
-  tests["VaultEdit refuses to overwrite externally changed files"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local original_file = fake.dir .. "/external-change.yml"
-    write_file(original_file, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
-
-    vim.cmd("edit " .. vim.fn.fnameescape(original_file))
-    local original_buf = vim.api.nvim_get_current_buf()
-
-    vault.edit(original_buf)
-
-    wait_until(function()
-      return vim.api.nvim_get_current_buf() ~= original_buf
-    end, "VaultEdit buffer did not open")
-
-    local edit_buf = vim.api.nvim_get_current_buf()
-    write_file(original_file, "$ANSIBLE_VAULT;1.1;AES256\nEXTERNAL CHANGE\n")
-
-    vim.api.nvim_buf_set_lines(edit_buf, 0, -1, false, { "plain: new" })
-    vim.cmd("write")
-
-    wait_until(function()
-      return notification_contains("Original file changed on disk")
-    end, "VaultEdit did not detect the external file change")
-
-    assert_true(vim.api.nvim_buf_is_valid(edit_buf), "edit buffer should remain open after a refused save")
-    assert_true(vim.bo[edit_buf].modified, "edit buffer should remain modified after a refused save")
-    assert_true(read_file(original_file):find("EXTERNAL CHANGE", 1, true), "external file content was overwritten")
-    vim.api.nvim_buf_delete(edit_buf, { force = true })
-  end
-
-  tests["VaultEncrypt on a key: value line keeps the key"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local buf = new_buffer({ "password: secret" })
-
-    vault.encrypt(nil, { range = 1, line1 = 1, line2 = 1 })
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
-    end, "YAML key was not preserved for full-line string encryption")
-
-    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    assert_eq(lines[1], "password: !vault |", "full-line YAML output has wrong first line")
-    assert_eq(lines[2], "          $ANSIBLE_VAULT;1.1;AES256", "full-line YAML output has wrong vault header")
-  end
-
-  tests["command args can override encrypt vault id"] = function()
-    local fake = create_fake_vault()
-    local dev_pass = make_password_file(fake.dir)
-    local prod_pass = make_password_file(fake.dir)
-    reset_config(fake, {
-      password_files = false,
-      vault_ids = { "dev@" .. dev_pass, "prod@" .. prod_pass },
-    })
-
-    local line = "password: secret"
-    local buf = new_buffer({ line })
-
-    vim.cmd("1VaultEncrypt --encrypt-vault-id prod")
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
-    end, "VaultEncrypt command arg did not encrypt")
-
-    assert_true(log_contains(fake.log, "ARG:--encrypt-vault-id"), "encrypt vault id flag was not passed")
-    assert_true(log_has_line(fake.log, "ARG:prod"), "encrypt vault id value was not passed")
-  end
-
-  tests["--vault-password-file can be repeated"] = function()
-    local fake = create_fake_vault()
-    local first = fake.dir .. "/first-pass"
-    local second = fake.dir .. "/second-pass"
-    write_file(first, "one\n")
-    write_file(second, "two\n")
-    reset_config(fake, { password_files = false })
-
-    local buf = new_buffer({ "plain" })
-    vim.cmd(
+  tests["public surface is setup only and six commands exist without setup"] = function()
+    local script = H.temp_dir() .. "/public.lua"
+    H.write_file(
+      script,
       string.format(
-        "VaultEncrypt --vault-password-file %s --vault-password-file %s",
-        vim.fn.fnameescape(first),
-        vim.fn.fnameescape(second)
+        [[
+vim.opt.runtimepath:prepend(%q)
+vim.cmd('runtime plugin/ansible-vault.lua')
+local module = require('ansible-vault')
+assert(vim.deep_equal(vim.tbl_keys(module), {'setup'}), vim.inspect(vim.tbl_keys(module)))
+local names = {'VaultCreate','VaultEncrypt','VaultDecrypt','VaultView','VaultEdit','VaultRekey'}
+for _, name in ipairs(names) do assert(vim.fn.exists(':' .. name) == 2, name) end
+module.setup({})
+module.setup({})
+for _, name in ipairs(names) do assert(vim.fn.exists(':' .. name) == 2, name) end
+io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
+]],
+        H.root
       )
     )
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
-    end, "encrypt with two password files did not finish")
-
-    assert_true(log_has_line(fake.log, "ARG:" .. first), "the first password file was dropped")
-    assert_true(log_has_line(fake.log, "ARG:" .. second), "the second password file was dropped")
+    local result = vim.system({ vim.v.progpath, "--headless", "-u", "NONE", "-l", script }):wait(10000)
+    eq(result.code, 0, result.stderr)
+    yes(result.stdout:find("PUBLIC_OK", 1, true))
   end
 
-  tests["password_files accepts a single string or a list"] = function()
-    local fake = create_fake_vault()
-    local pass = make_password_file(fake.dir)
-    reset_config(fake, { password_files = { pass } })
-
-    local buf = new_buffer({ "plain" })
-    vault.encrypt(buf)
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
-    end, "encrypt with a one-element list did not finish")
-
-    assert_true(log_has_line(fake.log, "ARG:" .. pass), "a one-element list should behave like a bare string")
+  tests["opening ciphertext has no automatic operation"] = function()
+    local fake, buf = fixture()
+    eq(vim.bo[buf].buftype, "")
+    yes(H.encrypted(buf))
+    eq(H.calls(fake), 0)
   end
 
-  tests["a command password-file override replaces the configured list"] = function()
-    local fake = create_fake_vault()
-    local first = fake.dir .. "/configured-one"
-    local second = fake.dir .. "/configured-two"
-    local override = fake.dir .. "/override-pass"
-    for _, path in ipairs({ first, second, override }) do
-      write_file(path, "secret\n")
+  --- Scope -----------------------------------------------------------------
+
+  tests["whole Encrypt uses current buffer and leaves saving to user"] = function()
+    local fake = H.create_fake_vault()
+    local config = H.reset_config(fake)
+    local buf, path = H.new_file_buffer(fake.dir, "plain.yml", { "alpha: one", "beta: two" })
+    local before = H.read_file(path)
+    vim.api.nvim_buf_set_mark(buf, "<", 2, 0, {})
+    vim.api.nvim_buf_set_mark(buf, ">", 2, 4, {})
+    vim.cmd("VaultEncrypt")
+    H.wait_until(function()
+      return H.encrypted(buf)
+    end)
+    eq(H.read_file(path), before)
+    yes(H.log_has_line(fake.log, "ARG:" .. config.password_files), "space-containing path must be one argv item")
+    yes(H.log_has_line(fake.log, "CONSUMED"), "fake must consume credentials")
+    vim.cmd("silent write")
+    yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
+    vim.cmd("VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "alpha: one"
+    end)
+    eq(H.lines(buf), { "alpha: one", "beta: two" })
+  end
+
+  tests["whole header wins and stale visual marks do not select inline scope"] = function()
+    local _, buf = fixture()
+    vim.api.nvim_buf_set_mark(buf, "<", 2, 0, {})
+    vim.api.nvim_buf_set_mark(buf, ">", 2, 1, {})
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    vim.cmd("VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "plain: old"
+    end)
+    eq(H.lines(buf), { "plain: old" })
+  end
+
+  tests["no-range Encrypt after inline Decrypt is whole, never foldback"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = H.inline("secret")
+    table.insert(input, "other: keep")
+    local buf, path = H.new_file_buffer(fake.dir, "inline.yml", input)
+    local before = H.read_file(path)
+    vim.cmd("VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "password: secret"
+    end)
+    vim.cmd("VaultEncrypt")
+    H.wait_until(function()
+      return H.encrypted(buf)
+    end)
+    eq(H.calls(fake, "encrypt"), 1)
+    eq(H.calls(fake, "encrypt_string"), 0)
+    eq(H.read_file(path), before)
+    vim.cmd("VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "password: secret"
+    end)
+    eq(H.lines(buf), { "password: secret", "other: keep" })
+  end
+
+  local refusals = {
+    "VaultDecrypt",
+    "VaultView",
+    "VaultEdit",
+    "VaultRekey --new-vault-password-file /none",
+  }
+  for _, command in ipairs(refusals) do
+    tests[command .. " refuses plaintext or cursor outside a block"] = function()
+      local fake = H.create_fake_vault()
+      H.reset_config(fake)
+      local input = H.inline("secret")
+      table.insert(input, "other: untouched")
+      local buf = H.new_buffer(input)
+      vim.api.nvim_win_set_cursor(0, { 4, 0 })
+      H.command_fails(command)
+      eq(H.lines(buf), input)
+      eq(vim.api.nvim_get_current_buf(), buf)
+      eq(H.calls(fake), 0)
     end
-    reset_config(fake, { password_files = { first, second } })
-
-    local buf = new_buffer({ "plain" })
-    vim.cmd("VaultEncrypt --vault-password-file " .. vim.fn.fnameescape(override))
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
-    end, "encrypt with an overridden password file did not finish")
-
-    assert_true(log_has_line(fake.log, "ARG:" .. override), "the override was not passed")
-    -- A merged list would leave the second configured entry in place and pass a
-    -- credential the user did not name on the command line.
-    assert_false(log_has_line(fake.log, "ARG:" .. first), "the configured list must be replaced, not merged")
-    assert_false(log_has_line(fake.log, "ARG:" .. second), "the configured list must be replaced, not merged")
   end
 
-  tests["--ask-vault-password forces a prompt over configured credentials"] = function()
-    local fake = create_fake_vault()
-    local pass = make_password_file(fake.dir)
-    reset_config(fake, { password_files = pass })
+  for name, range in pairs({ truncated = "1,2", multiple = "1,6", neighbor = "1,4" }) do
+    tests["inline scope rejects " .. name .. " range without modifying neighbors"] = function()
+      local fake = H.create_fake_vault()
+      H.reset_config(fake)
+      local input = H.inline("one", "first:")
+      vim.list_extend(input, name == "multiple" and H.inline("two", "second:") or { "other: keep" })
+      local buf = H.new_buffer(input)
+      H.command_fails(range .. "VaultDecrypt")
+      eq(H.lines(buf), input)
+    end
+  end
 
-    local original_inputsecret = vim.fn.inputsecret
-    local prompted = false
-    vim.fn.inputsecret = function()
-      prompted = true
-      return "typed"
+  tests["range Encrypt refuses a selection that cuts a nested value in half"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = { "vars:", "  inner: one", "  other: two" }
+    local buf = H.new_buffer(input)
+    H.command_fails("1VaultEncrypt")
+    eq(H.lines(buf), input, "encrypting a parent key would orphan its children")
+    eq(H.calls(fake), 0)
+  end
+
+  tests["range Encrypt rejects multiple plaintext keys before mutation"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = { "first: one", "second: two" }
+    local buf = H.new_buffer(input)
+    H.command_fails("1,2VaultEncrypt")
+    eq(H.lines(buf), input)
+    eq(H.calls(fake), 0)
+  end
+
+  --- Decrypt saves plaintext ------------------------------------------------
+
+  for _, scope in ipairs({ "whole", "inline" }) do
+    tests[scope .. " Decrypt write saves plaintext without a second prompt"] = function()
+      local fake = H.create_fake_vault()
+      H.reset_config(fake, { password_files = false })
+      local prompts = 0
+      H.patch(vim.fn, "inputsecret", function()
+        prompts = prompts + 1
+        return "secret"
+      end)
+      local input = scope == "whole" and H.envelope("plain: old\n") or H.inline("old", "plain:")
+      local buf, path = H.new_file_buffer(fake.dir, scope .. ".yml", input)
+      vim.cmd("VaultDecrypt")
+      H.wait_until(function()
+        return H.lines(buf)[1] == "plain: old"
+      end)
+      H.assert_hardened(buf)
+      eq(vim.bo[buf].buftype, "acwrite")
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "plain: intentionally saved" })
+      vim.cmd("silent write")
+      eq(H.read_file(path), "plain: intentionally saved\n")
+      eq(prompts, 1)
+      eq(H.calls(fake, "encrypt"), 0)
+      eq(H.calls(fake, "encrypt_string"), 0)
+      H.assert_hardened(buf)
+      no(vim.bo[buf].modified)
+    end
+  end
+
+  tests["a decrypted file reopened later is an ordinary plaintext file"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local buf, path = H.new_file_buffer(fake.dir, "vault.yml", H.envelope("plain: old\n"))
+    vim.cmd("VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "plain: old"
+    end)
+    vim.cmd("silent write")
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    local reopened = H.open_file(path)
+    eq(H.lines(reopened), { "plain: old" })
+    eq(vim.bo[reopened].buftype, "", "a plain file must not be adopted on open")
+    yes(vim.bo[reopened].swapfile, "no leftover hardening on an ordinary file")
+    eq(H.calls(fake, "decrypt"), 1, "reopening must not run ansible-vault")
+  end
+
+  --- Byte fidelity ---------------------------------------------------------
+
+  -- Expected values are literals written here, never computed by the code under
+  -- test: a round trip through the implementation's own parse/format pair would
+  -- agree with itself no matter how wrong it was.
+  local byte_values = {
+    { "empty", "" },
+    { "no trailing newline", "single" },
+    { "one trailing newline", "single\n" },
+    { "three trailing newlines", "one\ntwo\n\n\n" },
+    { "embedded blank line", "a\n\nb\n" },
+    { "leading spaces", "  indented\nnext\n" },
+    { "crlf bytes", "a\r\nb\r\n" },
+    { "tab and control bytes", "tab\there\n" },
+    { "multiline without trailing newline", "one\ntwo" },
+    { "colon and hash", "a: b # not a comment" },
+    { "yaml keyword", "true" },
+  }
+
+  for _, case in ipairs(byte_values) do
+    tests["inline Decrypt then range Encrypt round-trips " .. case[1]] = function()
+      local fake = H.create_fake_vault()
+      H.reset_config(fake)
+      local input = H.inline(case[2])
+      table.insert(input, "other: keep")
+      local buf = H.new_buffer(input)
+      vim.cmd("1,3VaultDecrypt")
+      H.wait_until(function()
+        return not vim.deep_equal(H.lines(buf), input)
+      end)
+      eq(H.lines(buf)[#H.lines(buf)], "other: keep", "the neighbour must be untouched")
+
+      local stdin = fake.dir .. "/stdin"
+      vim.env.FAKE_VAULT_STDIN_LOG = stdin
+      vim.cmd("1," .. (#H.lines(buf) - 1) .. "VaultEncrypt")
+      H.wait_until(function()
+        return H.text(buf):find("!vault", 1, true) ~= nil
+      end)
+      eq(H.read_file(stdin), case[2], "the value must survive decrypt -> encrypt byte for byte")
+      eq(H.lines(buf)[1], "password: !vault |", "the key must come from the buffer, not from ansible-vault")
+      eq(H.lines(buf)[#H.lines(buf)], "other: keep")
+    end
+  end
+
+  tests["a value ending in a newline survives at end of file without a final EOL"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local path = fake.dir .. "/noeol.yml"
+    H.write_file(path, table.concat(H.inline("value\n"), "\n"))
+    local buf = H.open_file(path)
+    no(vim.bo[buf].endofline, "precondition: the fixture has no final newline")
+    vim.cmd("1,3VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] ~= "password: !vault |"
+    end)
+    local stdin = fake.dir .. "/stdin"
+    vim.env.FAKE_VAULT_STDIN_LOG = stdin
+    vim.cmd("1," .. #H.lines(buf) .. "VaultEncrypt")
+    H.wait_until(function()
+      return H.text(buf):find("!vault", 1, true) ~= nil
+    end)
+    eq(H.read_file(stdin), "value\n", "the trailing newline is part of the value, not of the file")
+  end
+
+  local whole_bytes = {
+    { "empty file", "" },
+    { "no trailing newline", "plain: old" },
+    { "several trailing newlines", "plain: old\n\n\n" },
+    { "crlf file", "a: 1\r\nb: 2\r\n" },
+  }
+  for _, case in ipairs(whole_bytes) do
+    tests["whole Decrypt writes plaintext byte for byte: " .. case[1]] = function()
+      local fake = H.create_fake_vault()
+      H.reset_config(fake)
+      local buf, path = H.new_file_buffer(fake.dir, "vault.yml", H.envelope(case[2]))
+      vim.cmd("VaultDecrypt")
+      H.wait_until(function()
+        return not H.encrypted(buf)
+      end)
+      vim.cmd("silent write")
+      eq(H.read_file(path), case[2], "the decrypted bytes are what :w must save")
+    end
+  end
+
+  ---Content ending in a carriage return with no final newline.
+  ---
+  ---Only content that *ends* with a newline can be `dos`. Without one the last
+  ---line has no line ending for its carriage return to live in, so treating it
+  ---as half of a CRLF pair and writing the buffer back with 'noendofline' drops
+  ---that byte: "a\r" becomes "a". Every one of these goes through a different
+  ---writer, and none of them may lose it.
+  local cr_values = { { "trailing CR", "a\r" }, { "bare CR", "\r" }, { "CRLF then bare CR", "a\r\nb\r" } }
+
+  for _, case in ipairs(cr_values) do
+    tests["whole Decrypt then :w keeps a " .. case[1]] = function()
+      local fake = H.create_fake_vault()
+      H.reset_config(fake)
+      local buf, path = H.new_file_buffer(fake.dir, "vault.yml", H.envelope(case[2]))
+      vim.cmd("VaultDecrypt")
+      H.wait_until(function()
+        return not H.encrypted(buf)
+      end)
+      vim.cmd("silent write")
+      eq(H.read_file(path), case[2], "the decrypted bytes are what :w must save")
     end
 
-    local buf = new_buffer({ "plain" })
-    vim.cmd("VaultEncrypt --ask-vault-password")
+    tests["whole Edit re-encrypts a " .. case[1] .. " unchanged"] = function()
+      local fake = H.create_fake_vault()
+      H.reset_config(fake)
+      local source = H.new_file_buffer(fake.dir, "vault.yml", H.envelope(case[2]))
+      local scratch = H.open_scratch("VaultEdit", source)
+      local stdin = fake.dir .. "/stdin"
+      vim.env.FAKE_VAULT_STDIN_LOG = stdin
+      -- Saving without editing anything at all must be a byte-for-byte identity.
+      vim.cmd("silent write")
+      no(vim.bo[scratch].modified)
+      eq(H.read_file(stdin), case[2], "an unedited Edit must re-encrypt exactly what it decrypted")
+    end
 
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
-    end, "encrypt with a forced prompt did not finish")
-
-    vim.fn.inputsecret = original_inputsecret
-    assert_true(prompted, "the flag must prompt even though a password file is configured")
-    assert_false(log_has_line(fake.log, "ARG:" .. pass), "the configured password file must not also be passed")
-    -- The flag is plugin-level: ansible-vault puts --ask-vault-password and
-    -- --vault-password-file in one mutually exclusive group, and the child has no
-    -- tty to prompt on anyway.
-    assert_false(log_has_line(fake.log, "ARG:--ask-vault-password"), "the flag must not reach ansible-vault")
-    assert_true(log_has_line(fake.log, "ENVPW:set"), "the typed password should go through the environment")
+    tests["inline Edit re-encrypts a " .. case[1] .. " unchanged"] = function()
+      local fake = H.create_fake_vault()
+      H.reset_config(fake)
+      local input = H.inline(case[2])
+      table.insert(input, "other: keep")
+      local source = H.new_buffer(input)
+      vim.api.nvim_win_set_cursor(0, { 1, 0 })
+      H.open_scratch("VaultEdit", source)
+      local stdin = fake.dir .. "/stdin"
+      vim.env.FAKE_VAULT_STDIN_LOG = stdin
+      vim.cmd("silent write")
+      eq(H.read_file(stdin), case[2], "an unedited inline Edit must re-encrypt exactly what it decrypted")
+    end
   end
 
-  tests["an unknown argument is rejected instead of ignored"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
+  --- Structure preserved by range Encrypt ----------------------------------
 
-    local buf = new_buffer({ "plain" })
-
-    -- A misspelled flag must be rejected, not treated as a positional argument.
-    vim.cmd("VaultEncrypt --vault-password-fiel /nope")
-    assert_true(notification_contains("unknown or incomplete argument"), "the bad flag was not reported")
-    assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "plain" }, "the buffer must be left alone")
-
-    vim.cmd("VaultEncrypt stray-positional")
-    assert_true(notification_contains("unexpected argument"), "a stray positional was not reported")
+  local shapes = {
+    { "key", { "password: secret" }, "secret", "password: !vault |" },
+    { "quoted-key-comment", { [['a: b': "sec#ret" # comment]] }, "sec#ret", "'a: b': !vault |" },
+    { "nested-list-key", { "    - password: value" }, "value", "    - password: !vault |" },
+    { "bare-list", { "    - value" }, "value", "    - !vault |" },
+    { "scalar", { "plain-value" }, "plain-value", nil },
+    { "empty", { 'password: ""' }, "", "password: !vault |" },
+    { "literal-strip", { "password: |-", "  first", "  second" }, "first\nsecond", "password: !vault |" },
+    { "literal-clip", { "password: |", "  first", "  second" }, "first\nsecond\n", "password: !vault |" },
+    { "literal-keep", { "password: |+", "  first", "", "" }, "first\n\n\n", "password: !vault |" },
+    {
+      "nested-multiline",
+      { "  - 'a: b': |-", "      first", "      second" },
+      "first\nsecond",
+      "  - 'a: b': !vault |",
+    },
+    { "leading-space", { "password: |2-", "    indented", "  normal" }, "  indented\nnormal", "password: !vault |" },
+  }
+  for _, case in ipairs(shapes) do
+    tests["range Encrypt preserves value bytes " .. case[1]] = function()
+      local fake = H.create_fake_vault()
+      H.reset_config(fake)
+      local buf = H.new_buffer(case[2])
+      local stdin = fake.dir .. "/stdin"
+      vim.env.FAKE_VAULT_STDIN_LOG = stdin
+      vim.cmd("1," .. #case[2] .. "VaultEncrypt")
+      H.wait_until(function()
+        return H.text(buf):find("!vault", 1, true) ~= nil
+      end)
+      eq(H.read_file(stdin), case[3], "encrypt_string must receive only the YAML value, byte-for-byte")
+      if case[4] then
+        eq(H.lines(buf)[1], case[4], "raw key/list/indent structure must survive")
+      end
+      eq(H.calls(fake, "encrypt"), 0)
+    end
   end
 
-  tests["setup rejects unknown keys and impossible combinations"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-    local good = vim.deepcopy(vault.config)
+  --- View ------------------------------------------------------------------
 
-    vault.setup({ ansible_vault_path = fake.path, unknown_option = false })
-    assert_true(notification_contains("unknown option: unknown_option"), "an unknown key was accepted")
-    assert_eq(vault.config, good, "a rejected setup must not change the configuration")
-
-    vault.setup({ ansible_vault_path = fake.path, vault_ids = 42 })
-    assert_true(notification_contains("vault_ids must be string or table"), "a wrong type was accepted")
-
-    vault.setup({ ask_password = true, password_files = "/some/pass" })
-    assert_true(
-      notification_contains("ask_password cannot be combined with password_files"),
-      "ansible-vault treats these as mutually exclusive"
-    )
-
-    vault.setup({ new_vault_id = "new@/a", new_password_file = "/b" })
-    assert_true(
-      notification_contains("new_vault_id and new_password_file are mutually exclusive"),
-      "ansible-vault puts these in one mutually exclusive group"
-    )
-  end
-
-  tests["command vault-id override replaces configured password file"] = function()
-    local fake = create_fake_vault()
-    local old_pass = fake.dir .. "/old-pass"
-    local prod_pass = fake.dir .. "/prod-pass"
-    write_file(old_pass, "old\n")
-    write_file(prod_pass, "prod\n")
-
-    reset_config(fake, { password_files = old_pass })
-
-    new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "TARGET" })
-    vim.cmd("VaultView --vault-id prod@" .. prod_pass)
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, -1, false)[1] == "plain: target"
-    end, "VaultView with command vault-id override did not finish")
-
-    assert_true(log_contains(fake.log, "ARG:--vault-id"), "command vault-id flag was not passed")
-    assert_true(log_has_line(fake.log, "ARG:prod@" .. prod_pass), "command vault-id value was not passed")
-    assert_false(log_has_line(fake.log, "ARG:" .. old_pass), "configured password file was not overridden")
-
+  tests["View is readonly protected disposable and preserves source filetype"] = function()
+    local _, source, path = fixture()
+    vim.bo[source].filetype = "yaml"
+    local before = H.read_file(path)
+    local view = H.open_scratch("VaultView", source)
+    H.assert_hardened(view)
+    no(vim.bo[view].modifiable, "the view must not be editable")
+    yes(vim.bo[view].readonly, "the view must be read-only")
+    -- `acwrite` rather than `nofile`: `nofile` only stops `:w`, because the buffer
+    -- has no file of its own. `:w {path}` from a `nofile` buffer is not
+    -- intercepted at all and writes the decrypted content straight out.
+    eq(vim.bo[view].buftype, "acwrite")
+    eq(vim.bo[view].filetype, "yaml")
+    -- The trailing blank line is the value's own final newline, shown rather than
+    -- trimmed: the float reports the exact decrypted bytes.
+    eq(H.lines(view), { "plain: old", "" })
+    H.write_fails("silent write")
     vim.api.nvim_win_close(0, true)
+    no(vim.api.nvim_buf_is_valid(view), "View must wipe when closed")
+    eq(H.read_file(path), before)
+    yes(H.encrypted(source))
+    eq(vim.bo[source].buftype, "", "viewing must not adopt the source buffer")
   end
 
-  tests["command completion exposes override flags and inline labels"] = function()
-    local fake = create_fake_vault()
-    local prod_pass = make_password_file(fake.dir)
-    reset_config(fake, {
-      password_files = false,
-      vault_ids = { "prod@" .. prod_pass },
-    })
-
-    local label_completion = vim.fn.getcompletion("VaultEncrypt p", "cmdline")
-    assert_true(vim.tbl_contains(label_completion, "prod"), "inline encrypt label was not completed")
-
-    local flag_completion = vim.fn.getcompletion("VaultEdit --vault", "cmdline")
-    assert_true(vim.tbl_contains(flag_completion, "--vault-id"), "vault-id flag was not completed")
-    assert_true(
-      vim.tbl_contains(flag_completion, "--vault-password-file"),
-      "vault-password-file flag was not completed"
-    )
+  tests["inline View operates on an explicit single block without changing source"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = H.inline("secret")
+    table.insert(input, "other: keep")
+    local source = H.new_buffer(input)
+    local view = H.open_scratch("1,3VaultView", source)
+    eq(H.lines(view), { "secret" })
+    H.assert_hardened(view)
+    eq(H.lines(source), input)
+    no(vim.bo[view].modifiable)
   end
 
-  tests["an interactive password is never reused across operations"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake, { password_files = false })
+  --- Edit -----------------------------------------------------------------
 
-    local original_inputsecret = vim.fn.inputsecret
-    local prompt_count = 0
-    vim.fn.inputsecret = function()
-      prompt_count = prompt_count + 1
-      return "secret"
+  tests["whole Edit saves ciphertext repeatedly and does not close scratch"] = function()
+    local fake, source, path = fixture()
+    local scratch = H.open_scratch("VaultEdit", source)
+    H.assert_hardened(scratch)
+    eq(vim.bo[scratch].buftype, "acwrite")
+    for _, value in ipairs({ "plain: first", "plain: second" }) do
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { value })
+      vim.cmd("silent write")
+      yes(vim.api.nvim_buf_is_valid(scratch))
+      eq(vim.api.nvim_get_current_buf(), scratch)
+      no(vim.bo[scratch].modified)
+      yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
     end
-
-    local first = new_buffer({ "first" })
-    vault.encrypt(first)
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(first, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
-    end, "first encrypt did not finish")
-
-    local second = new_buffer({ "second" })
-    vault.encrypt(second)
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(second, 0, 1, false)[1] == "$ANSIBLE_VAULT;1.1;AES256"
-    end, "second encrypt did not finish")
-
-    vim.fn.inputsecret = original_inputsecret
-    -- No cache means no window in which a secret sits in the Lua heap between
-    -- operations, so each one must ask again.
-    assert_eq(prompt_count, 2, "each operation must prompt for its own password")
+    eq(H.calls(fake, "encrypt"), 2)
   end
 
-  tests["slow vault operations time out"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-    require("ansible-vault.cli").timeout_ms = 50
-    vim.env.FAKE_VAULT_SLEEP = "1"
-
-    local buf = new_buffer({ "plain: value" })
-    vault.encrypt(buf)
-
-    wait_until(function()
-      return notification_contains("timed out")
-    end, "slow vault operation did not time out")
-
-    assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "plain: value" }, "timed out operation changed buffer")
-    vim.env.FAKE_VAULT_SLEEP = nil
-    require("ansible-vault.cli").timeout_ms = 30000
+  tests["whole Edit round-trips the edited plaintext through the real file"] = function()
+    local fake, source, path = fixture()
+    local scratch = H.open_scratch("VaultEdit", source)
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: edited", "extra: line" })
+    vim.cmd("silent write")
+    pcall(vim.api.nvim_buf_delete, scratch, { force = true })
+    local reopened = H.open_file(path)
+    yes(H.encrypted(reopened))
+    vim.cmd("VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(reopened)[1] == "plain: edited"
+    end)
+    eq(H.lines(reopened), { "plain: edited", "extra: line" })
+    eq(H.calls(fake, "encrypt"), 1)
   end
 
-  tests["operations announce themselves on AnsibleVaultOperation"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
+  tests["inline Edit allows preexisting dirty source and only splices its block"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = { "before: original" }
+    vim.list_extend(input, H.inline("old"))
+    table.insert(input, "after: original")
+    local source, path = H.new_file_buffer(fake.dir, "inline.yml", input)
+    local disk = H.read_file(path)
+    vim.api.nvim_buf_set_lines(source, 0, 1, false, { "before: user-dirty" })
+    vim.api.nvim_win_set_cursor(0, { 3, 10 })
+    local scratch = H.open_scratch("VaultEdit", source)
+    eq(H.lines(scratch), { "old" })
+    H.assert_hardened(scratch)
+    for _, value in ipairs({ "new", "again" }) do
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { value })
+      vim.cmd("silent write")
+      no(vim.bo[scratch].modified)
+      eq(H.lines(source)[1], "before: user-dirty", "edits made before opening must be kept as they were")
+      eq(H.lines(source)[#H.lines(source)], "after: original")
+      yes(H.text(source):find("password: !vault |", 1, true))
+      yes(vim.bo[source].modified, "the source is left for the user to save")
+      eq(H.read_file(path), disk, "inline Edit must never save source YAML")
+    end
+    vim.api.nvim_set_current_buf(source)
+    vim.cmd("silent write")
+    no(vim.bo[source].modified)
+    no(H.read_file(path) == disk)
+  end
 
-    local buf = new_buffer({ "plain: value" })
+  tests["inline Edit writes back the exact bytes it was given"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = H.inline("one\ntwo\n")
+    table.insert(input, "other: keep")
+    local source = H.new_buffer(input)
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    local scratch = H.open_scratch("VaultEdit", source)
+    eq(H.lines(scratch), { "one", "two" })
+    yes(vim.bo[scratch].endofline, "a value ending in a newline keeps it in 'endofline'")
+    local stdin = fake.dir .. "/stdin"
+    vim.env.FAKE_VAULT_STDIN_LOG = stdin
+    vim.cmd("silent write")
+    eq(H.read_file(stdin), "one\ntwo\n", "an unedited value must be re-encrypted unchanged")
+  end
 
-    -- Collect rather than `once`: there is a single pattern for every operation, so
-    -- an earlier test's in-flight write can fire it first and consume a one-shot
-    -- autocmd. Match on the buffer instead.
-    local seen = {}
-    local id = vim.api.nvim_create_autocmd("User", {
-      pattern = "AnsibleVaultOperation",
-      callback = function(event)
-        if event.data and event.data.buf == buf then
-          table.insert(seen, event.data)
-        end
+  --- Create ---------------------------------------------------------------
+
+  tests["Create first write is ciphertext and mode 0600"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local path = fake.dir .. "/new vault.yml"
+    vim.cmd("VaultCreate " .. vim.fn.fnameescape(path))
+    local scratch = vim.api.nvim_get_current_buf()
+    H.assert_hardened(scratch)
+    eq(vim.bo[scratch].buftype, "acwrite")
+    eq(vim.fn.filereadable(path), 0)
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "secret: created" })
+    vim.cmd("silent write")
+    yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
+    eq(vim.fn.getfperm(path), "rw-------")
+    no(vim.bo[scratch].modified)
+  end
+
+  tests["Create never clears an existing unsaved buffer at the target name"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local path = fake.dir .. "/not-created.yml"
+    local original = H.open_file(path)
+    vim.api.nvim_buf_set_lines(original, 0, -1, false, { "user data" })
+    pcall(vim.cmd, "VaultCreate " .. vim.fn.fnameescape(path))
+    eq(H.lines(original), { "user data" })
+    yes(vim.bo[original].modified)
+    eq(vim.fn.filereadable(path), 0)
+  end
+
+  tests["Create refuses existing files and a target appearing before first save"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local path = fake.dir .. "/exists.yml"
+    H.write_file(path, "keep me\n")
+    H.command_fails("VaultCreate " .. vim.fn.fnameescape(path))
+    eq(H.read_file(path), "keep me\n")
+    local new = fake.dir .. "/new.yml"
+    vim.cmd("VaultCreate " .. vim.fn.fnameescape(new))
+    local scratch = vim.api.nvim_get_current_buf()
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "mine" })
+    H.write_file(new, "other writer\n")
+    H.write_fails()
+    eq(H.read_file(new), "other writer\n")
+    yes(vim.bo[scratch].modified)
+    vim.cmd("silent write!")
+    yes(H.read_file(new):match("^%$ANSIBLE_VAULT;"), ":w! is how the user overrides that refusal")
+  end
+
+  for _, mode in ipairs({ "whole", "inline", "create" }) do
+    tests[mode .. " Edit or Create rejects redirected writes"] = function()
+      local fake, source, path = fixture()
+      if mode == "inline" then
+        vim.api.nvim_buf_set_lines(source, 0, -1, false, H.inline("old"))
+      end
+      local scratch
+      if mode == "create" then
+        vim.cmd("VaultCreate " .. vim.fn.fnameescape(fake.dir .. "/new.yml"))
+        scratch = vim.api.nvim_get_current_buf()
+      else
+        scratch = H.open_scratch("VaultEdit", source)
+      end
+      local before = H.read_file(path)
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "modified" })
+      local target = fake.dir .. "/redirect.yml"
+      H.write_fails("silent write " .. vim.fn.fnameescape(target))
+      eq(vim.fn.filereadable(target), 0)
+      eq(H.read_file(path), before)
+      yes(vim.bo[scratch].modified)
+      H.write_fails("silent write! " .. vim.fn.fnameescape(target))
+      eq(vim.fn.filereadable(target), 0, ":w! must not turn a redirected write into a plaintext copy")
+    end
+  end
+
+  ---`:saveas` renames the buffer, so the session's idea of what it writes has to
+  ---follow it. Otherwise the next plain `:w` refuses, or worse writes to the old
+  ---path, and `:wq` cannot exit.
+  tests["saveas on a decrypted buffer keeps it saveable afterwards"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local dir = H.temp_dir()
+    local buf = H.new_file_buffer(dir, "vault.yml", H.envelope("plain: old\n"))
+    vim.cmd("VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "plain: old"
+    end)
+
+    local renamed = dir .. "/renamed.yml"
+    vim.cmd("silent saveas " .. vim.fn.fnameescape(renamed))
+    eq(vim.api.nvim_buf_get_name(buf), renamed, "the buffer should now be visiting the new path")
+    eq(H.read_file(renamed), "plain: old\n")
+    no(vim.bo[buf].modified)
+
+    -- A plain `:w` must keep working against the new name.
+    vim.api.nvim_buf_set_lines(buf, -1, -1, false, { "extra: line" })
+    vim.cmd("silent write")
+    eq(H.read_file(renamed), "plain: old\nextra: line\n")
+    no(vim.bo[buf].modified)
+
+    -- And another path is still only a copy.
+    local copy = dir .. "/copy.yml"
+    vim.api.nvim_buf_set_lines(buf, -1, -1, false, { "more: lines" })
+    vim.cmd("silent write " .. vim.fn.fnameescape(copy))
+    yes(H.read_file(copy):find("more: lines", 1, true) ~= nil, "the copy holds the current text")
+    yes(vim.bo[buf].modified, ":w {other} copies the text and leaves this buffer unsaved")
+    eq(vim.api.nvim_buf_get_name(buf), renamed)
+
+    -- `:wq` has to be able to finish the job.
+    vim.cmd("split")
+    local windows = #vim.api.nvim_list_wins()
+    vim.cmd("silent wq")
+    eq(#vim.api.nvim_list_wins(), windows - 1, ":wq must exit after a successful write")
+    eq(H.read_file(renamed), "plain: old\nextra: line\nmore: lines\n")
+  end
+
+  ---A `!vault` list item has no key. The plugin produces those itself, so every
+  ---verb has to accept one back: the prefix is rebuilt from the buffer, and
+  ---`--stdin-name` only names the key Ansible echoes back, which is discarded.
+  tests["a keyless list item survives Edit"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = { "  - !vault |" }
+    for _, line in ipairs(H.envelope("listed")) do
+      table.insert(input, "      " .. line)
+    end
+    table.insert(input, "  - other")
+    local source = H.new_buffer(input)
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+
+    local scratch = H.open_scratch("VaultEdit", source)
+    eq(H.lines(scratch), { "listed" }, "the scratch holds just the value")
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "rotated" })
+    vim.cmd("silent write")
+
+    eq(H.lines(source)[1], "  - !vault |", "the list dash and indentation must come back unchanged")
+    eq(H.lines(source)[#H.lines(source)], "  - other")
+    local stdin = fake.dir .. "/stdin"
+    vim.env.FAKE_VAULT_STDIN_LOG = stdin
+    vim.api.nvim_set_current_buf(scratch)
+    vim.cmd("silent write")
+    eq(H.read_file(stdin), "rotated")
+  end
+
+  --- Rekey ----------------------------------------------------------------
+
+  for _, label in ipairs({ "", "prod" }) do
+    tests["native Rekey preserves envelope " .. (label == "" and "1.1" or "1.2 label")] = function()
+      local fake, buf, path = fixture("plain: old\n", label ~= "" and label or nil)
+      local new = H.make_password_file(fake.dir, "new-secret", "new pass")
+      local before = H.read_file(path)
+      vim.cmd("VaultRekey --new-vault-password-file " .. vim.fn.fnameescape(new))
+      H.wait_until(function()
+        return H.read_file(path) ~= before and H.encrypted(buf)
+      end)
+      eq(H.calls(fake, "rekey"), 1)
+      eq(H.calls(fake, "decrypt"), 0, "whole Rekey must use native rekey, not decrypt/encrypt")
+      no(H.log_has_line(fake.log, "ARG:--encrypt-vault-id"))
+      yes(H.log_has_line(fake.log, "ARG:" .. (label ~= "" and (label .. "@" .. new) or new)))
+      eq(
+        H.read_file(path):match("^[^\n]+"),
+        label ~= "" and "$ANSIBLE_VAULT;1.2;AES256;prod" or "$ANSIBLE_VAULT;1.1;AES256"
+      )
+      yes(H.log_has_line(fake.log, "ENV:ANSIBLE_VAULT_ENCRYPT_IDENTITY="), "rekey must not inherit an encrypt identity")
+    end
+  end
+
+  tests["after a whole Rekey the new password opens the file and the old one does not"] = function()
+    local fake, buf, path = fixture()
+    local old = H.make_password_file(fake.dir, "secret")
+    local new = H.make_password_file(fake.dir, "new-secret", "new pass")
+    local before = H.read_file(path)
+    vim.cmd("VaultRekey --new-vault-password-file " .. vim.fn.fnameescape(new))
+    H.wait_until(function()
+      return H.read_file(path) ~= before and H.encrypted(buf)
+    end)
+
+    vim.cmd("VaultDecrypt --vault-password-file " .. vim.fn.fnameescape(new))
+    H.wait_until(function()
+      return H.lines(buf)[1] == "plain: old"
+    end, "the NEW password must open the rekeyed file")
+
+    -- A copy, so the old password is tried against untouched ciphertext rather
+    -- than against a buffer this test already decrypted.
+    local copy = fake.dir .. "/copy.yml"
+    H.write_file(copy, H.read_file(path))
+    H.open_file(copy)
+    H.command_fails("VaultDecrypt --vault-password-file " .. vim.fn.fnameescape(old))
+    yes(H.encrypted(0), "the OLD password must no longer open the file")
+  end
+
+  -- "reported success but produced nothing usable" is the case that matters:
+  -- `ansible-vault rekey` removes and recreates its target, so publishing
+  -- whatever came back would destroy the only copy of the ciphertext.
+  for _, failure in ipairs({ "fail", "invalid", "empty", "truncated" }) do
+    tests["a whole Rekey that " .. failure .. "s leaves the original ciphertext alone"] = function()
+      local fake, buf, path = fixture()
+      local new = H.make_password_file(fake.dir, "new-secret", "new pass")
+      local before = H.read_file(path)
+      vim.env.FAKE_VAULT_ACTION = "rekey"
+      if failure == "fail" then
+        vim.env.FAKE_VAULT_FAIL = "rekey exploded"
+      else
+        vim.env.FAKE_VAULT_OUTPUT = failure
+      end
+      H.command_fails("VaultRekey --new-vault-password-file " .. vim.fn.fnameescape(new))
+      eq(H.read_file(path), before, "a failed rekey must not touch the target")
+      yes(H.encrypted(buf))
+    end
+  end
+
+  tests["Rekey refuses a modified buffer and a buffer with no file"] = function()
+    local fake, buf = fixture()
+    local new = H.make_password_file(fake.dir, "new-secret", "new pass")
+    vim.api.nvim_buf_set_lines(buf, -1, -1, false, { "dirty" })
+    H.command_fails("VaultRekey --new-vault-password-file " .. vim.fn.fnameescape(new))
+    eq(H.calls(fake, "rekey"), 0)
+
+    H.new_buffer(H.envelope("plain: old\n"))
+    H.command_fails("VaultRekey --new-vault-password-file " .. vim.fn.fnameescape(new))
+    eq(H.calls(fake, "rekey"), 0)
+  end
+
+  tests["Rekey without a new credential fails before running anything"] = function()
+    local fake = fixture()
+    H.command_fails("VaultRekey")
+    eq(H.calls(fake), 0)
+  end
+
+  tests["inline Rekey never inserts intermediate plaintext or saves source"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = H.inline("PRIVATE-inline\n\n", "password:", nil, "prod")
+    table.insert(input, "other: keep")
+    local buf, path = H.new_file_buffer(fake.dir, "inline.yml", input)
+    local before = H.read_file(path)
+    local new = H.make_password_file(fake.dir, "rotated", "new")
+    local plaintext_seen = false
+    vim.api.nvim_buf_attach(buf, false, {
+      on_lines = function()
+        plaintext_seen = plaintext_seen or H.text(buf):find("PRIVATE-inline", 1, true) ~= nil
       end,
     })
+    vim.cmd("1,3VaultRekey --new-vault-password-file " .. vim.fn.fnameescape(new))
+    H.wait_until(function()
+      return not vim.deep_equal(H.lines(buf), input)
+    end)
+    no(plaintext_seen, "the rotation plaintext must never reach the buffer")
+    eq(H.read_file(path), before)
+    eq(H.lines(buf)[#H.lines(buf)], "other: keep")
+    eq(H.calls(fake, "rekey"), 0)
+    eq(H.calls(fake, "decrypt"), 1)
+    eq(H.calls(fake, "encrypt_string"), 1)
+    no(vim.bo[buf].buftype == "acwrite", "rekey must not leave the source managed as plaintext")
 
-    vault.encrypt(buf)
-
-    wait_until(function()
-      return vault.is_buffer_encrypted(buf) and #seen > 0
-    end, "encrypt did not finish or did not announce itself")
-    vim.api.nvim_del_autocmd(id)
-
-    assert_eq(seen[1].op, "encrypt", "the event should carry the operation")
-    assert_eq(seen[1].scope, "file", "the event should carry the scope it applied to")
-    assert_eq(seen[1].buf, buf, "the event should carry the buffer it applied to")
+    -- The value now opens with the new password and no longer with the old one.
+    vim.cmd("1,3VaultDecrypt --vault-password-file " .. vim.fn.fnameescape(new))
+    H.wait_until(function()
+      return H.text(buf):find("PRIVATE%-inline")
+    end, "the rekeyed value must open with the NEW password")
   end
 
-  tests["VaultDecrypt over a range replaces the YAML vault block"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local buf = new_buffer({
-      "password: !vault |",
-      "          $ANSIBLE_VAULT;1.1;AES256",
-      "          ENCSTR:secret",
-    })
-
-    vault.decrypt(nil, { range = 3, line1 = 1, line2 = 3 })
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: secret"
-    end, "the YAML vault block in the range was not decrypted")
-
-    assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "password: secret" })
-  end
-
-  tests["the cursor resolves inline view and decrypt without a range"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local buf = new_buffer({ "password: secret" })
-    vim.api.nvim_win_set_cursor(0, { 1, 0 })
-    vault.encrypt(nil, { range = 1, line1 = 1, line2 = 1 })
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
-    end, "under-cursor YAML value was not encrypted")
-
-    vim.api.nvim_win_set_cursor(0, { 2, 10 })
-    vault.view()
-
-    wait_until(function()
-      return vim.api.nvim_get_current_buf() ~= buf
-    end, "under-cursor vault view did not open")
-
-    assert_eq(vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, -1, false), { "secret" })
-
-    vim.api.nvim_set_current_buf(buf)
-    vim.api.nvim_win_set_cursor(0, { 2, 10 })
-    vault.decrypt()
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: secret"
-    end, "under-cursor vault block was not decrypted")
-
-    assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "password: secret" })
-  end
-
-  tests["under cursor vault lookup does not select a previous block"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local buf = new_buffer({
-      "password: !vault |",
-      "          $ANSIBLE_VAULT;1.1;AES256",
-      "          ENCSTR:secret",
-      "other: value",
-    })
-
-    vim.api.nvim_win_set_cursor(0, { 4, 0 })
-    vault.view()
-
-    assert_eq(vim.api.nvim_get_current_buf(), buf, "view should not open for a cursor outside the vault block")
-    assert_true(notification_contains("nothing encrypted here"), "missing error for cursor outside a vault block")
-  end
-
-  tests["scope: a vault file wins over a !vault block at the cursor"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    -- yaml.find_block treats a bare $ANSIBLE_VAULT line as the start of an inline
-    -- block, so a whole-file vault must be recognised first or :VaultDecrypt would
-    -- try to splice the file into itself as a YAML value.
-    local buf = new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
-    vim.api.nvim_win_set_cursor(0, { 1, 0 })
-
-    vault.decrypt(buf)
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "plain: old"
-    end, "a whole-file vault was not decrypted as a file")
-
-    assert_eq(vim.b[buf].ansible_vault_plaintext, "file", "the file scope should have won")
-  end
-
-  tests["scope: VaultEncrypt with no range encrypts the whole buffer"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    -- Every line here is a `key: value` pair. Resolving the cursor line as an
-    -- inline value would silently encrypt one line instead of the file.
-    local buf = new_buffer({ "alpha: one", "beta: two" })
-    vim.api.nvim_win_set_cursor(0, { 2, 0 })
-
-    vault.encrypt(buf)
-    wait_until(function()
-      return vault.is_buffer_encrypted(buf)
-    end, "VaultEncrypt with no range did not encrypt the buffer")
-
-    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    assert_eq(lines[1], "$ANSIBLE_VAULT;1.1;AES256", "the whole buffer should have been encrypted")
-    assert_true(lines[2]:find("alpha: one", 1, true) ~= nil, "the whole buffer content should have been the input")
-  end
-
-  tests["scope: VaultDecrypt refuses when there is nothing encrypted"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local buf = new_buffer({ "alpha: one" })
-    vault.decrypt(buf)
-
-    assert_true(notification_contains("nothing encrypted here"), "the refusal should name what it looked for")
-    assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "alpha: one" }, "the buffer must be untouched")
-  end
-
-  tests["scope: VaultEdit refuses a range"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local buf = new_buffer({ "password: !vault |", "          $ANSIBLE_VAULT;1.1;AES256", "          ENCSTR:x" })
-    vault.edit(buf, { range = 3, line1 = 1, line2 = 3 })
-
-    assert_true(notification_contains("whole vault file"), "VaultEdit should point at :VaultDecrypt for inline values")
-  end
-
-  tests["VaultEncrypt folds a decrypted inline value back without writing"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local dir = temp_dir()
-    local buf, path = new_file_buffer(dir, "inline.yml", {
-      "password: !vault |",
-      "          $ANSIBLE_VAULT;1.1;AES256",
-      "          ENCSTR:secret",
-    })
-    local before = read_file(path)
-
-    vault.decrypt(buf, { range = 3, line1 = 1, line2 = 3 })
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: secret"
-    end, "inline decrypt did not finish")
-    assert_eq(vim.b[buf].ansible_vault_plaintext, "inline", "the buffer should be in inline plaintext mode")
-
-    -- The inverse of decrypting in place, and like whole-file :VaultEncrypt it
-    -- leaves the file alone: `:w` stays the user's decision.
-    vault.encrypt(buf)
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
-    end, "VaultEncrypt did not fold the inline value back")
-
-    assert_eq(vim.b[buf].ansible_vault_plaintext, nil, "the buffer should have left plaintext mode")
-    assert_eq(read_file(path), before, "folding back must not write the file")
-  end
-
-  tests["a deleted inline region is not folded onto the next value"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local dir = temp_dir()
-    local buf, path = new_file_buffer(dir, "deleted.yml", {
-      "password: !vault |",
-      "          $ANSIBLE_VAULT;1.1;AES256",
-      "          ENCSTR:secret",
-      "keepme: plain",
-    })
-
-    vault.decrypt(buf, { range = 3, line1 = 1, line2 = 3 })
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: secret"
-    end, "inline decrypt did not finish")
-
-    -- Delete the decrypted line. The extmark is left-gravity, so it now points at
-    -- `keepme: plain`, which must not be mistaken for the region's content.
-    vim.api.nvim_buf_set_lines(buf, 0, 1, false, {})
-
-    vim.cmd("silent write")
-    wait_until(function()
-      return vim.bo[buf].buftype == ""
-    end, "write did not complete")
-
-    assert_true(notification_contains("no longer there"), "the orphaned region should be reported")
-    local written = read_file(path)
-    assert_true(written:find("keepme: plain", 1, true) ~= nil, "the unrelated value must be written unchanged")
-    assert_false(written:find("keepme: !vault", 1, true) ~= nil, "the unrelated value must not be encrypted")
-  end
-
-  tests["a second inline value can be decrypted while the first is open"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local buf = new_buffer({
-      "first: !vault |",
-      "          $ANSIBLE_VAULT;1.1;AES256",
-      "          ENCSTR:alpha",
-      "second: !vault |",
-      "          $ANSIBLE_VAULT;1.1;AES256",
-      "          ENCSTR:beta",
-    })
-
-    vim.api.nvim_win_set_cursor(0, { 1, 0 })
-    vault.decrypt()
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "first: alpha"
-    end, "the first value was not decrypted")
-
-    -- Inline plaintext mode must not make the buffer look wholly decrypted: it is
-    -- ordinary YAML, and the other values are still encrypted and still addressable.
-    vim.api.nvim_win_set_cursor(0, { 2, 0 })
-    vault.decrypt()
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 1, 2, false)[1] == "second: beta"
-    end, "a second value could not be decrypted while the first was open")
-
-    assert_eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), { "first: alpha", "second: beta" })
-  end
-
-  tests["VaultRekey rotates a single inline value"] = function()
-    local fake = create_fake_vault()
-    local old_pass = make_password_file(fake.dir)
-    local new_pass = fake.dir .. "/inline-new-pass"
-    write_file(new_pass, "new\n")
-    reset_config(fake, { password_files = old_pass, new_password_file = new_pass })
-
-    local buf = new_buffer({
-      "password: !vault |",
-      "          $ANSIBLE_VAULT;1.1;AES256",
-      "          ENCSTR:secret",
-      "other: plain",
-    })
-
-    vault.rekey({ range = 3, line1 = 1, line2 = 3 })
-
-    wait_until(function()
-      return notification_contains("Inline value rekeyed successfully")
-    end, "inline rekey did not finish")
-
-    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    assert_eq(lines[1], "password: !vault |", "the key should be preserved")
-    assert_eq(lines[#lines], "other: plain", "unrelated lines must be left alone")
-    assert_true(log_has_line(fake.log, "ARG:" .. new_pass), "the new credential should be used to re-encrypt")
-    assert_true(log_has_line(fake.log, "ARG:--stdin-name"), "the value must be re-encrypted under its own key")
-    assert_true(log_has_line(fake.log, "ARG:password"), "the key name should be passed as --stdin-name")
-
-    -- Plaintext must never land in the buffer on the way through. (The fake echoes
-    -- its input back inside the ciphertext, so look for the decrypted *shape*.)
-    assert_false(vim.tbl_contains(lines, "password: secret"), "the decrypted value must not be left in the buffer")
-  end
-
-  tests["VaultRekey refuses an inline value while it is decrypted"] = function()
-    local fake = create_fake_vault()
-    local new_pass = fake.dir .. "/refuse-new-pass"
-    write_file(new_pass, "new\n")
-    reset_config(fake, { new_password_file = new_pass })
-
-    local buf = new_buffer({
-      "password: !vault |",
-      "          $ANSIBLE_VAULT;1.1;AES256",
-      "          ENCSTR:secret",
-    })
-
-    vault.decrypt(buf, { range = 3, line1 = 1, line2 = 3 })
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: secret"
-    end, "inline decrypt did not finish")
-
-    vault.rekey()
-    assert_true(
-      notification_contains("Write or discard the decrypted content"),
-      "rekey should refuse decrypted content"
-    )
-  end
-
-  tests["VaultRekey never passes --encrypt-vault-id"] = function()
-    local fake = create_fake_vault()
-    local old_pass = make_password_file(fake.dir)
-    local new_pass = fake.dir .. "/new-pass"
-    write_file(new_pass, "new\n")
-    reset_config(fake, { password_files = old_pass, new_password_file = new_pass })
-
-    -- A 1.2 label must be preserved without passing --encrypt-vault-id.
-    local path = fake.dir .. "/labelled.yml"
-    write_file(path, "$ANSIBLE_VAULT;1.2;AES256;prod\nEDITME\n")
-    vim.cmd("edit " .. vim.fn.fnameescape(path))
-
-    vault.rekey()
-    wait_until(function()
-      return read_file(path):find("REKEYED", 1, true) ~= nil
-    end, "VaultRekey did not rewrite the file")
-
-    -- On `rekey` this flag selects the new secret from a pool seeded with the OLD
-    -- identities, so it either errors out or silently re-encrypts with the old
-    -- password. The label is carried by the new identity instead.
-    assert_false(log_contains(fake.log, "ARG:--encrypt-vault-id"), "--encrypt-vault-id must never reach rekey")
-    assert_true(log_has_line(fake.log, "ARG:--new-vault-id"), "the label should ride on the new identity")
-    assert_true(log_has_line(fake.log, "ARG:prod@" .. new_pass), "the new identity should carry the old label")
-    assert_eq(vim.fn.readfile(path, "", 1)[1], "$ANSIBLE_VAULT;1.2;AES256;prod", "the 1.2 label must survive the rekey")
-  end
-
-  tests["VaultRekey without a label stays on format 1.1"] = function()
-    local fake = create_fake_vault()
-    local new_pass = fake.dir .. "/new-pass-plain"
-    write_file(new_pass, "new\n")
-    reset_config(fake, { new_password_file = new_pass })
-
-    local path = fake.dir .. "/plain.yml"
-    write_file(path, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
-    vim.cmd("edit " .. vim.fn.fnameescape(path))
-
-    vault.rekey()
-    wait_until(function()
-      return read_file(path):find("REKEYED", 1, true) ~= nil
-    end, "VaultRekey did not rewrite the file")
-
-    assert_true(log_has_line(fake.log, "ARG:--new-vault-password-file"), "a plain rekey should pass the password file")
-    assert_false(log_contains(fake.log, "ARG:--new-vault-id"), "nothing should invent a label for a 1.1 file")
-    assert_eq(vim.fn.readfile(path, "", 1)[1], "$ANSIBLE_VAULT;1.1;AES256", "a 1.1 file should stay 1.1")
-  end
-
-  tests["VaultRekey rekeys a file-backed encrypted buffer"] = function()
-    local fake = create_fake_vault()
-    local new_pass = make_password_file(fake.dir)
-    reset_config(fake, { new_password_file = new_pass })
-
-    local original_file = fake.dir .. "/rekey.yml"
-    write_file(original_file, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
-
-    vim.cmd("edit " .. vim.fn.fnameescape(original_file))
-    local buf = vim.api.nvim_get_current_buf()
-
-    vault.rekey()
-
-    wait_until(function()
-      return read_file(original_file):find("REKEYED", 1, true) ~= nil
-    end, "VaultRekey did not rewrite the file")
-
-    assert_true(log_contains(fake.log, "ARG:--new-vault-password-file"), "new password file flag was not passed")
-    assert_true(log_contains(fake.log, "ARG:" .. new_pass), "new password file path was not passed")
-    assert_true(vault.is_buffer_encrypted(buf), "buffer was not reloaded as encrypted after rekey")
-  end
-
-  tests["B3 double VaultEdit on same file does not crash"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-    vim.env.FAKE_VAULT_SLEEP = "0.1"
-
-    local original_file = fake.dir .. "/double-edit.yml"
-    write_file(original_file, "$ANSIBLE_VAULT;1.1;AES256\nEDITME\n")
-
-    vim.cmd("edit " .. vim.fn.fnameescape(original_file))
-    local original_buf = vim.api.nvim_get_current_buf()
-
-    vault.edit(original_buf)
-    wait_until(function()
-      return vim.api.nvim_get_current_buf() ~= original_buf
-    end, "first VaultEdit did not open scratch buffer")
-
-    local edit_buf = vim.api.nvim_get_current_buf()
-    vim.cmd("split")
-    vault.edit(original_buf)
-
-    wait_until(function()
-      return notification_contains("buffer name conflict")
-    end, "second VaultEdit did not report name conflict")
-
-    vim.api.nvim_buf_delete(edit_buf, { force = true })
-    vim.cmd("only")
-    vim.env.FAKE_VAULT_SLEEP = nil
-  end
-
-  tests["B4 encrypt decrypt roundtrip preserves content structure"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local buf = new_buffer({ "line1", "line2", "" })
-    assert_eq(vim.api.nvim_buf_line_count(buf), 3, "buffer should have 3 lines including trailing empty")
-
-    vault.encrypt(buf)
-    wait_until(function()
-      return vault.is_buffer_encrypted(buf)
-    end, "encrypt did not finish")
-
-    vault.decrypt(buf)
-    wait_until(function()
-      return not vault.is_buffer_encrypted(buf)
-    end, "decrypt did not finish")
-
-    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    assert_true(#lines >= 1, "decrypted buffer should have content")
-    assert_false(vault.is_buffer_encrypted(buf), "buffer should not be encrypted after decrypt")
-  end
-
-  tests["B5 a failed password is re-prompted"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake, { password_files = false })
-
-    local original_inputsecret = vim.fn.inputsecret
-    local prompt_count = 0
-    vim.fn.inputsecret = function()
-      prompt_count = prompt_count + 1
-      return "mypass"
+  tests["a keyless list item survives Rekey with a real password change"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local old = H.make_password_file(fake.dir, "secret")
+    local new = H.make_password_file(fake.dir, "rotated", "new pass")
+    local input = { "  - !vault |" }
+    for _, line in ipairs(H.envelope("listed")) do
+      table.insert(input, "      " .. line)
     end
+    table.insert(input, "  - other")
+    local buf = H.new_buffer(input)
 
-    vim.env.FAKE_VAULT_FAIL = "simulated password error"
+    vim.cmd("1,3VaultRekey --new-vault-password-file " .. vim.fn.fnameescape(new))
+    H.wait_until(function()
+      return not vim.deep_equal(H.lines(buf), input)
+    end)
+    eq(H.lines(buf)[1], "  - !vault |", "the list dash and indentation must survive the rotation")
+    eq(H.lines(buf)[#H.lines(buf)], "  - other")
 
-    local buf = new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
-    vault.decrypt(buf)
-    wait_until(function()
-      return notification_contains("Decryption failed")
-    end, "decrypt with wrong password did not fail")
+    -- Judged the only honest way: the new password opens it and the old one
+    -- does not.
+    vim.cmd("1,3VaultDecrypt --vault-password-file " .. vim.fn.fnameescape(new))
+    H.wait_until(function()
+      return H.lines(buf)[1] == "  - listed"
+    end, "the NEW password must open the rekeyed value")
 
-    vim.env.FAKE_VAULT_FAIL = nil
-    vault.decrypt(buf)
-    wait_until(function()
-      return not vault.is_buffer_encrypted(buf)
-    end, "decrypt with correct password did not succeed")
-
-    vim.fn.inputsecret = original_inputsecret
-    assert_eq(prompt_count, 2, "password should have been re-prompted after failure")
+    local again = H.new_buffer(H.lines(buf))
+    vim.cmd("1VaultEncrypt --vault-password-file " .. vim.fn.fnameescape(new))
+    H.wait_until(function()
+      return H.lines(again)[1] == "  - !vault |"
+    end)
+    H.command_fails("1,3VaultDecrypt --vault-password-file " .. vim.fn.fnameescape(old))
+    eq(H.lines(again)[1], "  - !vault |", "the OLD password must not open it")
   end
 
-  tests["B6 encrypt string ignores YAML comments"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-    local stdin_log = fake.dir .. "/stdin.log"
-    vim.env.FAKE_VAULT_STDIN_LOG = stdin_log
-
-    local buf = new_buffer({ 'password: "sec#ret" # prod' })
-
-    vault.encrypt(nil, { range = 1, line1 = 1, line2 = 1 })
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "password: !vault |"
-    end, "YAML value with comment was not encrypted")
-
-    assert_eq(read_file(stdin_log), "sec#ret", "YAML comments or quoted # were included in the encrypted value")
-  end
-
-  tests["B6 decrypt string quotes YAML special values"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local function quote(s)
-      return require("ansible-vault.yaml").quote_value(s)
-    end
-
-    assert_eq(quote("yes"), '"yes"', "boolean 'yes' should be quoted")
-    assert_eq(quote("no"), '"no"', "boolean 'no' should be quoted")
-    assert_eq(quote("true"), '"true"', "boolean 'true' should be quoted")
-    assert_eq(quote("false"), '"false"', "boolean 'false' should be quoted")
-    assert_eq(quote("null"), '"null"', "null should be quoted")
-    assert_eq(quote("on"), '"on"', "boolean 'on' should be quoted")
-    assert_eq(quote("off"), '"off"', "boolean 'off' should be quoted")
-    assert_eq(quote("# comment"), '"# comment"', "hash-prefixed should be quoted")
-    assert_eq(quote("[list]"), '"[list]"', "bracket-prefixed should be quoted")
-    assert_eq(quote("normal"), "normal", "normal value should not be quoted")
-    assert_eq(quote(""), '""', "empty should be quoted")
-  end
-
-  tests["B7 find vault block beyond 100 lines"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-
-    local lines = {}
-    table.insert(lines, "password: !vault |")
-    table.insert(lines, "          $ANSIBLE_VAULT;1.1;AES256")
-    for i = 1, 120 do
-      table.insert(lines, "          " .. string.rep("A", 60))
-    end
-    table.insert(lines, "          ENCSTR:verylongvalue")
-    table.insert(lines, "other: value")
-
-    local buf = new_buffer(lines)
-    local cursor_row = #lines - 1
-    vim.api.nvim_win_set_cursor(0, { cursor_row, 30 })
-
-    vault.view()
-
-    wait_until(function()
-      return vim.api.nvim_get_current_buf() ~= buf
-    end, "under-cursor vault view did not open for block > 100 lines")
-
-    assert_true(vim.api.nvim_get_current_buf() ~= buf, "view window should be open")
-    vim.api.nvim_win_close(0, true)
-  end
-
-  tests["B8 re-setup clears previous config"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake, { encrypt_vault_id = "prod" })
-    assert_eq(vault.config.encrypt_vault_id, "prod")
-
-    local table_before = vault.config
-
-    vault.setup({})
-    assert_eq(vault.config.encrypt_vault_id, nil, "encrypt_vault_id should reset to nil on re-setup")
-    assert_eq(vault.config.ansible_vault_path, nil, "the executable set by the previous setup should be cleared")
-
-    -- Filled in place, not replaced: :checkhealth and anything else holding
-    -- `vault.config` would otherwise keep reading a detached table after setup().
-    assert_true(table_before == vault.config, "setup() must not swap the config table out from under its holders")
-  end
-
-  tests["B9 command args support quoted paths with spaces"] = function()
-    local fake = create_fake_vault()
-    local pass_path = fake.dir .. "/path with spaces/vault pass"
-    vim.fn.mkdir(fake.dir .. "/path with spaces", "p")
-    write_file(pass_path, "secret\n")
-    vim.fn.setfperm(pass_path, "rw-------")
-    reset_config(fake, { password_files = false })
-
-    new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
-    local cmd = "VaultView --vault-password-file '" .. pass_path .. "'"
-    vim.cmd(cmd)
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, 1, false)[1] == "plain: old"
-    end, "VaultView with quoted path did not finish")
-
-    assert_true(log_contains(fake.log, "ARG:" .. pass_path), "quoted path was not passed as one arg")
-    vim.api.nvim_win_close(0, true)
-  end
-
-  tests["B9 command args support escaped spaces"] = function()
-    local fake = create_fake_vault()
-    local pass_path = fake.dir .. "/path with spaces/vault pass"
-    vim.fn.mkdir(fake.dir .. "/path with spaces", "p")
-    write_file(pass_path, "secret\n")
-    vim.fn.setfperm(pass_path, "rw-------")
-    reset_config(fake, { password_files = false })
-
-    new_buffer({ "$ANSIBLE_VAULT;1.1;AES256", "EDITME" })
-    local escaped_path = pass_path:gsub(" ", "\\ ")
-    vim.cmd("VaultView --vault-password-file " .. escaped_path)
-
-    wait_until(function()
-      return vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, 1, false)[1] == "plain: old"
-    end, "VaultView with escaped-space path did not finish")
-
-    assert_true(log_contains(fake.log, "ARG:" .. pass_path), "escaped-space path was not passed as one arg")
-    vim.api.nvim_win_close(0, true)
-  end
-
-  tests["health check runs"] = function()
-    local fake = create_fake_vault()
-    reset_config(fake)
-    require("ansible-vault.health").check()
+  tests["inline Rekey leaves the old block in place when re-encryption fails"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = H.inline("value", "password:")
+    table.insert(input, "other: keep")
+    local buf = H.new_buffer(input)
+    local new = H.make_password_file(fake.dir, "rotated", "new")
+    vim.env.FAKE_VAULT_ACTION = "encrypt_string"
+    vim.env.FAKE_VAULT_FAIL = "no re-encryption for you"
+    H.command_fails("1,3VaultRekey --new-vault-password-file " .. vim.fn.fnameescape(new))
+    eq(H.lines(buf), input, "a failed second stage must leave the original block")
   end
 end

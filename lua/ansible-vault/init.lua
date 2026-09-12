@@ -1,52 +1,40 @@
+---The six commands, and the whole-file half of each verb.
+---
+---`setup()` is the only thing this module exports. Commands are registered when
+---the module loads, so they exist whether or not `setup()` was ever called, and
+---registering again is harmless — which is what keeps a second `setup()` from
+---disturbing an editing session that is already open.
+---
+---Scope is decided in `inline.lua` and is the same for every verb: an explicit
+---`[range]` names one inline value, a vault header on line 1 means the whole file,
+---and a cursor inside a `!vault` block names that block. `:VaultEncrypt` without a
+---range is always the whole buffer — there is no state from an earlier command
+---that can turn it into something else.
+local M = {}
+
 local ansible_cfg = require("ansible-vault.ansible_cfg")
 local buffer = require("ansible-vault.buffer")
 local cli = require("ansible-vault.cli")
-local edit_mod = require("ansible-vault.edit")
-local config_mod = require("ansible-vault.config")
+local config = require("ansible-vault.config")
 local credentials = require("ansible-vault.credentials")
+local edit = require("ansible-vault.edit")
+local fs = require("ansible-vault.fs")
 local inline = require("ansible-vault.inline")
 local op = require("ansible-vault.op")
 local plaintext = require("ansible-vault.plaintext")
-local secure = require("ansible-vault.secure")
 local ui = require("ansible-vault.ui")
+local yaml = require("ansible-vault.yaml")
 
-local M = {}
+local notify = config.notify
+local is_nonempty_string = config.is_nonempty_string
 
----Minimum supported Neovim version.
+--- Command arguments -------------------------------------------------------
+
+---Split a command line into arguments, honouring quotes and backslash escapes.
 ---
----The plugin tracks the current Neovim release only. Older versions are not
----worked around and are not tested; they may happen to work, but that is not a
----promise. Keeping a single target is what keeps this maintainable.
-M.MIN_NVIM_VERSION = "0.12"
-
-local uv = vim.uv
-local AUGROUP = "AnsibleVault"
-
----The live configuration table. Callers hold this reference, so `setup()` fills
----it in place rather than replacing it.
----@type AnsibleVaultConfig
-M.config = config_mod.values
-
----Parse the `$ANSIBLE_VAULT` header of some content.
-M.parse_header = buffer.parse_header
-
----Whether some content is vault ciphertext.
-M.is_encrypted = buffer.is_encrypted
-
----Whether a buffer holds vault ciphertext. The supported way to drive a
----statusline: it inspects the buffer rather than reading state an earlier
----operation happened to leave behind.
-M.is_buffer_encrypted = buffer.is_buffer_encrypted
-
----Edit an encrypted file in a secure scratch buffer.
-M.edit = edit_mod.edit
-
-local is_nonempty_string = config_mod.is_nonempty_string
-local effective_config = config_mod.effective
-local notify = config_mod.notify
-
-local expand_path = credentials.expand_path
-
+---Neovim hands the argument list over as one string, so paths with spaces have to
+---survive here or they cannot be passed at all:
+---`:VaultEdit --vault-password-file "~/my secrets/pass"`.
 ---@param args string|nil
 ---@return string[]
 local function parse_command_args(args)
@@ -105,63 +93,81 @@ local function parse_command_args(args)
   return result
 end
 
----@param args string[]|nil
----@param opts? table
----@return table
----Parse command arguments into config overrides.
----
----Credential flags are spelled exactly as `ansible-vault` spells them.
----Unrecognised flags are errors, not positional arguments.
----@return table|nil parsed, string|nil err
-local function parse_operation_options(args, opts)
-  local result = {
-    overrides = {},
-    positionals = {},
-  }
+---Flags that name which credential opens a vault, spelled exactly as
+---`ansible-vault` spells them.
+local CREDENTIAL_FLAGS = {
+  ["--vault-password-file"] = { key = "password_files", value = true, list = true },
+  ["--vault-id"] = { key = "vault_ids", value = true, list = true },
+  ["--ask-vault-password"] = { key = "ask_password", value = false },
+}
 
-  -- A command-line credential replaces the configured ones outright rather than
-  -- adding to them; `false` is the sentinel `effective_config` reads as "unset".
-  local function exclusive(key)
-    for _, other in ipairs({ "password_files", "vault_ids", "ask_password" }) do
-      if other ~= key and result.overrides[other] == nil then
-        result.overrides[other] = false
-      end
-    end
-  end
+---Which flags each command accepts.
+---
+---Per command rather than one shared list, so a flag that cannot mean anything is
+---an error instead of a silent no-op. `--encrypt-vault-id` is the one that matters:
+---on `rekey` it selects from a pool seeded with the *old* identities, so accepting
+---it there would let a rekey report success and leave the file on its old
+---password.
+local FLAG_SETS = {
+  read = CREDENTIAL_FLAGS,
+  write = vim.tbl_extend("force", {}, CREDENTIAL_FLAGS, {
+    ["--encrypt-vault-id"] = { key = "encrypt_vault_id", value = true },
+  }),
+  rekey = vim.tbl_extend("force", {}, CREDENTIAL_FLAGS, {
+    ["--new-vault-password-file"] = { key = "new_password_file", value = true },
+    ["--new-vault-id"] = { key = "new_vault_id", value = true },
+  }),
+}
+
+---@param flags table
+---@return string[]
+local function flag_names(flags)
+  local names = vim.tbl_keys(flags)
+  table.sort(names)
+  return names
+end
+
+---Turn command arguments into configuration overrides.
+---
+---Credential flags *replace* the configured credentials rather than adding to
+---them, so `:VaultEdit --vault-id prod@~/.pass` uses exactly that identity. The
+---`false` sentinel is what `config.effective` reads as "explicitly unset", which a
+---`nil` could not express through `tbl_deep_extend`.
+---@param args string[]
+---@param command table
+---@return table|nil parsed, string|nil err
+local function parse_operation_options(args, command)
+  local flags = FLAG_SETS[command.flags]
+  local result = { overrides = {}, positionals = {} }
+  local seen = {}
 
   local index = 1
-  while index <= #(args or {}) do
+  while index <= #args do
     local arg = args[index]
-    local next_arg = args[index + 1]
+    local flag = flags[arg]
 
-    if arg == "--vault-password-file" and next_arg then
-      exclusive("password_files")
-      result.overrides.password_files = result.overrides.password_files or {}
-      table.insert(result.overrides.password_files, next_arg)
-      index = index + 2
-    elseif arg == "--vault-id" and next_arg then
-      exclusive("vault_ids")
-      result.overrides.vault_ids = result.overrides.vault_ids or {}
-      table.insert(result.overrides.vault_ids, next_arg)
-      index = index + 2
-    elseif arg == "--ask-vault-password" then
-      exclusive("ask_password")
-      result.overrides.ask_password = true
-      index = index + 1
-    elseif arg == "--encrypt-vault-id" and next_arg then
-      result.overrides.encrypt_vault_id = next_arg
-      index = index + 2
-    elseif arg == "--new-vault-password-file" and next_arg then
-      result.overrides.new_password_file = next_arg
-      result.overrides.new_vault_id = false
-      index = index + 2
-    elseif arg == "--new-vault-id" and next_arg then
-      result.overrides.new_vault_id = next_arg
-      result.overrides.new_password_file = false
-      index = index + 2
+    if flag then
+      local value = true
+      if flag.value then
+        value = args[index + 1]
+        if value == nil or value:match("^%-%-") then
+          return nil, string.format("missing value for %s", arg)
+        end
+        index = index + 2
+      else
+        index = index + 1
+      end
+
+      seen[flag.key] = true
+      if flag.list then
+        result.overrides[flag.key] = result.overrides[flag.key] or {}
+        table.insert(result.overrides[flag.key], value)
+      else
+        result.overrides[flag.key] = value
+      end
     elseif arg:match("^%-") then
-      return nil, string.format("unknown or incomplete argument: %s", arg)
-    elseif opts and opts.positionals then
+      return nil, string.format("unknown argument: %s (accepted here: %s)", arg, table.concat(flag_names(flags), ", "))
+    elseif command.positionals then
       table.insert(result.positionals, arg)
       index = index + 1
     else
@@ -169,33 +175,49 @@ local function parse_operation_options(args, opts)
     end
   end
 
+  if seen.ask_password and (seen.password_files or seen.vault_ids) then
+    return nil, "--ask-vault-password cannot be combined with --vault-id or --vault-password-file"
+  end
+
+  if seen.new_vault_id and seen.new_password_file then
+    return nil, "--new-vault-id and --new-vault-password-file are mutually exclusive"
+  end
+
+  -- Naming any credential on the command line means the configured ones do not
+  -- apply at all; the same for a new identity on rekey.
+  local EXCLUSIVE_GROUPS = {
+    { "password_files", "vault_ids", "ask_password" },
+    { "new_vault_id", "new_password_file" },
+  }
+  for _, group in ipairs(EXCLUSIVE_GROUPS) do
+    local given = false
+    for _, key in ipairs(group) do
+      given = given or seen[key] == true
+    end
+    if given then
+      for _, key in ipairs(group) do
+        if not seen[key] then
+          result.overrides[key] = false
+        end
+      end
+    end
+  end
+
+  if command.positionals and #result.positionals > command.positionals then
+    return nil, string.format("expected at most %d file name", command.positionals)
+  end
+
   return result, nil
 end
 
 ---@param arg_lead string
----@param include_rekey? boolean
----@param include_labels? boolean
+---@param command table
 ---@return string[]
-local function complete_operation_args(arg_lead, include_rekey, include_labels)
-  local candidates = {
-    "--vault-id",
-    "--vault-password-file",
-    "--ask-vault-password",
-    "--encrypt-vault-id",
-  }
+local function complete_args(arg_lead, command)
+  local candidates = flag_names(FLAG_SETS[command.flags])
 
-  if include_rekey then
-    table.insert(candidates, "--new-vault-password-file")
-    table.insert(candidates, "--new-vault-id")
-  end
-
-  if include_labels then
-    for _, vault_id in ipairs(credentials.as_list(M.config.vault_ids)) do
-      local label = vault_id:match("^([^@]+)@")
-      if label then
-        table.insert(candidates, label)
-      end
-    end
+  if command.positionals and not arg_lead:match("^%-") then
+    vim.list_extend(candidates, vim.fn.getcompletion(arg_lead, "file"))
   end
 
   return vim.tbl_filter(function(candidate)
@@ -203,90 +225,96 @@ local function complete_operation_args(arg_lead, include_rekey, include_labels)
   end, candidates)
 end
 
+--- Whole-buffer operations --------------------------------------------------
+
 ---@param target integer
----@param opts? table
-local function encrypt_file(target, opts)
+---@param opts table
+local function encrypt_buffer(target, opts)
+  local kind = plaintext.kind(target)
+  if kind and kind ~= "plaintext" then
+    vim.notify("This buffer already encrypts what it writes; use :w", vim.log.levels.WARN)
+    return
+  end
+
   local context = buffer.capture_context(target)
 
   op.credentials(function(creds)
     if not creds then
       return
     end
-
     if not buffer.is_valid(target) then
-      buffer.run_cleanup(creds.cleanup)
       vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
       return
     end
-
     if not buffer.start_operation(target, "encrypt") then
-      buffer.run_cleanup(creds.cleanup)
       return
     end
 
     local tick = buffer.changedtick(target)
-    local content = buffer.content(target)
+    local content = buffer.bytes(target)
     local args = op.with_encrypt_vault_id(creds.args, opts, creds, context)
 
     cli.run("encrypt", content, args, function(success, output)
-      buffer.run_cleanup(creds.cleanup)
       buffer.finish_operation(target, "encrypt")
 
-      if success then
-        if buffer.replace_lines(target, tick, output, "Buffer encrypted successfully") then
-          plaintext.leave(target)
-          op.emit("encrypt", "file", { buf = target })
-        end
-      else
+      if not success then
         vim.notify("Encryption failed: " .. output, vim.log.levels.ERROR)
+        return
+      end
+      if not yaml.vault_lines(output) then
+        vim.notify("ansible-vault produced no valid encrypted content; the buffer was left alone", vim.log.levels.ERROR)
+        return
+      end
+
+      if buffer.replace_lines(target, tick, output, "Buffer encrypted successfully") then
+        -- The whole buffer is ciphertext and the undo history that held the
+        -- plaintext is gone, so normal write behaviour is safe again. Encrypting
+        -- one value out of a file proves no such thing, which is why only this
+        -- path releases the buffer.
+        plaintext.leave(target)
       end
     end, opts, creds)
   end, opts, context)
 end
 
 ---@param target integer
----@param opts? table
-local function decrypt_file(target, opts)
+---@param opts table
+local function decrypt_buffer(target, opts)
   local context = buffer.capture_context(target)
 
   op.credentials(function(creds)
     if not creds then
       return
     end
-
     if not buffer.is_valid(target) then
-      buffer.run_cleanup(creds.cleanup)
       vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
       return
     end
-
     if not buffer.start_operation(target, "decrypt") then
-      buffer.run_cleanup(creds.cleanup)
       return
     end
 
     local tick = buffer.changedtick(target)
-    local content = buffer.content(target)
 
-    cli.run("decrypt", content, creds.args, function(success, output)
-      buffer.run_cleanup(creds.cleanup)
+    cli.run("decrypt", buffer.content(target), creds.args, function(success, output)
       buffer.finish_operation(target, "decrypt")
 
-      if success then
-        if buffer.replace_lines(target, tick, output, "Buffer decrypted successfully") then
-          plaintext.enter(target, "file", opts)
-          op.emit("decrypt", "file", { buf = target })
-        end
-      else
+      if not success then
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
+        return
+      end
+
+      -- `replace_lines` hardens the buffer before the plaintext lands in it.
+      if buffer.replace_lines(target, tick, output, "Buffer decrypted successfully") then
+        plaintext.enter(target)
       end
     end, opts, creds)
   end, opts, context)
 end
 
 ---@param target integer
----@param opts? table
-local function view_file(target, opts)
+---@param opts table
+local function view_buffer(target, opts)
   local filetype = vim.bo[target].filetype
   local context = buffer.capture_context(target)
 
@@ -294,80 +322,124 @@ local function view_file(target, opts)
     if not creds then
       return
     end
-
     if not buffer.is_valid(target) then
-      buffer.run_cleanup(creds.cleanup)
       vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
       return
     end
 
     cli.run("decrypt", buffer.content(target), creds.args, function(success, output)
-      buffer.run_cleanup(creds.cleanup)
-
-      if success then
-        ui.open_float(output, " Vault View (read-only) ", filetype)
-        op.emit("view", "file", { buf = target })
-      else
+      if not success then
         vim.notify("View failed: " .. output, vim.log.levels.ERROR)
+        return
       end
+      ui.open_float(output, " Vault View (read-only) ", filetype)
     end, opts, creds)
   end, opts, context)
 end
 
+---Rekey a whole vault file with the native `rekey`, via a ciphertext staging
+---file.
+---
+---`ansible-vault rekey` rewrites its target in place by removing and recreating
+---it, so pointing it at the user's file means a failure part way through leaves
+---nothing behind. It is pointed at a copy instead, and the result is published
+---over the original in one atomic rename — but only if the original is still
+---exactly the file that was copied, and only if what came back is a vault file.
+---
+---Still the native `rekey`: decrypting and re-encrypting instead would change the
+---file's format version and lose its vault id label.
 ---@param target integer
----@param opts? table
-local function rekey_file(target, opts)
+---@param opts table
+local function rekey_buffer(target, opts)
   if vim.bo[target].modified then
     vim.notify("Write or discard changes before VaultRekey", vim.log.levels.ERROR)
     return
   end
 
-  local file_path = vim.api.nvim_buf_get_name(target)
-  if file_path == "" then
+  local file = vim.api.nvim_buf_get_name(target)
+  if file == "" then
     vim.notify("VaultRekey requires a file-backed buffer", vim.log.levels.ERROR)
     return
   end
 
+  local source, read_err = fs.read_file(file)
+  if not source then
+    vim.notify("VaultRekey cannot read " .. file .. ": " .. tostring(read_err), vim.log.levels.ERROR)
+    return
+  end
+  if not yaml.vault_lines(source) then
+    vim.notify("VaultRekey: " .. file .. " is not an Ansible Vault file on disk", vim.log.levels.ERROR)
+    return
+  end
+
+  local signature = fs.signature(file)
   local context = buffer.capture_context(target)
+
+  -- Never `--encrypt-vault-id`: on rekey that flag picks from a pool seeded with
+  -- the OLD identities, so it can report success having re-encrypted with the old
+  -- password. See `credentials.rekey_args`.
+  local new_args, new_err = credentials.rekey_args(config.effective(opts), context)
+  if new_err then
+    vim.notify("VaultRekey: " .. new_err, vim.log.levels.ERROR)
+    return
+  end
+  if not new_args then
+    vim.notify("VaultRekey requires new_vault_id, new_password_file, or a --new-vault-* argument", vim.log.levels.ERROR)
+    return
+  end
 
   op.credentials(function(creds)
     if not creds then
       return
     end
-
-    -- Old credentials open the file; the new identity is named separately. No
-    -- --encrypt-vault-id: on `rekey` that flag selects from a pool seeded with
-    -- the OLD identities, so it can silently re-encrypt with the old password.
-    -- See credentials.rekey_args.
-    local new_args, new_err = credentials.rekey_args(effective_config(opts), context)
-    if new_err then
-      buffer.run_cleanup(creds.cleanup)
-      vim.notify("VaultRekey: " .. new_err, vim.log.levels.ERROR)
+    if not buffer.is_valid(target) then
+      vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
       return
     end
-    if not new_args then
-      buffer.run_cleanup(creds.cleanup)
-      vim.notify(
-        "VaultRekey requires new_vault_id, new_password_file, or a --new-vault-* argument",
-        vim.log.levels.ERROR
-      )
-      return
-    end
-
-    local rekey_args = vim.deepcopy(creds.args)
-    vim.list_extend(rekey_args, new_args)
-
     if not buffer.start_operation(target, "rekey") then
-      buffer.run_cleanup(creds.cleanup)
       return
     end
 
-    cli.run_file("rekey", file_path, rekey_args, function(success, output)
-      buffer.run_cleanup(creds.cleanup)
+    local staging = vim.fn.tempname()
+    local staged, stage_err = fs.atomic_write(staging, source)
+    if not staged then
       buffer.finish_operation(target, "rekey")
+      vim.notify("VaultRekey could not stage the ciphertext: " .. tostring(stage_err), vim.log.levels.ERROR)
+      return
+    end
+
+    local args = vim.deepcopy(creds.args)
+    vim.list_extend(args, new_args)
+
+    cli.run_file("rekey", staging, args, function(success, output)
+      buffer.finish_operation(target, "rekey")
+
+      local produced = fs.read_file(staging)
+      fs.remove(staging)
 
       if not success then
         vim.notify("Rekey failed: " .. output, vim.log.levels.ERROR)
+        return
+      end
+      if not produced or not yaml.vault_lines(produced) then
+        vim.notify(
+          "Rekey reported success but produced no valid vault content; " .. file .. " was left unchanged",
+          vim.log.levels.ERROR
+        )
+        return
+      end
+      if not fs.same_signature(signature, fs.signature(file)) then
+        vim.notify(file .. " changed on disk during the rekey; it was left unchanged", vim.log.levels.ERROR)
+        return
+      end
+      if buffer.is_valid(target) and vim.bo[target].modified then
+        vim.notify(file .. " has unsaved changes again; the rekeyed content was not published", vim.log.levels.ERROR)
+        return
+      end
+
+      local published, publish_err = fs.atomic_write(file, produced)
+      if not published then
+        vim.notify("Failed to write the rekeyed file: " .. tostring(publish_err), vim.log.levels.ERROR)
         return
       end
 
@@ -379,23 +451,17 @@ local function rekey_file(target, opts)
       end
 
       notify("Vault file rekeyed successfully", vim.log.levels.INFO)
-      op.emit("rekey", "file", { buf = target, file = file_path })
     end, opts, creds)
   end, opts, context)
 end
 
---- Scope-aware verbs -------------------------------------------------------
----
----One command per verb, with the target resolved from the buffer, explicit
----range and cursor. Never read the `'<`/`'>` marks: they may point at a stale
----selection elsewhere in the buffer.
+--- Verbs -------------------------------------------------------------------
 
----@param buf? integer
----@param opts? table
+---@param opts table
 ---@param want "ciphertext"|"plain"
 ---@return integer|nil target, table|nil scope
-local function target_and_scope(buf, opts, want)
-  local target = buffer.normalize(buf)
+local function target_and_scope(opts, want)
+  local target = vim.api.nvim_get_current_buf()
   if not buffer.is_valid(target) then
     vim.notify("Target buffer no longer exists", vim.log.levels.ERROR)
     return nil, nil
@@ -410,11 +476,9 @@ local function target_and_scope(buf, opts, want)
   return target, scope
 end
 
----Encrypt the whole buffer, or one inline YAML value.
----@param buf? integer
----@param opts? table
-function M.encrypt(buf, opts)
-  local target, scope = target_and_scope(buf, opts, "plain")
+---@param opts table
+local function vault_encrypt(opts)
+  local target, scope = target_and_scope(opts, "plain")
   if not target then
     return
   end
@@ -428,56 +492,34 @@ function M.encrypt(buf, opts)
   end
 
   if scope.scope == "file" then
-    encrypt_file(target, opts)
-    return
+    encrypt_buffer(target, opts)
+  else
+    inline.encrypt_region(target, scope.region, opts)
   end
-
-  if scope.state == "plaintext" then
-    -- The inverse of decrypting in place: fold the tracked regions back into
-    -- `!vault` blocks without touching the file. `:w` remains the user's call.
-    plaintext.restore_regions(target, opts, function(ok)
-      if not ok then
-        return
-      end
-      plaintext.leave(target)
-      notify("Vault values restored", vim.log.levels.INFO)
-      op.emit("encrypt", "inline", { buf = target })
-    end)
-    return
-  end
-
-  inline.encrypt_selection(target, scope.selection, opts)
 end
 
----Decrypt the whole buffer, or one inline YAML value, in place.
----@param buf? integer
----@param opts? table
-function M.decrypt(buf, opts)
-  local target, scope = target_and_scope(buf, opts, "ciphertext")
+---@param opts table
+local function vault_decrypt(opts)
+  local target, scope = target_and_scope(opts, "ciphertext")
   if not target then
     return
   end
 
   if scope.state ~= "ciphertext" then
-    vim.notify(
-      scope.state == "plaintext" and "Already decrypted" or "Nothing encrypted here to decrypt",
-      vim.log.levels.WARN
-    )
+    vim.notify("Nothing encrypted here to decrypt", vim.log.levels.WARN)
     return
   end
 
   if scope.scope == "file" then
-    decrypt_file(target, opts)
+    decrypt_buffer(target, opts)
   else
-    inline.decrypt_selection(target, scope.selection, "replace", opts)
+    inline.decrypt_region(target, scope.region, opts)
   end
 end
 
----Show the decrypted content of the buffer, or of one inline value, read-only.
----@param buf? integer
----@param opts? table
-function M.view(buf, opts)
-  local target, scope = target_and_scope(buf, opts, "ciphertext")
+---@param opts table
+local function vault_view(opts)
+  local target, scope = target_and_scope(opts, "ciphertext")
   if not target then
     return
   end
@@ -488,260 +530,182 @@ function M.view(buf, opts)
   end
 
   if scope.scope == "file" then
-    view_file(target, opts)
+    view_buffer(target, opts)
   else
-    inline.decrypt_selection(target, scope.selection, "view", opts)
+    inline.view_region(target, scope.region, opts)
   end
 end
 
----Rekey the vault file, or one inline `!vault` value.
----@param opts? table
-function M.rekey(opts)
-  local target, scope = target_and_scope(nil, opts, "ciphertext")
+---@param opts table
+local function vault_edit(opts)
+  local target, scope = target_and_scope(opts, "ciphertext")
   if not target then
     return
   end
 
   if scope.state ~= "ciphertext" then
-    vim.notify(
-      scope.state == "plaintext" and "Write or discard the decrypted content before rekeying"
-        or "Nothing encrypted here to rekey",
-      vim.log.levels.ERROR
-    )
+    vim.notify("Nothing encrypted here to edit", vim.log.levels.WARN)
     return
   end
 
   if scope.scope == "file" then
-    rekey_file(target, opts)
+    edit.edit_file(target, opts)
   else
-    inline.rekey_selection(target, scope.selection, opts)
+    edit.edit_inline(target, scope.region, opts)
   end
 end
 
----Create a new Ansible Vault file.
----
----Opens an empty, hardened buffer for the given path. The file is only created
----on `:w`, and only ever with encrypted content.
----@param opts? table
-function M.create(opts)
-  local path = opts and opts.positionals and opts.positionals[1]
-  if not is_nonempty_string(path) then
-    vim.notify("VaultCreate requires a file path", vim.log.levels.ERROR)
+---@param opts table
+local function vault_rekey(opts)
+  local target, scope = target_and_scope(opts, "ciphertext")
+  if not target then
     return
   end
 
-  path = vim.fn.fnamemodify(expand_path(path), ":p")
-
-  if uv.fs_stat(path) and not (opts and opts.bang) then
-    vim.notify("File already exists (use :VaultCreate! to overwrite): " .. path, vim.log.levels.ERROR)
+  if scope.state ~= "ciphertext" then
+    vim.notify("Nothing encrypted here to rekey", vim.log.levels.WARN)
     return
   end
 
-  local dir = vim.fn.fnamemodify(path, ":h")
-  local dir_stat = uv.fs_stat(dir)
-  if not dir_stat or dir_stat.type ~= "directory" then
-    vim.notify("Directory does not exist: " .. dir, vim.log.levels.ERROR)
-    return
+  if scope.scope == "file" then
+    rekey_buffer(target, opts)
+  else
+    inline.rekey_region(target, scope.region, opts)
   end
-
-  local ok, err = pcall(vim.cmd, "edit " .. vim.fn.fnameescape(path))
-  if not ok then
-    vim.notify("Failed to open " .. path .. ": " .. tostring(err), vim.log.levels.ERROR)
-    return
-  end
-
-  local buf = vim.api.nvim_get_current_buf()
-  secure.protect(buf)
-  secure.with_cleared_undo(buf, function()
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "" })
-  end)
-  vim.bo[buf].modified = false
-
-  plaintext.enter(buf, "file", opts)
-  op.emit("create", "file", { buf = buf, file = path })
 end
 
----Drop every secret this process is still holding. Runs on exit.
----
----Interactive passwords are not cached, so this sweeps the temp password files
----the askpass fallback may have written.
-function M.cleanup()
-  credentials.cleanup_all()
-end
-
---- Commands ---------------------------------------------------------------
----
----One table, one registration pass.
-
----@param arg_lead string
----@return string[]
-local function complete_create_args(arg_lead)
-  local candidates = complete_operation_args(arg_lead)
-  if not arg_lead:match("^%-") then
-    vim.list_extend(candidates, vim.fn.getcompletion(arg_lead, "file"))
-  end
-  return vim.tbl_filter(function(candidate)
-    return vim.startswith(candidate, arg_lead)
-  end, candidates)
-end
-
-local COMPLETERS = {
-  operation = function(arg_lead)
-    return complete_operation_args(arg_lead)
-  end,
-  rekey = function(arg_lead)
-    return complete_operation_args(arg_lead, true)
-  end,
-  labels = function(arg_lead)
-    return complete_operation_args(arg_lead, false, true)
-  end,
-  create = complete_create_args,
-}
+--- Commands ----------------------------------------------------------------
 
 ---@type table[]
 local COMMANDS = {
   {
     name = "VaultEncrypt",
-    desc = "Encrypt the buffer, or the inline YAML value in [range]",
-    complete = "labels",
+    desc = "Encrypt the whole buffer, or the YAML value in [range]",
+    flags = "write",
     range = true,
-    run = function(_, parsed)
-      M.encrypt(nil, parsed)
-    end,
+    run = vault_encrypt,
   },
   {
     name = "VaultDecrypt",
     desc = "Decrypt the buffer, or one inline !vault value, in place",
-    complete = "operation",
+    flags = "read",
     range = true,
-    run = function(_, parsed)
-      M.decrypt(nil, parsed)
-    end,
+    run = vault_decrypt,
   },
   {
     name = "VaultView",
     desc = "Show decrypted content read-only, for the buffer or one inline value",
-    complete = "operation",
+    flags = "read",
     range = true,
-    run = function(_, parsed)
-      M.view(nil, parsed)
-    end,
+    run = vault_view,
   },
   {
     name = "VaultEdit",
-    desc = "Edit an encrypted file in a secure scratch buffer",
-    complete = "operation",
-    run = function(_, parsed)
-      M.edit(nil, parsed)
-    end,
+    desc = "Edit a vault file, or one inline !vault value, in a protected buffer",
+    flags = "write",
+    range = true,
+    run = vault_edit,
   },
   {
     name = "VaultCreate",
     desc = "Create a new Ansible Vault file",
-    complete = "create",
+    flags = "write",
     bang = true,
-    parse = { positionals = true },
-    run = function(cmd_opts, parsed)
-      parsed.bang = cmd_opts.bang
-      M.create(parsed)
+    positionals = 1,
+    run = function(opts)
+      edit.create(opts)
     end,
   },
   {
     name = "VaultRekey",
     desc = "Rekey the vault file, or one inline !vault value",
-    complete = "rekey",
+    flags = "rekey",
     range = true,
-    run = function(_, parsed)
-      M.rekey(parsed)
-    end,
+    run = vault_rekey,
   },
 }
 
 local version_warned = false
 
----Apply the plugin's defaults when the user never called `setup()`.
-local function ensure_configured()
-  if not version_warned and vim.fn.has("nvim-" .. M.MIN_NVIM_VERSION) == 0 then
-    version_warned = true
-    vim.notify(
-      string.format("ansible-vault.nvim supports Neovim %s and newer; older versions are untested", M.MIN_NVIM_VERSION),
-      vim.log.levels.WARN
-    )
+---The plugin tracks the current Neovim release only. Older versions are not
+---worked around and are not tested; they may happen to work, but that is not a
+---promise.
+local function check_version()
+  if version_warned or vim.fn.has("nvim-" .. config.MIN_NVIM_VERSION) == 1 then
+    return
   end
-
-  if not M._configured then
-    M.setup({})
-  end
+  version_warned = true
+  vim.notify(
+    string.format(
+      "ansible-vault.nvim supports Neovim %s and newer; older versions are untested",
+      config.MIN_NVIM_VERSION
+    ),
+    vim.log.levels.WARN
+  )
 end
 
----Register every user command. Idempotent.
-function M.register_commands()
+local registered = false
+
+---Register every user command. Idempotent, and called when this module loads, so
+---the commands exist without `setup()` and a second `setup()` changes nothing.
+local function register_commands()
+  if registered then
+    return
+  end
+  registered = true
+
   for _, command in ipairs(COMMANDS) do
     vim.api.nvim_create_user_command(command.name, function(cmd_opts)
-      ensure_configured()
-      local parsed, err = parse_operation_options(parse_command_args(cmd_opts.args), command.parse)
+      check_version()
+
+      local parsed, err = parse_operation_options(parse_command_args(cmd_opts.args), command)
       if not parsed then
         vim.notify(string.format(":%s: %s", command.name, err), vim.log.levels.ERROR)
         return
       end
-      -- Scope resolution reads these, so they travel with the overrides rather
-      -- than being recovered from editor state later.
+
+      -- Scope and bang travel with the parsed options rather than being recovered
+      -- from editor state later, which is what keeps a stale visual selection out
+      -- of the decision.
       parsed.range = cmd_opts.range
       parsed.line1 = cmd_opts.line1
       parsed.line2 = cmd_opts.line2
-      command.run(cmd_opts, parsed)
+      parsed.bang = cmd_opts.bang
+
+      command.run(parsed)
     end, {
-      nargs = command.nargs or "*",
+      nargs = "*",
       range = command.range or nil,
       bang = command.bang or nil,
-      complete = command.complete and COMPLETERS[command.complete] or nil,
+      complete = function(arg_lead)
+        return complete_args(arg_lead, command)
+      end,
       desc = command.desc,
       force = true,
     })
   end
 end
 
----Setup the plugin.
+---Configure the plugin.
+---
+---Optional: the commands work with the defaults without it. Calling it again
+---replaces the configuration and leaves any open vault buffer alone, because
+---nothing an editing session depends on lives in the configuration.
 ---@param opts? AnsibleVaultConfig
 function M.setup(opts)
   opts = opts or {}
 
-  local errors = config_mod.validate(opts)
+  local errors = config.validate(opts)
   if #errors > 0 then
     vim.notify("ansible-vault.nvim setup: " .. table.concat(errors, "; "), vim.log.levels.ERROR)
     return
   end
 
-  config_mod.apply(opts)
-  M._configured = true
-
+  config.apply(opts)
   ansible_cfg.clear_cache()
-  M.register_commands()
-
-  local group = vim.api.nvim_create_augroup(AUGROUP, { clear = true })
-
-  -- Secrets must not outlive the process, and a crash is the case that matters.
-  -- This covers the orderly exit; anything the plugin writes is also named after
-  -- this process so a crashed instance's leftovers are identifiable.
-  vim.api.nvim_create_autocmd("VimLeavePre", {
-    group = group,
-    desc = "Drop cached Ansible Vault secrets",
-    callback = function()
-      M.cleanup()
-    end,
-  })
-
-  -- Re-reading a file replaces whatever the buffer held, so any plaintext state
-  -- tracked for it is stale.
-  vim.api.nvim_create_autocmd("BufReadPre", {
-    group = group,
-    pattern = "*",
-    callback = function(event)
-      if vim.b[event.buf].ansible_vault_plaintext then
-        plaintext.leave(event.buf)
-      end
-    end,
-  })
+  register_commands()
 end
+
+register_commands()
 
 return M

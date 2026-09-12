@@ -13,7 +13,6 @@
 ---this is named for what it does rather than looking like a plain getter.
 local M = {}
 
-local cli = require("ansible-vault.cli")
 local config = require("ansible-vault.config")
 local secure = require("ansible-vault.secure")
 local yaml = require("ansible-vault.yaml")
@@ -40,6 +39,58 @@ end
 ---@return string
 function M.content(buf)
   return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+end
+
+---The bytes a buffer stands for, as this plugin would write them.
+---
+---'fileformat' and 'endofline' are part of the content, not presentation: a value
+---decrypted without a trailing newline has to be written back without one, and a
+---file read as `dos` has to keep its CRLFs. Reproducing them here is what makes a
+---decrypt/write round trip byte-for-byte.
+---@param buf integer
+---@return string
+function M.bytes(buf)
+  local eol = ({ dos = "\r\n", mac = "\r" })[vim.bo[buf].fileformat] or "\n"
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  return table.concat(lines, eol) .. (vim.bo[buf].endofline and eol or "")
+end
+
+---Split raw bytes into buffer lines, reporting how they ended.
+---
+---`vim.split` on its own turns "a\n" into `{ "a", "" }`, which is a trailing blank
+---*line* rather than a trailing newline; writing that back out would grow the
+---content by a newline on every round trip. The final newline is returned
+---separately so it can live in 'endofline' where it belongs.
+---@param content string
+---@return string[] lines
+---@return boolean eol Whether the content ended with a newline
+---@return boolean dos Whether every line ended with CRLF
+function M.content_to_lines(content)
+  local lines = vim.split(content, "\n", { plain = true })
+  local eol = #lines > 1 and lines[#lines] == ""
+  if eol then
+    table.remove(lines)
+  end
+
+  -- Only content that *ends* with a newline can be `dos`. Without one, the final
+  -- line has no line ending for its carriage return to live in: stripping it as
+  -- part of a CRLF pair and then writing the buffer back with 'noendofline'
+  -- would drop that byte silently, turning "a\r" into "a". Left alone it is an
+  -- ordinary character, shown as ^M and written back verbatim.
+  local dos = eol and #lines > 0
+  for _, line in ipairs(lines) do
+    if line:sub(-1) ~= "\r" then
+      dos = false
+      break
+    end
+  end
+  if dos then
+    for i, line in ipairs(lines) do
+      lines[i] = line:sub(1, -2)
+    end
+  end
+
+  return lines, eol, dos
 end
 
 ---@param content string|string[]
@@ -122,13 +173,6 @@ function M.capture_context(buf)
   return context
 end
 
----@param cleanup? fun()
-function M.run_cleanup(cleanup)
-  if cleanup then
-    cleanup()
-  end
-end
-
 ---Claim a buffer for one operation at a time.
 ---@param buf integer
 ---@param operation string
@@ -155,6 +199,11 @@ function M.finish_operation(buf, operation)
 end
 
 ---Put `ansible-vault` output into a buffer, hardening first when it is plaintext.
+---
+---The buffer's 'fileformat' and 'endofline' are set from the output rather than
+---left over from whatever the file used to be, because they are the only place a
+---final newline can be recorded. A vault file stored with CRLFs would otherwise
+---put a carriage return back on every line of the plaintext written out of it.
 ---@param buf integer
 ---@param expected_changedtick integer
 ---@param output string
@@ -171,7 +220,7 @@ function M.replace_lines(buf, expected_changedtick, output, success_message)
     return false
   end
 
-  local lines = cli.output_to_lines(output)
+  local lines, eol, dos = M.content_to_lines(output)
   local becomes_plaintext = not M.is_encrypted(lines)
 
   local ok, err
@@ -180,6 +229,9 @@ function M.replace_lines(buf, expected_changedtick, output, success_message)
     -- doing it before the plaintext lands is what keeps it off disk.
     ok, err = secure.set_plaintext_lines(buf, lines)
   else
+    -- A change made while 'undolevels' is -1 discards the undo tree, so the
+    -- plaintext this content replaces is not left sitting in undo history that a
+    -- later 'undofile' write could persist.
     ok, err = secure.with_cleared_undo(buf, function()
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     end)
@@ -189,6 +241,11 @@ function M.replace_lines(buf, expected_changedtick, output, success_message)
     vim.notify("Failed to update buffer: " .. tostring(err), vim.log.levels.ERROR)
     return false
   end
+
+  pcall(function()
+    vim.bo[buf].fileformat = dos and "dos" or "unix"
+    vim.bo[buf].endofline = eol
+  end)
 
   M.remember_header(buf, lines)
   config.notify(success_message, vim.log.levels.INFO)

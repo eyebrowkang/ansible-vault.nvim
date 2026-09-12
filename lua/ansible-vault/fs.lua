@@ -66,6 +66,44 @@ function M.atomic_write(path, data)
   return true, nil
 end
 
+---Read a whole file as bytes.
+---
+---Used for the ciphertext staging file `:VaultRekey` runs the native rekey on, so
+---nothing here decodes or normalises anything: the bytes are the file.
+---@param path string
+---@return string|nil data
+---@return string|nil err
+function M.read_file(path)
+  local fd, open_err = uv.fs_open(path, "r", DEFAULT_MODE)
+  if not fd then
+    return nil, open_err or "failed to open file"
+  end
+
+  local chunks = {}
+  local offset = 0
+  while true do
+    local chunk, read_err = uv.fs_read(fd, 65536, offset)
+    if chunk == nil then
+      uv.fs_close(fd)
+      return nil, read_err or "failed to read file"
+    end
+    if chunk == "" then
+      break
+    end
+    chunks[#chunks + 1] = chunk
+    offset = offset + #chunk
+  end
+  uv.fs_close(fd)
+
+  return table.concat(chunks), nil
+end
+
+---Delete a file, ignoring a missing one.
+---@param path string
+function M.remove(path)
+  pcall(uv.fs_unlink, path)
+end
+
 ---Snapshot what a file looks like on disk, for detecting outside changes.
 ---
 ---Size and timestamps rather than a hash: the point is to notice that someone

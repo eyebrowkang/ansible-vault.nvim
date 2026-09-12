@@ -1,8 +1,8 @@
 ---The plumbing every vault operation shares.
 ---
----Resolve credentials for the target file, decide which identity to encrypt with,
----and announce completed operations. `rekey` has separate identity rules because
----`--encrypt-vault-id` can silently re-encrypt with the old password there.
+---Resolve credentials for the target file and decide which identity to encrypt
+---with. `rekey` has separate identity rules because `--encrypt-vault-id` can
+---silently re-encrypt with the old password there.
 ---
 ---Credential *policy* still lives in `credentials.lua`. This module only threads
 ---the effective configuration through to it.
@@ -14,9 +14,21 @@ local credentials = require("ansible-vault.credentials")
 ---Resolve credentials for an operation, prompting only if nothing supplies them.
 ---@param callback fun(creds: AnsibleVaultCredentials|nil)
 ---@param opts? table
----@param context? table
+---@param context? { file_path?: string, header_label?: string }
 function M.credentials(callback, opts, context)
   credentials.resolve(config.effective(opts), context or {}, callback)
+end
+
+---Credentials that encrypt with a rekey's target identity and nothing else.
+---
+---For inline rekey, which decrypts and re-encrypts as two separate runs and must
+---not let the first run's secret pool decide what the second one encrypts with.
+---Returns `nil, nil` when no rekey target was configured or named.
+---@param opts? table
+---@param context? { file_path?: string, header_label?: string }
+---@return AnsibleVaultCredentials|nil creds, string|nil err
+function M.new_credentials(opts, context)
+  return credentials.new_credentials(config.effective(opts), context or {})
 end
 
 ---Append `--encrypt-vault-id` when a specific identity must be named: because the
@@ -48,22 +60,6 @@ function M.with_encrypt_vault_id(args, opts, creds, context)
     table.insert(result, label)
   end
   return result
-end
-
----Announce a completed operation on the one `User` pattern the plugin emits.
----
----A single pattern with the operation in `data` is what a listener actually
----wants: one autocmd can act on everything, and filtering on `op`/`scope` is a
----comparison rather than a dozen registrations to keep in sync.
----@param op "encrypt"|"decrypt"|"view"|"edit"|"save"|"rekey"|"create"
----@param scope "file"|"inline"
----@param data? table
-function M.emit(op, scope, data)
-  local payload = vim.tbl_deep_extend("force", { op = op, scope = scope }, data or {})
-  pcall(vim.api.nvim_exec_autocmds, "User", {
-    pattern = "AnsibleVaultOperation",
-    data = payload,
-  })
 end
 
 return M
