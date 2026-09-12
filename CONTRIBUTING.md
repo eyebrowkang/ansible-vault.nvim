@@ -1,5 +1,9 @@
 # Contributing
 
+Before v1.0.0, there are no compatibility or migration guarantees. Document the
+current behavior, not upgrade paths; do not add compatibility aliases or migration
+guides. See the [stability policy](README.md#stability-policy-before-v100).
+
 ## Commit messages
 
 Release notes are generated from the commit history with
@@ -71,7 +75,7 @@ rules follow from that, and the tests enforce them:
   through its environment, read back by a helper script that holds no secret.
 
 If you add a code path that puts decrypted content in a buffer, add a case to
-`tests/run.lua` asserting `swapfile`, `undofile` and `buftype`, and make sure
+`tests/spec_privacy.lua` asserting `swapfile`, `undofile` and `buftype`, and make sure
 `make test-leak` still passes.
 
 ## Adding a command
@@ -81,8 +85,6 @@ Commands are declared once, in the `COMMANDS` table in
 registers whatever the table contains. Then update `README.md`,
 `README.zh-CN.md` and `doc/ansible-vault.txt`.
 
-Prefer teaching an existing verb a new scope over adding a command. Each of the
-six commands resolves its own target from the range, the buffer and the cursor,
-and that is deliberate: the previous surface had three commands per verb — one
-for a selection, one for the cursor, one for the whole file — which is three
-places to keep in sync and three names for the user to choose between.
+Prefer teaching an existing verb a new scope over adding a command. Resolve its
+target from the range, the buffer and the cursor, so one name covers both
+whole-file and inline operations.
