@@ -1,4 +1,5 @@
 local ansible_cfg = require("ansible-vault.ansible_cfg")
+local cli = require("ansible-vault.cli")
 local config_mod = require("ansible-vault.config")
 local credentials = require("ansible-vault.credentials")
 local fs = require("ansible-vault.fs")
@@ -29,31 +30,6 @@ local remember_header
 ---@type AnsibleVaultConfig
 M.config = config_mod.values
 
----Render an argv with credential values replaced.
----
----Used wherever an argv could reach the user: a vault id carries a password file
----path, and the askpass helper path is just as sensitive.
----@param argv string[]
----@return string
-local function redact_argv(argv)
-  local parts = {}
-  local redact_next = false
-  for _, arg in ipairs(argv) do
-    if redact_next then
-      table.insert(parts, "<redacted>")
-      redact_next = false
-    else
-      table.insert(parts, arg)
-      redact_next = arg:match("^%-%-vault%-password%-file$") ~= nil
-        or arg:match("^%-%-vault%-pass%-file$") ~= nil
-        or arg:match("^%-%-vault%-id$") ~= nil
-        or arg:match("^%-%-new%-vault%-password%-file$") ~= nil
-        or arg:match("^%-%-new%-vault%-id$") ~= nil
-    end
-  end
-  return table.concat(parts, " ")
-end
-
 local is_nonempty_string = config_mod.is_nonempty_string
 local effective_config = config_mod.effective
 local notify = config_mod.notify
@@ -74,68 +50,8 @@ local function emit_event(op, scope, data)
   })
 end
 
----How long to let `ansible-vault` run before giving up.
----
----Not configuration: a vault operation that takes longer than this is broken,
----not slow, and a user-facing knob only invites tuning a symptom. Tests lower it
----to keep the suite fast.
-M.timeout_ms = 30000
-
----@return integer|nil
-local function get_timeout_ms()
-  if type(M.timeout_ms) == "number" and M.timeout_ms > 0 then
-    return math.floor(M.timeout_ms)
-  end
-  return nil
-end
-
 local expand_path = credentials.expand_path
 local expand_vault_id = credentials.expand_vault_id
-
----The argv prefix that runs `ansible-vault`, honouring `ansible_vault_path`.
----
----Public because `:checkhealth` reports the executable it would actually use, and
----resolving that itself would be a second implementation that could disagree.
----@param opts? table
----@return string[]
-function M.executable_argv(opts)
-  local config = effective_config(opts)
-  local executable = "ansible-vault"
-  if is_nonempty_string(config.ansible_vault_path) then
-    executable = expand_path(config.ansible_vault_path)
-  end
-
-  return { executable }
-end
-
----@param action string
----@param args string[]
----@param target? string|false
----@param opts? table
----@return string[]
-local function build_vault_argv(action, args, target, opts)
-  local argv = M.executable_argv(opts)
-  table.insert(argv, action)
-  for _, arg in ipairs(args or {}) do
-    table.insert(argv, tostring(arg))
-  end
-  if target == nil then
-    target = "-"
-  end
-  if target ~= false then
-    table.insert(argv, tostring(target))
-  end
-  return argv
-end
-
----@param output string
----@return string[]
-local function output_to_lines(output)
-  if output == "" then
-    return { "" }
-  end
-  return vim.split(output, "\n", { plain = true })
-end
 
 ---Context describing which file an operation applies to, so credentials and the
 ---encryption label can be resolved the way Ansible would resolve them there.
@@ -229,79 +145,6 @@ has_rekey_target = function(args)
     end
   end
   return false
-end
-
----Describe a failed run without echoing the process output.
----
----`ansible-vault decrypt` can exit non-zero after having already written
----plaintext to stdout, so stdout must never end up in a message that lands in
----`:messages` or a notification backend's log.
----@param action string
----@param exit_code integer
----@param stderr string
----@return string
-local function failure_message(action, exit_code, stderr)
-  if stderr ~= "" then
-    return stderr
-  end
-  return string.format("ansible-vault %s exited with status %d", action, exit_code)
-end
-
----Spawn `ansible-vault` and hand the result to `callback`.
----
----`vim.system` enforces the timeout itself and reports exit code 124 when it
----fires, so there is no timer to arm, cancel or leak. It also merges `env` into
----the inherited environment rather than replacing it, which is what lets the
----password be passed through `ANSIBLE_VAULT_NVIM_PASSWORD` without stripping
----`PATH` from the child.
----@param action string
----@param args string[]
----@param opts table|nil
----@param creds AnsibleVaultCredentials|nil
----@param stdin string|nil Content to pipe in, or nil when operating on a file
----@param file string|nil File to operate on, or nil when piping stdin
----@param callback fun(success: boolean, output: string)
-local function spawn_vault(action, args, opts, creds, stdin, file, callback)
-  local argv = build_vault_argv(action, args or {}, file or "-", opts)
-
-  local timeout = get_timeout_ms()
-  local system_opts = {
-    cwd = creds and creds.cwd or nil,
-    env = creds and creds.env or nil,
-    timeout = timeout,
-    stdin = stdin,
-  }
-
-  -- Deliberately not `text = true`: that would normalize CRLF in the output,
-  -- rewriting the line endings of whatever was decrypted.
-  local ok, err = pcall(vim.system, argv, system_opts, function(result)
-    vim.schedule(function()
-      if result.code == 0 then
-        callback(true, result.stdout or "")
-      elseif result.code == 124 then
-        callback(false, string.format("ansible-vault %s timed out after %dms", action, timeout or 0))
-      else
-        callback(false, failure_message(action, result.code, result.stderr or ""))
-      end
-    end)
-  end)
-
-  if not ok then
-    -- `err` can quote the argv back, which carries vault ids and the askpass
-    -- helper path, so it goes through the same redaction as everything else.
-    callback(false, "Failed to start ansible-vault: " .. redact_argv({ tostring(err) }))
-  end
-end
-
----Run ansible-vault over buffer content.
----@param action string The vault action (encrypt, decrypt, encrypt_string)
----@param input string Input content
----@param args string[] Additional arguments
----@param callback fun(success: boolean, output: string): nil
----@param opts? table
----@param creds? AnsibleVaultCredentials Supplies the child cwd and environment
-local function run_vault(action, input, args, callback, opts, creds)
-  spawn_vault(action, args, opts, creds, input, nil, callback)
 end
 
 ---@param args string|nil
@@ -469,17 +312,6 @@ local function complete_operation_args(arg_lead, include_rekey, include_labels)
   end, candidates)
 end
 
----Run ansible-vault against a file path.
----@param action string
----@param file_path string
----@param args string[]
----@param callback fun(success: boolean, output: string): nil
----@param opts? table
----@param creds? AnsibleVaultCredentials
-local function run_vault_file(action, file_path, args, callback, opts, creds)
-  spawn_vault(action, args, opts, creds, nil, file_path, callback)
-end
-
 ---@param buf? integer
 ---@return integer
 local function normalize_buf(buf)
@@ -553,7 +385,7 @@ local function replace_buffer_lines(buf, expected_changedtick, output, success_m
     return false
   end
 
-  local lines = output_to_lines(output)
+  local lines = cli.output_to_lines(output)
   local becomes_plaintext = not M.is_encrypted(lines)
 
   local ok, err
@@ -584,7 +416,7 @@ local function open_output_window(output, title, filetype)
   -- Explicitly hardened rather than relying on the implicit scratch defaults;
   -- this window shows decrypted content.
   local buf = secure.create_buffer(false, true)
-  local lines = output_to_lines(output)
+  local lines = cli.output_to_lines(output)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].filetype = filetype or ""
@@ -787,7 +619,7 @@ function M.encrypt(buf, opts)
     local content = buffer_content(target)
     local args = with_encrypt_vault_id(creds.args, opts, creds, context)
 
-    run_vault("encrypt", content, args, function(success, output)
+    cli.run("encrypt", content, args, function(success, output)
       run_cleanup(creds.cleanup)
       finish_buffer_operation(target, "encrypt")
 
@@ -839,7 +671,7 @@ function M.decrypt(buf, opts)
     local tick = changedtick(target)
     local content = buffer_content(target)
 
-    run_vault("decrypt", content, creds.args, function(success, output)
+    cli.run("decrypt", content, creds.args, function(success, output)
       run_cleanup(creds.cleanup)
       finish_buffer_operation(target, "decrypt")
 
@@ -884,7 +716,7 @@ function M.view(buf, opts)
       return
     end
 
-    run_vault("decrypt", buffer_content(target), creds.args, function(success, output)
+    cli.run("decrypt", buffer_content(target), creds.args, function(success, output)
       run_cleanup(creds.cleanup)
 
       if success then
@@ -1144,7 +976,7 @@ end
 ---@param plan table
 ---@return string[]
 local function format_encrypt_string_output(output, plan)
-  local lines = output_to_lines(output)
+  local lines = cli.output_to_lines(output)
 
   -- ansible-vault terminates its output with a newline; splicing that in as-is
   -- would leave a stray blank line behind in the buffer.
@@ -1249,7 +1081,7 @@ local function encrypt_string_selection(buf, selection, opts)
     table.insert(full_args, "--stdin-name")
     table.insert(full_args, plan.name)
 
-    run_vault("encrypt_string", plan.content, full_args, function(success, output)
+    cli.run("encrypt_string", plan.content, full_args, function(success, output)
       run_cleanup(creds.cleanup)
       finish_buffer_operation(buf, "encrypt_string")
 
@@ -1421,7 +1253,7 @@ restore_inline_regions = function(buf, opts, callback)
       table.insert(args, "--stdin-name")
       table.insert(args, name or "encrypted_string")
 
-      run_vault("encrypt_string", content, args, function(success, output)
+      cli.run("encrypt_string", content, args, function(success, output)
         if not success then
           run_cleanup(creds.cleanup)
           vim.notify("Failed to re-encrypt " .. (name or "value") .. ": " .. output, vim.log.levels.ERROR)
@@ -1429,7 +1261,7 @@ restore_inline_regions = function(buf, opts, callback)
           return
         end
 
-        local out_lines = output_to_lines(output)
+        local out_lines = cli.output_to_lines(output)
         while #out_lines > 0 and out_lines[#out_lines] == "" do
           table.remove(out_lines, #out_lines)
         end
@@ -1503,7 +1335,7 @@ write_plaintext_buffer = function(buf, target_path, opts)
   -- while the encryption is still in flight. The event loop keeps running, so
   -- this waits without freezing the job that does the work.
   local function await()
-    local budget = get_timeout_ms() or 30000
+    local budget = cli.timeout_ms > 0 and cli.timeout_ms or 30000
     if not vim.wait(budget + 1000, function()
       return done
     end, 20) then
@@ -1553,7 +1385,7 @@ write_plaintext_buffer = function(buf, target_path, opts)
 
     local args = with_encrypt_vault_id(creds.args, opts, creds, context)
 
-    run_vault("encrypt", content, args, function(success, output)
+    cli.run("encrypt", content, args, function(success, output)
       run_cleanup(creds.cleanup)
 
       if not success then
@@ -1663,7 +1495,7 @@ function M.edit(buf, opts)
       return
     end
 
-    run_vault("decrypt", buffer_content(original_buf), creds.args, function(success, output)
+    cli.run("decrypt", buffer_content(original_buf), creds.args, function(success, output)
       if not success then
         run_cleanup(creds.cleanup)
         vim.notify("Decryption failed: " .. output, vim.log.levels.ERROR)
@@ -1685,7 +1517,7 @@ function M.edit(buf, opts)
       -- Harden before the decrypted lines land, not after.
       local edit_buf = secure.create_buffer(true, false)
       secure.protect(edit_buf)
-      local decrypted_lines = output_to_lines(output)
+      local decrypted_lines = cli.output_to_lines(output)
       secure.with_cleared_undo(edit_buf, function()
         vim.api.nvim_buf_set_lines(edit_buf, 0, -1, false, decrypted_lines)
       end)
@@ -1749,7 +1581,7 @@ function M.edit(buf, opts)
           -- 'modified' stays set until the write actually lands. Clearing it up
           -- front would let `:q` wipe the buffer, and its plaintext, while the
           -- encryption is still in flight.
-          run_vault("encrypt", edit_content, encrypt_args, function(enc_success, enc_output)
+          cli.run("encrypt", edit_content, encrypt_args, function(enc_success, enc_output)
             if not enc_success then
               if is_valid_buf(cur_buf) then
                 vim.b[cur_buf].vault_write_pending = false
@@ -1851,7 +1683,7 @@ function M.rekey(opts)
       return
     end
 
-    run_vault_file("rekey", file_path, rekey_args, function(success, output)
+    cli.run_file("rekey", file_path, rekey_args, function(success, output)
       run_cleanup(creds.cleanup)
       finish_buffer_operation(target, "rekey")
 
@@ -1880,14 +1712,13 @@ parse_vault_from_yaml = function(content)
   return yaml.parse_block(content)
 end
 
-local needs_yaml_quoting = yaml.needs_quoting
 local yaml_quote_value = yaml.quote_value
 
 ---@param output string
 ---@param parsed table
 ---@return string[]
 local function format_decrypt_string_output(output, parsed)
-  local lines = output_to_lines(output)
+  local lines = cli.output_to_lines(output)
   while #lines > 0 and lines[#lines] == "" do
     table.remove(lines, #lines)
   end
@@ -1962,7 +1793,7 @@ local function decrypt_string_selection(target, selection, mode, opts)
       return
     end
 
-    run_vault("decrypt", parsed.vault_content, creds.args, function(success, output)
+    cli.run("decrypt", parsed.vault_content, creds.args, function(success, output)
       run_cleanup(creds.cleanup)
       if mode == "replace" then
         finish_buffer_operation(target, "decrypt_string")
@@ -2322,18 +2153,5 @@ function M.setup(opts)
     end,
   })
 end
-
-M._private = {
-  build_vault_argv = build_vault_argv,
-  expand_vault_id = expand_vault_id,
-  parse_vault_from_yaml = parse_vault_from_yaml,
-  output_to_lines = output_to_lines,
-  complete_operation_args = complete_operation_args,
-  complete_create_args = complete_create_args,
-  needs_yaml_quoting = needs_yaml_quoting,
-  yaml_quote_value = yaml_quote_value,
-  redact_argv = redact_argv,
-  effective_config = effective_config,
-}
 
 return M
