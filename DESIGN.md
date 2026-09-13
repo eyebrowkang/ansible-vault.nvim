@@ -79,6 +79,23 @@ the first priority forbids outright.
 Both lifecycles are first class. A change that works for whole files but not
 for inline values, or the reverse, is half a change.
 
+### Argument completion reads, it never resolves
+
+Completing a vault id label means reading the labels a project has already
+named: the header on the buffer's own ciphertext, `setup()`, and Ansible's own
+configuration. The v0.2.0 cut-down dropped this and it is deliberately back —
+an `--encrypt-vault-id` typo is silent, because Ansible picks some other
+identity and still exits 0.
+
+What completion must never do is *resolve*: no child process, no password, no
+prompt, nothing that reaches a secret. It runs on a keystroke, and a label is a
+name the user already wrote down somewhere. The same rule is why the source
+half of a `label@source` completes as a plain file path and nothing checks
+whether that file opens anything.
+
+Suggestions are not a vocabulary. A label nobody has used yet completes to
+nothing and is still valid to type.
+
 ### Declined before v1.0.0
 
 Decisions, not gaps. An absent feature leaves no trace in the code, so they

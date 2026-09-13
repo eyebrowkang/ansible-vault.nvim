@@ -234,8 +234,9 @@ line. Disable that setting if you want to use a file instead.
 
 `<Tab>` completes arguments from what precedes the cursor: the flags a command
 still accepts, file names for `--vault-password-file` and
-`--new-vault-password-file`, and the source after the `label@` of a vault ID.
-Completed paths are escaped, so a name with a space stays one argument.
+`--new-vault-password-file`, and both halves of a vault ID — the labels this
+project already uses, then the source after the `@`. Completed paths are
+escaped, so a name with a space stays one argument.
 
 For the six supported argument types, quoting, label selection and full
 precedence details, see `:help ansible-vault-command-args` and

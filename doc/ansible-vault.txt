@@ -305,12 +305,19 @@ Completion follows the argument in front of the cursor:
     --vault-password-file, --new-vault-password-file
                         file names
     --vault-id, --new-vault-id
-                        after `label@`, a file name or a prompt source;
-                        the label itself is yours to name
+                        a known label with `@` attached; after the `@`,
+                        a file name or a prompt source
+    --encrypt-vault-id  a known label
     Create's filename   file names, until the one it takes has been given
 
+A known label is one this project has already named: the vault id label on the
+current buffer's own ciphertext first, then the labels in `vault_ids` and
+`encrypt_vault_id`, then those in Ansible's `vault_identity_list` and
+`vault_encrypt_identity`. They are suggestions only — a label nobody has
+written down yet completes to nothing and can still be typed.
+
 Completed paths are backslash-escaped, so a name with a space in it stays one
-argument. `--encrypt-vault-id` takes a vault label and completes to nothing.
+argument.
 
                                                 *ansible-vault-keymaps*
 KEYMAPS

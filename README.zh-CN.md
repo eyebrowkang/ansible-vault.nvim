@@ -213,7 +213,8 @@ vault ID，包括命令行指定的凭据。如果希望改用文件，请关闭
 
 `<Tab>` 会根据光标前的内容补全参数：该命令还能接受的选项、
 `--vault-password-file` 和 `--new-vault-password-file` 的文件名，以及 vault ID
-中 `label@` 之后的来源。补全出的路径会转义，含空格的名字仍是一个参数。
+的两部分——本项目已经用过的 label，和 `@` 之后的来源。补全出的路径会转义，含空格
+的名字仍是一个参数。
 
 六类命令参数、引号用法、标签选择和完整优先级，见
 `:help ansible-vault-command-args` 与 `:help ansible-vault-passwords`。
