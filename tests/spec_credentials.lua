@@ -146,11 +146,15 @@ return function(H, tests)
   ---The cursor's own token decides nothing; the argument in front of it does.
   tests["completion reads the flag in front of the cursor, not the whole line"] = function()
     completion_dir()
-    local offered = complete("VaultEncrypt --vault-password-file vault-pass --vault-id x@/y --")
-    eq(offered, { "--ask-vault-password", "--encrypt-vault-id", "--vault-id", "--vault-password-file" })
+    -- A flag and its value are both behind the cursor, so what comes next is a
+    -- flag position again rather than a second value.
+    for _, candidate in ipairs(complete("VaultEncrypt --vault-password-file vault-pass ")) do
+      yes(vim.startswith(candidate, "--"), "after a complete flag/value pair, a flag is next: " .. candidate)
+    end
+    -- And a flag that takes no value must not swallow the next one's turn.
     yes(
-      vim.tbl_contains(complete("VaultEncrypt --ask-vault-password --vault-password-file "), "vault-pass"),
-      "a flag with no value of its own must not swallow the next one's completion"
+      vim.tbl_contains(complete("VaultRekey --ask-vault-password --new-vault-password-file "), "vault-pass"),
+      "a valueless flag must not leave the following flag waiting for a value"
     )
   end
 
@@ -171,6 +175,40 @@ return function(H, tests)
       eq(complete(flag .. " prod@vault-p"), { "prod@vault-pass" })
       eq(complete(flag .. " prod@pro"), { "prod@prompt", "prod@prompt_ask_vault_pass" })
     end
+  end
+
+  ---Completion and the parser read one table of conflicts, so a flag offered
+  ---here is never one the command then refuses.
+  tests["completion drops the flags an argument already given rules out"] = function()
+    completion_dir()
+    eq(
+      complete("VaultEncrypt --ask-vault-password --"),
+      { "--encrypt-vault-id" },
+      "an interactive ask replaces the credentials, so neither may be offered beside it"
+    )
+    eq(
+      complete("VaultEncrypt --vault-password-file vault-pass --"),
+      { "--encrypt-vault-id", "--vault-id", "--vault-password-file" },
+      "asking is what conflicts; several files and ids are one identity list"
+    )
+    -- Rekey's two new-credential flags rule each other out, and neither repeats,
+    -- so naming one leaves nothing in that family to offer.
+    eq(complete("VaultRekey --new-vault-id prod@vault-pass --new-"), {})
+    eq(complete("VaultRekey --new-vault-password-file vault-pass --new-"), {})
+  end
+
+  tests["completion offers a single-value flag once and a list flag again"] = function()
+    completion_dir()
+    eq(
+      complete("VaultEncrypt --encrypt-vault-id prod --"),
+      { "--ask-vault-password", "--vault-id", "--vault-password-file" },
+      "a second --encrypt-vault-id would only replace the first"
+    )
+    yes(
+      vim.tbl_contains(complete("VaultEncrypt --vault-id a@vault-pass --"), "--vault-id"),
+      "identities accumulate, so that flag stays on offer"
+    )
+    yes(vim.tbl_contains(complete("VaultEncrypt --vault-password-file vault-pass --"), "--vault-password-file"))
   end
 
   tests["completion leaves the vault id label to the user"] = function()
