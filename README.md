@@ -60,6 +60,12 @@ or an extra confirmation.
 | `:VaultEdit` | Separate protected buffer; a successful `:w` encrypts to the original file, disposes it, and returns to refreshed ciphertext | Separate protected buffer; a successful `:w` encrypts back into the source buffer **only**, disposes it, and returns there |
 | `:VaultRekey` | Change credentials and save new ciphertext to the file | Change credentials for one block; then save the source YAML |
 
+Create and Edit buffers are **unlisted**: they are named `ansible-vault://…` and
+would otherwise show up beside the file they came from under the same name. They
+live in their window until the save that ends the session. If you navigate a
+window away from one with unsaved changes, `<C-^>` goes back to it, and `:ls!`
+lists it.
+
 Create and whole-file Edit save to a **fixed target**. They do not allow
 `:w other-file` or `:saveas` to choose a different file. Inline Edit opens the
 value in a split and never saves the source file: its successful protected save

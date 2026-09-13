@@ -196,6 +196,10 @@ and Rekey. Other YAML entries are left unchanged.
     this protected editing session; run |:VaultEdit| again for another
     plaintext edit.
 
+    The editing buffer is named `ansible-vault://{file}` and is not listed,
+    so it does not appear beside that file under the same name. See
+    |ansible-vault-session-buffers| for getting back to an unsaved one.
+
     Whole file:
         Requires an encrypted, file-backed buffer with no unsaved changes.
         `:write` encrypts and saves to the original file, disposes the
@@ -502,6 +506,20 @@ path, under a `ansible-vault://` buffer name nothing ever writes, and those
 events would offer the decrypted buffer to every formatter and linter
 listening for them. A `:write {other-file}` plaintext copy does not announce
 itself either, because it does not save the buffer.
+
+SESSION BUFFERS                          *ansible-vault-session-buffers*
+
+|:VaultCreate| and |:VaultEdit| open an unlisted buffer named
+`ansible-vault://{file}`, or `ansible-vault://{file}#{value}` for one inline
+value. Unlisted because that name ends in the file name it came from: listed,
+it would sit beside that file under the same name in anything showing only the
+last path component.
+
+The buffer exists for one edit and is disposed by the save that ends the
+session, so it is not part of the buffer list. It is still reachable while it
+holds unsaved changes: `<C-^>` returns to it from the window that left it,
+`:ls!` lists it, and `:buffer {full-name}` selects it. `:buffer` completion
+does not offer unlisted names.
 
 PERSISTENT UNDO
 
