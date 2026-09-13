@@ -803,6 +803,123 @@ check("a named identity outranks an ansible.cfg entry with the same label", func
   end, "content encrypted with the ansible.cfg identity must still decrypt")
 end)
 
+--- Identities that ask for a password --------------------------------------
+
+---Answer the plugin's password prompt for the duration of `fn`.
+---
+---Restored however `fn` ends: a leaked `inputsecret` would silently answer for
+---every later check. `answers` is keyed by a fragment of the question, so each
+---identity can be given its own password.
+---@param answers table<string, string>
+---@param fn fun(asked: string[])
+local function with_answers(answers, fn)
+  local original = vim.fn.inputsecret
+  local asked = {}
+  vim.fn.inputsecret = function(question)
+    question = tostring(question)
+    table.insert(asked, question)
+    for fragment, value in pairs(answers) do
+      if question:find(fragment, 1, true) then
+        return value
+      end
+    end
+    fail("unexpected password prompt: " .. question)
+  end
+  local ok, err = pcall(fn, asked)
+  vim.fn.inputsecret = original
+  if not ok then
+    error(err, 0)
+  end
+end
+
+---`prompt` makes `ansible-vault` collect the password itself, from a terminal
+---this child does not have — and its stdin is already carrying the content. So
+---the literal source cannot work here: the plugin has to ask in Neovim and hand
+---the answer over the way it hands over any other typed password.
+check("a vault id that asks is answered in Neovim", function()
+  local dir = temp_dir()
+  local pass = password_file(dir, "prod-pass", "typed-prod")
+  local path = make_vault_file(dir, "asked.yml", "token: asked\n", "prod", pass)
+
+  reset({})
+  local buf = open_file(path)
+  with_answers({ prod = "typed-prod" }, function(asked)
+    vim.cmd("VaultDecrypt --vault-id prod@prompt")
+    wait_until(function()
+      return lines(buf)[1] == "token: asked"
+    end, "an asking vault id must decrypt without a controlling terminal")
+    assert_eq(#asked, 1, "the plugin asks, exactly once")
+    assert_true(asked[1]:find("prod", 1, true) ~= nil, "the question must name the identity: " .. asked[1])
+
+    vim.cmd("VaultEncrypt --vault-id prod@prompt")
+    wait_until(function()
+      return (lines(buf)[1] or ""):match("^%$ANSIBLE_VAULT") ~= nil
+    end, "an asking vault id must encrypt too")
+    assert_eq(#asked, 2, "each operation asks again; the password is not cached")
+  end)
+  vim.cmd("silent write")
+
+  assert_eq(read_file(path):match("^[^\n]*"), "$ANSIBLE_VAULT;1.2;AES256;prod", "the identity's label must be written")
+  local ok, plaintext = opens_with(pass, path)
+  assert_true(ok, "the typed password must be the one the file ended up under")
+  assert_eq(plaintext, "token: asked\n")
+end)
+
+---An asking entry in the project's own `vault_identity_list` is inherited, not
+---named by the plugin, and it reaches the child through the identity list rather
+---than through a flag.
+check("an asking identity inherited from ansible.cfg is answered too", function()
+  local dir = temp_dir()
+  vim.fn.mkdir(dir .. "/group_vars/prod", "p")
+  local pass = password_file(dir, "cfg-pass", "typed-cfg")
+  write_file(dir .. "/ansible.cfg", "[defaults]\nvault_identity_list = prod@prompt\n")
+
+  reset({})
+  local path = dir .. "/group_vars/prod/vault.yml"
+  write_file(path, "db_password: fromprompt\n")
+  local buf = open_file(path)
+  with_answers({ prod = "typed-cfg" }, function(asked)
+    vim.cmd("VaultEncrypt")
+    wait_until(function()
+      return (lines(buf)[1] or ""):match("^%$ANSIBLE_VAULT") ~= nil
+    end, "an inherited asking identity must be answered by the plugin")
+    assert_eq(#asked, 1)
+  end)
+  vim.cmd("silent write")
+
+  assert_eq(read_file(path):match("^[^\n]*"), "$ANSIBLE_VAULT;1.2;AES256;prod", "the inherited label must be kept")
+  local ok, plaintext = opens_with(pass, path)
+  assert_true(ok, "the typed password must be the one the file ended up under")
+  assert_eq(plaintext, "db_password: fromprompt\n")
+end)
+
+---Two identities that both ask are two separate passwords. Handing one label's
+---answer to the other would seal the file with a password the user chose for
+---something else — exit 0, expected header, wrong key.
+check("each asking identity keeps its own password", function()
+  local dir = temp_dir()
+  local prod = password_file(dir, "prod-pass", "prod-secret")
+  local dev = password_file(dir, "dev-pass", "dev-secret")
+
+  reset({ vault_ids = { "prod@prompt", "dev@prompt" }, encrypt_vault_id = "dev" })
+  local path = dir .. "/two.yml"
+  write_file(path, "chosen: dev\n")
+  local buf = open_file(path)
+  with_answers({ prod = "prod-secret", dev = "dev-secret" }, function(asked)
+    vim.cmd("VaultEncrypt")
+    wait_until(function()
+      return (lines(buf)[1] or ""):match("^%$ANSIBLE_VAULT") ~= nil
+    end, "two asking identities must both be answered")
+    assert_eq(#asked, 2, "each identity is asked for in its own right")
+  end)
+  vim.cmd("silent write")
+
+  local ok, plaintext = opens_with(dev, path)
+  assert_true(ok, "the file must be sealed with the answer given for the named label")
+  assert_eq(plaintext, "chosen: dev\n")
+  assert_true(not select(1, opens_with(prod, path)), "the other label's answer must NOT be what it ended up under")
+end)
+
 --- Report ----------------------------------------------------------------
 
 if failures > 0 then

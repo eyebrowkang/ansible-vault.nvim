@@ -179,7 +179,10 @@ require("ansible-vault").setup({
 ```
 
 Both `password_files` and `vault_ids` accept a string or a list. If both are set,
-`password_files` takes precedence. Executable password scripts are supported.
+`password_files` takes precedence. Executable password scripts are supported. A
+vault ID whose source is `prompt` or `prompt_ask_vault_pass`, including one
+inherited from your Ansible configuration, is asked for in Neovim: once per
+operation, separately per identity, never cached.
 
 These are the four available settings, all optional:
 

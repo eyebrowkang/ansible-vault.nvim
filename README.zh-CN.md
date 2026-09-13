@@ -167,7 +167,9 @@ require("ansible-vault").setup({
 ```
 
 `password_files` 和 `vault_ids` 都接受字符串或列表。同时设置时，
-`password_files` 优先。也支持可执行的密码脚本。
+`password_files` 优先。也支持可执行的密码脚本。源为 `prompt` 或
+`prompt_ask_vault_pass` 的 vault ID（包括从 Ansible 配置继承的）会在 Neovim 中
+提示输入：每次操作重新提示，每个身份分别提示，不缓存。
 
 可用配置共四项，均可省略：
 

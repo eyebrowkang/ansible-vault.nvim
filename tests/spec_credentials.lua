@@ -156,6 +156,149 @@ return function(H, tests)
     eq(H.calls(fake), 0)
   end
 
+  --- Identities that ask for a password ------------------------------------
+
+  ---`ansible-vault` collects a `prompt` source itself, from a terminal the child
+  ---does not have — and its stdin is already carrying the content, so the literal
+  ---source either makes the child read that content as the password or wait for a
+  ---terminal that never arrives. The plugin has to ask in Neovim instead.
+  tests["a vault id that asks is answered in Neovim, not by the child"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake, { password_files = false })
+    local asked = {}
+    H.patch(vim.fn, "inputsecret", function(question)
+      table.insert(asked, tostring(question))
+      return "typed-prod"
+    end)
+
+    local buf = H.new_buffer({ "plain: value" })
+    vim.cmd("VaultEncrypt --vault-id prod@prompt")
+    H.wait_until(function()
+      return H.encrypted(buf)
+    end, "an asking vault id must work without a controlling terminal")
+
+    eq(#asked, 1, "the plugin asks, exactly once")
+    yes(asked[1]:find("prod", 1, true) ~= nil, "the question must name the identity: " .. asked[1])
+    no(H.log_has_line(fake.log, "ARG:prod@prompt"), "the child must never be handed the literal prompt source")
+    yes(H.log_has_line(fake.log, "ENVPW:set"), "the answer travels in the environment")
+    eq(H.lines(buf)[1], "$ANSIBLE_VAULT;1.2;AES256;prod", "the identity's own label must be the one written")
+
+    -- Per operation, like every other typed password.
+    vim.cmd("VaultDecrypt --vault-id prod@prompt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "plain: value"
+    end, "the same identity must open what it sealed")
+    eq(#asked, 2, "each operation must ask again rather than cache the password")
+  end
+
+  tests["two asking identities never share one password"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake, {
+      password_files = false,
+      vault_ids = { "prod@prompt", "dev@prompt_ask_vault_pass" },
+      encrypt_vault_id = "dev",
+    })
+    local asked = {}
+    H.patch(vim.fn, "inputsecret", function(question)
+      local label = tostring(question):find("prod", 1, true) and "prod" or "dev"
+      table.insert(asked, label)
+      return label .. "-secret"
+    end)
+
+    local buf = H.new_buffer({ "plain: value" })
+    vim.cmd("VaultEncrypt")
+    H.wait_until(function()
+      return H.encrypted(buf)
+    end, "both spellings of an asking source must be answered")
+    eq(asked, { "prod", "dev" }, "each identity is asked for in its own right, in the order it was given")
+    eq(H.lines(buf)[1], "$ANSIBLE_VAULT;1.2;AES256;dev", "the named identity is the one encrypted with")
+
+    -- Which password it really ended up under: if one answer stood in for the
+    -- other, this file is sealed with prod's and does not open.
+    local dev_pass = H.make_password_file(fake.dir, "dev-secret", "dev verify")
+    vim.cmd("VaultDecrypt --vault-password-file " .. vim.fn.fnameescape(dev_pass))
+    H.wait_until(function()
+      return H.lines(buf)[1] == "plain: value"
+    end, "the file must be sealed with the answer given for its own label")
+  end
+
+  tests["an asking identity inherited from ansible.cfg is answered too"] = function()
+    local fake = H.create_fake_vault()
+    local root = H.make_project({ "[defaults]", "vault_identity_list = prod@prompt, backup@.vault_pass" })
+    H.reset_config(fake, { password_files = false })
+    local asked = 0
+    H.patch(vim.fn, "inputsecret", function()
+      asked = asked + 1
+      return "cfg-typed"
+    end)
+
+    local creds = H.resolve_credentials(nil, { file_path = root .. "/group_vars/prod/vault.yml" })
+    yes(creds ~= nil, "resolution should succeed")
+    eq(asked, 1, "only the entry that asks is asked about")
+    local list = creds.env.ANSIBLE_VAULT_IDENTITY_LIST
+    yes(list ~= nil, "the child's identity list must be replaced, or its entry asks on a pipe")
+    no(list:find("prompt", 1, true) ~= nil, "no source handed to Ansible may ask for itself: " .. list)
+    yes(list:match("^prod@/") ~= nil, "the label must survive the substitution: " .. list)
+    yes(
+      list:find("," .. "backup@" .. root .. "/.vault_pass", 1, true) ~= nil,
+      "the entries that do not ask must be kept, in order: " .. list
+    )
+    eq(creds.args, {}, "answering a configured entry must not add credential flags of its own")
+  end
+
+  tests["an asking entry is answered alongside an explicit password file"] = function()
+    local fake = H.create_fake_vault()
+    local root = H.make_project({ "[defaults]", "vault_identity_list = prod@prompt" })
+    local mine = H.make_password_file(fake.dir, "my-secret", "mine")
+    H.reset_config(fake, { password_files = mine })
+    H.patch(vim.fn, "inputsecret", function()
+      return "cfg-typed"
+    end)
+
+    local creds = H.resolve_credentials(nil, { file_path = root .. "/group_vars/prod/vault.yml" })
+    local list = creds.env.ANSIBLE_VAULT_IDENTITY_LIST
+    yes(list ~= nil, "the configured entry must still be reachable")
+    yes(list:match("^default@" .. vim.pesc(mine) .. ",prod@/") ~= nil, "ours first, theirs answered and kept: " .. list)
+  end
+
+  tests["cancelling an asking vault id runs nothing"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake, { password_files = false, vault_ids = { "prod@prompt" } })
+    H.patch(vim.fn, "inputsecret", function()
+      return ""
+    end)
+    local buf = H.new_buffer({ "plain: value" })
+    local before = H.lines(buf)
+    H.command_fails("VaultEncrypt")
+    yes(H.notification_contains("Password is required"))
+    eq(H.lines(buf), before, "a cancelled prompt must not touch the buffer")
+    eq(H.calls(fake), 0, "nor start the child")
+  end
+
+  tests["an asking vault id fails closed when the helper cannot be installed"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake, { password_files = false, vault_ids = { "prod@prompt" } })
+    local helper, helper_dir = H.askpass_path()
+    -- Installed helpers are cached, so the fail-closed path is only reached
+    -- again once the script is gone.
+    vim.fn.delete(helper)
+    local stdpath = vim.fn.stdpath
+    H.patch(vim.fn, "stdpath", function(what)
+      return what == "run" and "" or stdpath(what)
+    end)
+    local typed = "NEVER-ON-DISK-3c1a"
+    H.patch(vim.fn, "inputsecret", function()
+      return typed
+    end)
+
+    local buf = H.new_buffer({ "plain: value" })
+    H.command_fails("VaultEncrypt")
+    yes(H.notification_contains("without writing it to disk"), H.notification_text())
+    no(H.encrypted(buf), "nothing may be encrypted with a password that could not be passed safely")
+    eq(H.calls(fake), 0, "the child must not be started at all")
+    eq(H.grep_under(helper_dir, typed), {}, "no password file fallback may be written")
+  end
+
   tests["a command vault-id replaces both configured lists"] = function()
     local fake = H.create_fake_vault()
     local dev = H.make_password_file(fake.dir, "secret", "dev pass")

@@ -816,6 +816,48 @@ return function(H, tests)
     no(H.read_file(helper):find(typed, 1, true) ~= nil, "the helper script must contain no secret")
   end
 
+  ---An identity whose source asks (`prod@prompt`) is answered in Neovim, so its
+  ---answer is a typed password like any other and must stay out of everything a
+  ---typed password stays out of — for every identity that asked, not just the
+  ---first one.
+  tests["passwords typed for asking identities stay out of argv, messages and helpers"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake, {
+      password_files = false,
+      vault_ids = { "prod@prompt", "dev@prompt" },
+      encrypt_vault_id = "prod",
+    })
+    local typed = { prod = "PROD-TYPED-11ac", dev = "DEV-TYPED-22bd" }
+    H.patch(vim.fn, "inputsecret", function(question)
+      return tostring(question):find("prod", 1, true) and typed.prod or typed.dev
+    end)
+
+    local buf = H.new_buffer({ "api_key: value" })
+    vim.cmd("VaultEncrypt")
+    H.wait_until(function()
+      return H.encrypted(buf)
+    end)
+
+    local _, helper_dir = H.askpass_path()
+    local helpers = {}
+    for _, line in ipairs(H.log_lines(fake.log)) do
+      local source = line:match("^ARG:[^@]+@(/.+)$")
+      if source and source:find("askpass", 1, true) then
+        helpers[source] = true
+      end
+      for _, secret in pairs(typed) do
+        no(line:find(secret, 1, true) ~= nil, "a password must never appear in argv: " .. line)
+      end
+    end
+
+    -- One helper per identity: sharing one would mean sharing one password.
+    eq(vim.tbl_count(helpers), 2, "each asking identity needs its own helper script")
+    for _, secret in pairs(typed) do
+      eq(H.grep_under(helper_dir, secret), {}, "no helper script may hold a password")
+      no(H.notification_text():find(secret, 1, true) ~= nil, "nor may a message")
+    end
+  end
+
   tests["a typed password is never reused by the next operation"] = function()
     local fake = H.create_fake_vault()
     H.reset_config(fake, { password_files = false })
