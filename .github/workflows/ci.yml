@@ -17,7 +17,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           version: latest
-          args: --check .
+          args: --version
 
       - name: Install Lua and Luarocks
         uses: leafo/gh-actions-lua@v10
@@ -30,8 +30,8 @@ jobs:
       - name: Install luacheck
         run: luarocks install luacheck
 
-      - name: Run luacheck
-        run: luacheck lua/ plugin/ tests/
+      - name: Run lint
+        run: make lint
 
   test:
     needs: lint
@@ -53,7 +53,7 @@ jobs:
           neovim: true
           version: ${{ matrix.neovim_version }}
 
-      - name: Run unit tests
+      - name: Run command tests
         run: make test
 
   test-real:
