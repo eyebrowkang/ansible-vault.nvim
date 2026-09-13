@@ -30,29 +30,16 @@ vim.o.swapfile = false
 --- Harness -----------------------------------------------------------------
 
 local failures, ran = 0, 0
+local notifications = {}
 
 local function fail(message)
   error(message, 2)
 end
 
-local function assert_eq(actual, expected, message)
-  if not vim.deep_equal(actual, expected) then
-    fail(
-      string.format(
-        "%s\nexpected: %s\nactual:   %s",
-        message or "values are not equal",
-        vim.inspect(expected),
-        vim.inspect(actual)
-      )
-    )
-  end
-end
-
-local function assert_true(value, message)
-  if not value then
-    fail(message or "expected value to be truthy")
-  end
-end
+local S = dofile(vim.fn.getcwd() .. "/tests/support.lua")
+local assert_eq, assert_true = S.assert_eq, S.assert_true
+local write_file, read_file, temp_dir = S.write_file, S.read_file, S.temp_dir
+local lines, open_file = S.lines, S.open_file
 
 local function wait_until(predicate, message)
   if not vim.wait(20000, predicate, 20) then
@@ -60,34 +47,11 @@ local function wait_until(predicate, message)
   end
 end
 
-local function write_file(path, contents)
-  local file = assert(io.open(path, "wb"))
-  assert(file:write(contents))
-  assert(file:close())
-end
-
-local function read_file(path)
-  local file = assert(io.open(path, "rb"))
-  local contents = file:read("*a")
-  assert(file:close())
-  return contents
-end
-
-local function temp_dir()
-  local dir = vim.fn.tempname()
-  vim.fn.mkdir(dir, "p")
-  return dir
-end
-
 local function password_file(dir, name, value)
   local path = dir .. "/" .. name
   write_file(path, value .. "\n")
   vim.fn.setfperm(path, "rw-------")
   return path
-end
-
-local function lines(buf)
-  return vim.api.nvim_buf_get_lines(buf or 0, 0, -1, false)
 end
 
 ---Run the real binary directly. This is the independent oracle: nothing the
@@ -165,7 +129,13 @@ local function check(name, fn)
     end
   end
 
+  local notify = vim.notify
+  notifications = {}
+  vim.notify = function(message, level)
+    table.insert(notifications, { message = tostring(message), level = level })
+  end
   local ok, err = xpcall(fn, debug.traceback)
+  vim.notify = notify
 
   fresh_buffers()
   for key in pairs(vim.fn.environ()) do
@@ -182,11 +152,6 @@ local function check(name, fn)
     io.stderr:write("FAILED ", name, "\n", tostring(err), "\n")
     io.stderr:flush()
   end
-end
-
-local function open_file(path)
-  vim.cmd("silent edit " .. vim.fn.fnameescape(path))
-  return vim.api.nvim_get_current_buf()
 end
 
 --- Whole-file lifecycle ----------------------------------------------------
@@ -407,12 +372,27 @@ check("an empty inline value is refused without changing the buffer", function()
   vim.api.nvim_set_current_buf(buf)
   local input = { 'password: ""', "other: keep" }
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, input)
-  pcall(vim.cmd, "1VaultEncrypt")
-  -- Give the child time to come back and be rejected.
-  vim.wait(15000, function()
-    return table.concat(lines(buf), "\n"):find("!vault", 1, true) ~= nil
-  end, 50)
+  vim.bo[buf].modified = false
+  vim.cmd("1VaultEncrypt")
+  wait_until(function()
+    for _, item in ipairs(notifications) do
+      if item.level == vim.log.levels.ERROR and item.message:find("Encryption failed", 1, true) then
+        return true
+      end
+    end
+    return false
+  end, "empty inline encryption must finish with an error notification")
   assert_eq(lines(buf), input, "a refused encryption must leave the selection alone")
+  assert_true(not vim.bo[buf].modified, "a refused encryption must not mark the buffer modified")
+
+  -- A successful retry proves the failed child completed and released the buffer.
+  vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "password: retry" })
+  vim.cmd("1VaultEncrypt")
+  wait_until(function()
+    return lines(buf)[1] == "password: !vault |"
+  end, "the buffer must accept another operation after the failure")
+  assert_eq(decrypt_inline(buf, pass, dir), "retry")
+  assert_eq(lines(buf)[#lines(buf)], "other: keep")
 end)
 
 check("inline Decrypt then range Encrypt round trips through real Ansible", function()

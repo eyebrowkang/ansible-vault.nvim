@@ -238,18 +238,42 @@ return function(H, tests)
     eq(H.calls(fake, "encrypt_string"), 0, "there is nowhere to put the result, so nothing should run")
   end
 
-  tests["inline Edit refuses to write back while another operation holds the source"] = function()
-    local _, source, scratch, _, input = inline_edit_fixture()
+  tests["inline Edit refuses a busy source and can save once it is free again"] = function()
+    local fake, source, scratch, path, input = inline_edit_fixture()
+    local disk = H.read_file(path)
     vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "new" })
-    vim.b[source].ansible_vault_pending = "decrypt"
+
+    -- Start a second operation on the same value from the source buffer. It is
+    -- slow and fails, so the source is still untouched when it releases.
+    vim.env.FAKE_VAULT_FAIL = "no decryption for you"
+    slow(0.4, "decrypt")
+    vim.api.nvim_set_current_buf(source)
+    vim.api.nvim_win_set_cursor(0, { 3, 0 })
+    vim.cmd("VaultDecrypt")
+    vim.api.nvim_set_current_buf(scratch)
+
     local message = H.write_fails()
     yes(message:find("another vault operation", 1, true), message)
     eq(H.lines(source), input)
-    vim.b[source].ansible_vault_pending = nil
-    -- The lock must have been left as it was found, so a retry works.
+    eq(H.read_file(path), disk)
+    yes(vim.bo[scratch].modified)
+    eq(H.calls(fake, "encrypt_string"), 0, "a busy source must not start a write")
+
+    H.wait_until(function()
+      return H.notification_contains("Decryption failed")
+    end, "the other operation must finish and report")
+    vim.env.FAKE_VAULT_FAIL = nil
+    vim.env.FAKE_VAULT_SLEEP = nil
+
+    -- The refusal left the source as it was found, so the edit can still be saved.
     vim.cmd("silent write")
+    no(vim.bo[scratch].modified)
+    no(vim.deep_equal(H.lines(source), input), "the retry must actually replace the block")
     yes(H.text(source):find("password: !vault |", 1, true) ~= nil)
-    eq(vim.b[source].ansible_vault_pending, nil, "the lock must be released after the write")
+    eq(H.lines(source)[1], "before: keep", "only the block may be replaced")
+    eq(H.read_file(path), disk, "an inline save still does not save the source file")
+    vim.cmd("silent write")
+    eq(H.calls(fake, "encrypt_string"), 2, "a following save must work too")
   end
 
   tests["a source destroyed while the child runs cannot be written back to"] = function()
