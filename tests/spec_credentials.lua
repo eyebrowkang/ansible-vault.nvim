@@ -239,10 +239,53 @@ return function(H, tests)
     no(H.log_contains(fake.log, "ARG:--vault-password-file"), "no credential flag should be added")
     no(H.log_contains(fake.log, "ARG:--vault-id"), "no credential flag should be added")
     yes(H.log_has_line(fake.log, "CWD:" .. root), "the child must run where the config was found")
+    yes(
+      H.log_has_line(fake.log, "ENV:ANSIBLE_CONFIG=" .. root .. "/ansible.cfg"),
+      "the child reads the config we found"
+    )
 
     local described = credentials.describe(config.values, { file_path = root .. "/group_vars/prod/vault.yml" })
     eq(described.cfg_path, root .. "/ansible.cfg")
     eq(described.source, "ansible.cfg")
+  end
+
+  tests["a project .ansible.cfg supplies credentials to the child too"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake, { password_files = false })
+    local root = H.make_project({ "[defaults]", "vault_password_file = .vault_pass" }, ".ansible.cfg")
+    local buf = H.new_file_buffer(root .. "/group_vars/prod", "vault.yml", { "plain: value" })
+
+    vim.cmd("VaultEncrypt")
+    H.wait_until(function()
+      return H.encrypted(buf)
+    end, "a project .ansible.cfg must be enough to encrypt with, as the health report claims")
+    -- Ansible reads `ansible.cfg` from its working directory but `.ansible.cfg`
+    -- only from $HOME, so running the child in the right directory is not enough.
+    yes(H.log_has_line(fake.log, "ENV:ANSIBLE_CONFIG=" .. root .. "/.ansible.cfg"), "the child must be told the path")
+    eq(vim.env.ANSIBLE_CONFIG, nil, "naming it for the child must not change this process's environment")
+  end
+
+  tests["a relative ANSIBLE_CONFIG is settled before the child changes directory"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake, { password_files = false })
+    local root = H.make_project({ "[defaults]", "vault_password_file = .vault_pass" })
+    vim.fn.mkdir(root .. "/nested", "p")
+    H.write_file(root .. "/nested/ansible.cfg", "[defaults]\nvault_password_file = .vault_pass\n")
+    H.write_file(root .. "/nested/.vault_pass", "nestedsecret\n")
+
+    local cfg = require("ansible-vault.ansible_cfg")
+    vim.cmd("cd " .. vim.fn.fnameescape(root))
+    local here = vim.fn.getcwd()
+    -- A directory, which is the harder half of what ANSIBLE_CONFIG accepts.
+    vim.env.ANSIBLE_CONFIG = "nested"
+    cfg.clear_cache()
+
+    local resolved = cfg.resolve(here .. "/group_vars/prod/vault.yml")
+    eq(resolved.cfg_path, here .. "/nested/ansible.cfg", "the child runs elsewhere, so a relative path cannot survive")
+    eq(resolved.settings.vault_password_file, here .. "/nested/.vault_pass")
+    local creds = H.resolve_credentials(nil, { file_path = here .. "/group_vars/prod/vault.yml" })
+    eq(creds.env.ANSIBLE_CONFIG, here .. "/nested/ansible.cfg")
+    eq(vim.env.ANSIBLE_CONFIG, "nested", "the user's own environment must be left as it is")
   end
 
   tests["ANSIBLE_VAULT_PASSWORD_FILE outranks ansible.cfg"] = function()
@@ -368,5 +411,16 @@ return function(H, tests)
     eq(creds.env.ANSIBLE_VAULT_ENCRYPT_IDENTITY, "")
     eq(creds.env.ANSIBLE_ASK_VAULT_PASS, "False")
     eq(select(1, credentials.new_credentials({}, {})), nil)
+
+    -- The re-encrypt half is a separate run, so it needs the same config the
+    -- decrypt half was given: without it the child finds no `.ansible.cfg` and
+    -- the rekey fails halfway through.
+    local root = H.make_project({ "[defaults]", "vault_password_file = .vault_pass" }, ".ansible.cfg")
+    local rooted = credentials.new_credentials(
+      { new_password_file = "/new" },
+      { file_path = root .. "/group_vars/prod/vault.yml" }
+    )
+    eq(rooted.env.ANSIBLE_CONFIG, root .. "/.ansible.cfg")
+    eq(rooted.cwd, root)
   end
 end

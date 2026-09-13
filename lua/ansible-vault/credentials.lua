@@ -416,7 +416,11 @@ local function child_env(plan, identities, extra)
     return nil, err
   end
 
-  return vim.tbl_extend("force", env, isolation or {}, extra or {}), nil
+  -- The child must read the same config this plan was built from, not whatever
+  -- its working directory happens to offer it.
+  local from_cfg = ansible_cfg.config_env(plan.cfg)
+
+  return vim.tbl_extend("force", env, from_cfg, isolation or {}, extra or {}), nil
 end
 
 ---Resolve credentials, prompting only when nothing else supplies them.
@@ -566,13 +570,16 @@ function M.new_credentials(config, context)
 
   return {
     args = { "--vault-id", identity, "--encrypt-vault-id", label },
-    env = {
+    -- The same config the decrypt half read, so this run resolves the project's
+    -- settings rather than none at all; the identity list below still replaces
+    -- its credentials, which is what keeps the new secret the only one.
+    env = vim.tbl_extend("force", ansible_cfg.config_env(cfg), {
       [ASK_ENV] = "False",
       -- Replaces whatever `ansible.cfg` configured, so the old identities cannot
       -- take the label ahead of this one.
       [IDENTITY_LIST_ENV] = identity,
       [ENCRYPT_IDENTITY_ENV] = "",
-    },
+    }),
     cwd = cfg.cwd,
   },
     nil

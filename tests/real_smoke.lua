@@ -669,6 +669,59 @@ check("ansible.cfg alone supplies credentials", function()
   end, "decrypting with ansible.cfg credentials failed")
 end)
 
+---A project config may be named `.ansible.cfg`, and Ansible reads that name from
+---`$HOME` only — never from its working directory. So running the child in the
+---directory the file was found in resolves nothing, and the credentials the
+---health report says are available are not there.
+check("a project .ansible.cfg supplies credentials, including for an inline rekey", function()
+  local dir = temp_dir()
+  vim.fn.mkdir(dir .. "/group_vars/prod", "p")
+  local pass = password_file(dir, ".vault_pass", "dotcfgsecret")
+  local new = password_file(dir, "new-pass", "new-secret")
+  write_file(dir .. "/.ansible.cfg", "[defaults]\nvault_password_file = .vault_pass\n")
+
+  reset({})
+  local path = dir .. "/group_vars/prod/vault.yml"
+  write_file(path, "db_password: fromdotcfg\n")
+  local buf = open_file(path)
+  vim.cmd("VaultEncrypt")
+  wait_until(function()
+    return (lines(buf)[1] or ""):match("^%$ANSIBLE_VAULT") ~= nil
+  end, "encrypting with .ansible.cfg credentials failed")
+  vim.cmd("silent write")
+  local ok, plaintext = opens_with(pass, path)
+  assert_true(ok, "the .ansible.cfg password should open it")
+  assert_eq(plaintext, "db_password: fromdotcfg\n")
+
+  vim.cmd("VaultDecrypt")
+  wait_until(function()
+    return lines(buf)[1] == "db_password: fromdotcfg"
+  end, "decrypting with .ansible.cfg credentials failed")
+
+  -- An inline rekey is two runs, and the second one builds its own credentials.
+  local inline = dir .. "/group_vars/prod/inline.yml"
+  write_file(inline, "password: rotate-me\n")
+  local inline_buf = open_file(inline)
+  vim.cmd("1VaultEncrypt")
+  wait_until(function()
+    return table.concat(lines(inline_buf), "\n"):find("!vault", 1, true) ~= nil
+  end, "inline encrypt under .ansible.cfg did not finish")
+
+  local before = table.concat(lines(inline_buf), "\n")
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  vim.cmd("VaultRekey --new-vault-password-file " .. vim.fn.fnameescape(new))
+  wait_until(function()
+    return table.concat(lines(inline_buf), "\n") ~= before
+  end, "inline rekey under .ansible.cfg did not rewrite the value")
+  assert_rotated(
+    extract_envelope(inline_buf, dir, "dotcfg.vault"),
+    pass,
+    new,
+    "rotate-me",
+    "inline rekey under .ansible.cfg"
+  )
+end)
+
 ---This is what "The vault-ids default,default are available to encrypt" looks
 ---like when it is not handled: a configured password file alongside an
 ---ansible.cfg identity.
