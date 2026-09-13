@@ -288,6 +288,33 @@ end
 ---Ansible's own spellings for "ask me", which are sources rather than paths.
 local PROMPT_SOURCES = { "prompt", "prompt_ask_vault_pass" }
 
+---Spell a completed argument so this command's own tokenizer reads it back
+---whole.
+---
+---Neovim inserts a candidate verbatim, and `~/my secrets/pass` would arrive as
+---two arguments. Backslash escaping is the form that survives both ends: Vim
+---keeps it inside `ArgLead` rather than splitting there, and `parse_command_args`
+---removes it again. Quotes and backslashes need it for the same reason spaces
+---do.
+---@param value string
+---@return string
+local function escape_arg(value)
+  return (value:gsub("[\\'\"%s]", "\\%0"))
+end
+
+---The argument under the cursor, as its value rather than as it was typed.
+---@param arg_lead string
+---@return string
+local function unescape_lead(arg_lead)
+  return parse_command_args(arg_lead)[1] or ""
+end
+
+---@param arg_lead string
+---@return string[]
+local function complete_file(arg_lead)
+  return vim.tbl_map(escape_arg, vim.fn.getcompletion(unescape_lead(arg_lead), "file"))
+end
+
 ---Complete the source half of a `label@source` vault id.
 ---
 ---The label is the user's own name for an identity, and nothing here can know
@@ -301,7 +328,7 @@ local PROMPT_SOURCES = { "prompt", "prompt_ask_vault_pass" }
 ---@param arg_lead string
 ---@return string[]
 local function complete_vault_id(arg_lead)
-  local label, source = arg_lead:match("^([^@]+)@(.*)$")
+  local label, source = unescape_lead(arg_lead):match("^([^@]+)@(.*)$")
   if not label then
     return {}
   end
@@ -309,11 +336,11 @@ local function complete_vault_id(arg_lead)
   local candidates = {}
   for _, prompt in ipairs(PROMPT_SOURCES) do
     if vim.startswith(prompt, source) then
-      table.insert(candidates, label .. "@" .. prompt)
+      table.insert(candidates, escape_arg(label .. "@" .. prompt))
     end
   end
   for _, path in ipairs(vim.fn.getcompletion(source, "file")) do
-    table.insert(candidates, label .. "@" .. path)
+    table.insert(candidates, escape_arg(label .. "@" .. path))
   end
   return candidates
 end
@@ -363,7 +390,7 @@ local function complete_args(arg_lead, cmd_line, cursor_pos, command)
   -- that the parser then rejects as a missing value.
   if awaiting and awaiting.value then
     if awaiting.complete == "file" then
-      return vim.fn.getcompletion(arg_lead, "file")
+      return complete_file(arg_lead)
     end
     if awaiting.complete == "vault_id" then
       return complete_vault_id(arg_lead)
@@ -379,18 +406,16 @@ local function complete_args(arg_lead, cmd_line, cursor_pos, command)
   local candidates = {}
   for _, name in ipairs(flag_names(flags)) do
     local repeatable = flags[name].list or not typed[name]
-    if repeatable and still_offerable(name, typed) then
+    if repeatable and still_offerable(name, typed) and vim.startswith(name, arg_lead) then
       table.insert(candidates, name)
     end
   end
 
   if command.positionals and positionals < command.positionals and not arg_lead:match("^%-") then
-    vim.list_extend(candidates, vim.fn.getcompletion(arg_lead, "file"))
+    vim.list_extend(candidates, complete_file(arg_lead))
   end
 
-  return vim.tbl_filter(function(candidate)
-    return vim.startswith(candidate, arg_lead)
-  end, candidates)
+  return candidates
 end
 
 --- Verbs -------------------------------------------------------------------
