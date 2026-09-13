@@ -158,9 +158,64 @@ return function(H, tests)
     )
   end
 
-  tests["completion offers nothing for a value it cannot enumerate"] = function()
+  --- Vault id labels -------------------------------------------------------
+
+  tests["completion offers the labels setup() names"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake, { password_files = false, vault_ids = { "dev@/1", "prod@/2" } })
     completion_dir()
-    eq(complete("VaultEncrypt --encrypt-vault-id "), {}, "a vault label is not a file and not a flag")
+    H.new_buffer({ "plain: value" })
+    eq(complete("VaultEncrypt --encrypt-vault-id "), { "dev", "prod" })
+    eq(complete("VaultEncrypt --encrypt-vault-id pr"), { "prod" })
+  end
+
+  tests["completion offers the labels Ansible's own configuration names"] = function()
+    local fake = H.create_fake_vault()
+    local root = H.make_project({ "[defaults]", "vault_identity_list = prod@.vault_pass, backup@.vault_pass" })
+    H.reset_config(fake, { password_files = false })
+    H.open_file(root .. "/group_vars/prod/vault.yml")
+    local offered = complete("VaultEncrypt --encrypt-vault-id ")
+    yes(vim.tbl_contains(offered, "prod"), vim.inspect(offered))
+    yes(vim.tbl_contains(offered, "backup"), "every entry in the list is a label the user may mean")
+  end
+
+  ---Re-encrypting a 1.2 file under the label it already carries is the common
+  ---case, and the file in front of the user is the only place that label is.
+  tests["completion offers the label on the buffer's own ciphertext first"] = function()
+    local fake = H.create_fake_vault()
+    -- A usable password file as well, so the decryption below actually runs.
+    H.reset_config(fake, { vault_ids = { "other@/1" } })
+    local buf = H.new_file_buffer(fake.dir, "vault.yml", H.envelope("plain: old\n", nil, "fromfile"))
+    eq(complete("VaultEncrypt --encrypt-vault-id "), { "fromfile", "other" })
+
+    -- It survives the decryption that removes the header, because re-encrypting
+    -- is exactly when the label is needed and no longer readable.
+    vim.cmd("VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "plain: old"
+    end)
+    yes(vim.tbl_contains(complete("VaultEncrypt --encrypt-vault-id "), "fromfile"))
+  end
+
+  tests["completion offers a known label with the separator for a vault id"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake, { password_files = false, vault_ids = { "dev@/1", "prod@/2" } })
+    completion_dir()
+    eq(complete("VaultEncrypt --vault-id "), { "dev@", "prod@" }, "ready for the source to be completed next")
+    eq(complete("VaultEncrypt --vault-id pr"), { "prod@" })
+    eq(complete("VaultRekey --new-vault-id pr"), { "prod@" }, "a rekey may reuse a label it already knows")
+    -- And past the separator it is the source's turn again.
+    yes(vim.tbl_contains(complete("VaultEncrypt --vault-id prod@"), "prod@vault-pass"))
+  end
+
+  tests["completion offers no label when nothing has named one"] = function()
+    local fake = H.create_fake_vault()
+    -- No credentials configured, and a directory with no ansible.cfg above it.
+    H.reset_config(fake, { password_files = false })
+    completion_dir()
+    H.new_buffer({ "plain: value" })
+    eq(complete("VaultEncrypt --encrypt-vault-id "), {}, "an invented label is the user's to type")
+    eq(complete("VaultEncrypt --vault-id "), {})
   end
 
   for _, flag in ipairs({ "VaultEncrypt --vault-id", "VaultRekey --new-vault-id" }) do
@@ -257,10 +312,16 @@ return function(H, tests)
     )
   end
 
-  tests["completion leaves the vault id label to the user"] = function()
+  ---Known labels are a suggestion, not the set of allowed names: a project can
+  ---introduce one at any time, and completing nothing is the correct answer for
+  ---a name nobody has written down yet.
+  tests["completion suggests labels without requiring one"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake, { password_files = false, vault_ids = { "prod@/1" } })
     completion_dir()
-    eq(complete("VaultEncrypt --vault-id "), {}, "nothing here knows what a project calls its identities")
-    eq(complete("VaultEncrypt --vault-id pro"), {})
+    eq(complete("VaultEncrypt --encrypt-vault-id brand-new"), {}, "an unseen label is still the user's to type")
+    eq(complete("VaultEncrypt --vault-id brand-new"), {})
+
     -- `credentials` requires a label before the separator, so completing without
     -- one would offer an identity it then refuses to read.
     eq(complete("VaultEncrypt --vault-id @"), {})

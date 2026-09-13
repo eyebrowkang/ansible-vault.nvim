@@ -15,6 +15,7 @@ local M = {}
 local ansible_cfg = require("ansible-vault.ansible_cfg")
 local buffer = require("ansible-vault.buffer")
 local config = require("ansible-vault.config")
+local credentials = require("ansible-vault.credentials")
 local edit = require("ansible-vault.edit")
 local file = require("ansible-vault.file")
 local inline = require("ansible-vault.inline")
@@ -106,7 +107,7 @@ local CREDENTIAL_FLAGS = {
 local FLAG_SETS = {
   read = CREDENTIAL_FLAGS,
   write = vim.tbl_extend("force", {}, CREDENTIAL_FLAGS, {
-    ["--encrypt-vault-id"] = { key = "encrypt_vault_id", value = true },
+    ["--encrypt-vault-id"] = { key = "encrypt_vault_id", value = true, complete = "label" },
   }),
   rekey = vim.tbl_extend("force", {}, CREDENTIAL_FLAGS, {
     ["--new-vault-password-file"] = { key = "new_password_file", value = true, complete = "file" },
@@ -315,6 +316,64 @@ local function complete_file(arg_lead)
   return vim.tbl_map(escape_arg, vim.fn.getcompletion(unescape_lead(arg_lead), "file"))
 end
 
+---The vault id labels this project already uses.
+---
+---Most specific first: the label on the buffer's own ciphertext, then the ones
+---`setup()` names, then the ones Ansible's own configuration does. Re-encrypting
+---a 1.2 file under the label it already carries is the common case, and the file
+---in front of the user is the only place that label can be read from.
+---
+---Read, never resolved: no child process, no password, no prompt. Everything
+---here is a name the user has already written down somewhere, and a failure to
+---find any of it just means fewer suggestions.
+---@return string[]
+local function known_labels()
+  local labels, seen = {}, {}
+  local function add(label)
+    if is_nonempty_string(label) and not seen[label] then
+      seen[label] = true
+      table.insert(labels, label)
+    end
+  end
+
+  ---@param identities any
+  local function add_identities(identities)
+    for _, identity in ipairs(credentials.as_list(identities)) do
+      add(identity:match("^([^@]+)@"))
+    end
+  end
+
+  pcall(function()
+    local buf = vim.api.nvim_get_current_buf()
+    -- What the buffer holds now, and what it held before it was decrypted.
+    local header = buffer.parse_header(vim.api.nvim_buf_get_lines(buf, 0, 1, false))
+    add(header and header.label)
+    add(vim.b[buf].ansible_vault_label)
+
+    add_identities(config.values.vault_ids)
+    add(config.values.encrypt_vault_id)
+
+    local cfg = ansible_cfg.resolve(vim.api.nvim_buf_get_name(buf))
+    add_identities(cfg.settings.vault_identity_list)
+    add(cfg.settings.vault_encrypt_identity)
+  end)
+
+  return labels
+end
+
+---@param arg_lead string
+---@return string[]
+local function complete_label(arg_lead)
+  local lead = unescape_lead(arg_lead)
+  local candidates = {}
+  for _, label in ipairs(known_labels()) do
+    if vim.startswith(label, lead) then
+      table.insert(candidates, escape_arg(label))
+    end
+  end
+  return candidates
+end
+
 ---Complete the source half of a `label@source` vault id.
 ---
 ---The label is the user's own name for an identity, and nothing here can know
@@ -330,7 +389,11 @@ end
 local function complete_vault_id(arg_lead)
   local label, source = unescape_lead(arg_lead):match("^([^@]+)@(.*)$")
   if not label then
-    return {}
+    -- Still naming the identity. The labels already in use are offered with the
+    -- separator attached, so the next completion is of the source behind it.
+    return vim.tbl_map(function(known)
+      return known .. "@"
+    end, complete_label(arg_lead))
   end
 
   local candidates = {}
@@ -394,6 +457,9 @@ local function complete_args(arg_lead, cmd_line, cursor_pos, command)
     end
     if awaiting.complete == "vault_id" then
       return complete_vault_id(arg_lead)
+    end
+    if awaiting.complete == "label" then
+      return complete_label(arg_lead)
     end
     return {}
   end
