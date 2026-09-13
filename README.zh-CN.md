@@ -211,6 +211,10 @@ Ansible 环境变量/配置 → 交互输入**。命令凭据替换本次操作�
 `ask_vault_pass = true` / `ANSIBLE_ASK_VAULT_PASS=true` 也优先于密码文件和
 vault ID，包括命令行指定的凭据。如果希望改用文件，请关闭该设置。
 
+`<Tab>` 会根据光标前的内容补全参数：该命令还能接受的选项、
+`--vault-password-file` 和 `--new-vault-password-file` 的文件名，以及 vault ID
+中 `label@` 之后的来源。补全出的路径会转义，含空格的名字仍是一个参数。
+
 六类命令参数、引号用法、标签选择和完整优先级，见
 `:help ansible-vault-command-args` 与 `:help ansible-vault-passwords`。
 

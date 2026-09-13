@@ -297,7 +297,20 @@ Quote or backslash-escape paths containing spaces: >vim
     :VaultCreate 'group_vars/prod/private vault.yml'
     :VaultRekey --new-vault-id prod@~/.ansible/new-pass
 <
-Completion offers each command's supported flags and filenames for Create.
+                                             *ansible-vault-completion*
+Completion follows the argument in front of the cursor:
+
+    flag position       the flags this command accepts, minus the ones
+                        already given and the ones those rule out
+    --vault-password-file, --new-vault-password-file
+                        file names
+    --vault-id, --new-vault-id
+                        after `label@`, a file name or a prompt source;
+                        the label itself is yours to name
+    Create's filename   file names, until the one it takes has been given
+
+Completed paths are backslash-escaped, so a name with a space in it stays one
+argument. `--encrypt-vault-id` takes a vault label and completes to nothing.
 
                                                 *ansible-vault-keymaps*
 KEYMAPS
