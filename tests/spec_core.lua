@@ -209,6 +209,74 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
     eq(H.calls(fake, "decrypt"), 1, "reopening must not run ansible-vault")
   end
 
+  tests["a relative decrypted buffer keeps its own target across :cd"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local source_dir = H.temp_dir()
+    local path = source_dir .. "/vault.yml"
+    H.write_file(path, table.concat(H.envelope("plain: old\n"), "\n") .. "\n")
+    local buf, full_name = H.open_file_relative(source_dir, "vault.yml")
+    eq(full_name, path)
+    eq(vim.fn.bufname(buf), "vault.yml", "precondition: Neovim retained the short buffer name")
+
+    vim.cmd("VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "plain: old"
+    end)
+
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "plain: first" })
+    vim.cmd("silent write")
+    eq(H.read_file(path), "plain: first\n", "a bare :w must save the file that was decrypted")
+
+    local other_dir = H.temp_dir()
+    vim.cmd("cd " .. vim.fn.fnameescape(other_dir))
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "plain: after-cd" })
+    vim.cmd("silent write")
+    eq(H.read_file(path), "plain: after-cd\n", ":cd must not retarget a stale short buffer name")
+    eq(vim.fn.filereadable(other_dir .. "/vault.yml"), 0, "a bare :w must not spill plaintext into the new cwd")
+
+    -- An explicitly different spelling remains the deliberate plaintext copy the
+    -- user asked for; only a self-save gets the stale-short-name protection.
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "plain: copied" })
+    vim.cmd("silent write ./copy.yml")
+    eq(H.read_file(other_dir .. "/copy.yml"), "plain: copied\n")
+    yes(vim.bo[buf].modified, ":w {other} is a copy, not a save of this buffer")
+    eq(vim.api.nvim_buf_get_name(buf), path)
+
+    vim.cmd("silent write")
+    eq(H.read_file(path), "plain: copied\n")
+    no(vim.bo[buf].modified)
+  end
+
+  tests["a relative :saveas after VaultDecrypt adopts the named target"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local source_dir = H.temp_dir()
+    local original = source_dir .. "/vault.yml"
+    H.write_file(original, table.concat(H.envelope("plain: old\n"), "\n") .. "\n")
+    local buf = H.open_file_relative(source_dir, "vault.yml")
+    vim.cmd("VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "plain: old"
+    end)
+
+    local saved_dir = H.temp_dir()
+    vim.cmd("cd " .. vim.fn.fnameescape(saved_dir))
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "plain: saved-as" })
+    vim.cmd("silent saveas renamed.yml")
+    local renamed = saved_dir .. "/renamed.yml"
+    eq(vim.api.nvim_buf_get_name(buf), renamed)
+    eq(H.read_file(renamed), "plain: saved-as\n")
+    no(vim.bo[buf].modified)
+
+    local third_dir = H.temp_dir()
+    vim.cmd("cd " .. vim.fn.fnameescape(third_dir))
+    vim.api.nvim_buf_set_lines(buf, -1, -1, false, { "extra: line" })
+    vim.cmd("silent write")
+    eq(H.read_file(renamed), "plain: saved-as\nextra: line\n")
+    eq(vim.fn.filereadable(third_dir .. "/renamed.yml"), 0, "the adopted target must not move after :cd")
+  end
+
   --- Byte fidelity ---------------------------------------------------------
 
   -- Expected values are literals written here, never computed by the code under

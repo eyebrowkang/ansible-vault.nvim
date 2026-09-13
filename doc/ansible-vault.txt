@@ -140,10 +140,17 @@ and Rekey. Other YAML entries are left unchanged.
     A file changed on disk since decryption requires `:write!` to overwrite
     it. Review the changes before forcing a save.
 
-    A whole-buffer `:write {other-file}` from a named buffer writes a
-    plaintext copy without marking the original buffer saved. From an
-    unnamed buffer, `:write {file}` adopts the filename and marks it saved.
-    `:saveas {file}` is also an intentional plaintext save. Partial writes
+    A bare `:write` from a named buffer keeps that buffer's full target,
+    including after `:cd`. `:write ./copy.yml` is an intentional plaintext
+    copy resolved from the current directory and leaves the named buffer
+    modified. `:saveas ./renamed.yml` likewise resolves from the current
+    directory, adopts that target, and later bare `:write` stays directed
+    there across `:cd`. From an unnamed buffer, `:write {file}` adopts the
+    resolved filename and marks it saved.
+
+    After `:cd`, `:write {old-short-buffer-name}` is deliberately treated as
+    a self-save to avoid an unintended plaintext copy. Use `./name` to
+    unambiguously request a current-directory relative target. Partial writes
     and append writes are refused; see |ansible-vault-security|.
 
     The current buffer stays protected after a plaintext save. The saved
@@ -477,9 +484,11 @@ WRITE RESTRICTIONS
 
 Partial writes, such as `:1write {file}`, and append writes, such as
 `:write >> {file}`, are refused in managed buffers and View windows.
-A whole-buffer `:write {path}` or `:saveas {path}` from a decrypted buffer is
-an intentional plaintext save. Create/Edit cannot redirect their fixed
-write target; View cannot save at all.
+For a named decrypted buffer, bare `:write` keeps its full target across `:cd`.
+Use an explicit relative target such as `:write ./copy.yml` for an intentional
+plaintext copy in the current directory, or `:saveas ./name` to adopt that new
+target. See |:VaultDecrypt| for the deliberate stale-short-name safety rule.
+Create/Edit cannot redirect their fixed write target; View cannot save at all.
 
 PERSISTENT UNDO
 

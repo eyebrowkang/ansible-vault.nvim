@@ -50,4 +50,18 @@ function S.open_file(path)
   return vim.api.nvim_get_current_buf()
 end
 
+---Open a file by its short name, retaining Neovim's distinct short/full names.
+---Tests use this to cover BufWriteCmd's relative `event.file` behavior.
+function S.open_file_relative(dir, name)
+  vim.cmd("cd " .. vim.fn.fnameescape(dir))
+  vim.cmd("silent edit " .. vim.fn.fnameescape(name))
+  local buf = vim.api.nvim_get_current_buf()
+  local short = vim.fn.bufname(buf)
+  local full = vim.api.nvim_buf_get_name(buf)
+  if short == full or full ~= dir .. "/" .. name then
+    error("relative open did not retain distinct buffer names: " .. vim.inspect({ short = short, full = full }), 2)
+  end
+  return buf, full
+end
+
 return S
