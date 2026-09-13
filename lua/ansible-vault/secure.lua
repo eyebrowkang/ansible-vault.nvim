@@ -190,9 +190,11 @@ end
 ---undo history that could reach an undo file.
 ---@param buf integer
 ---@param lines string[]
+---@param start_row? integer 0-based, inclusive; defaults to 0
+---@param end_row? integer 0-based, exclusive; defaults to -1 (end of buffer)
 ---@return boolean ok
 ---@return any err
-function M.set_plaintext_lines(buf, lines)
+function M.set_plaintext_lines(buf, lines, start_row, end_row)
   if not is_valid(buf) then
     return false, "buffer no longer exists"
   end
@@ -205,7 +207,7 @@ function M.set_plaintext_lines(buf, lines)
   end
 
   return M.with_cleared_undo(buf, function()
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.api.nvim_buf_set_lines(buf, start_row or 0, end_row or -1, false, lines)
   end)
 end
 

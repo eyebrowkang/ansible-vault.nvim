@@ -116,10 +116,4 @@ function M.effective(opts)
   return config
 end
 
----@param message string
----@param level integer
-function M.notify(message, level)
-  vim.notify(message, level)
-end
-
 return M

@@ -28,17 +28,16 @@ local config = require("ansible-vault.config")
 local fs = require("ansible-vault.fs")
 local secure = require("ansible-vault.secure")
 
-local notify = config.notify
-
 ---@class AnsibleVaultSession
 ---@field buf integer The managed buffer
 ---@field kind "plaintext"|"create"|"file"|"inline"
 ---@field write fun(session: AnsibleVaultSession, path: string, bang: boolean): boolean, string|nil
 ---@field target? string Path this session writes to, for the fixed-target kinds
 ---@field signature? table Baseline for detecting outside changes to `target`
----@field epoch integer Bumped by every write and by teardown; late callbacks compare it
----@field writing boolean
----@field autocmds integer[]
+---@field epoch? integer Owned by this module; advanced on write and teardown
+---@field writing? boolean Whether the BufWriteCmd handler is running
+---@field autocmds? integer[] Installed by manage
+---@field on_release? fun(session: AnsibleVaultSession) Called after invalidation
 
 ---@type table<integer, AnsibleVaultSession>
 local sessions = {}
@@ -67,6 +66,35 @@ function M.holds_plaintext(buf)
   return M.kind(buf) == "plaintext"
 end
 
+---Whether the session, and optionally one of its writes, still owns this buffer.
+---@param session AnsibleVaultSession
+---@param epoch? integer
+---@return boolean
+function M.current(session, epoch)
+  return sessions[session.buf] == session and (epoch == nil or session.epoch == epoch)
+end
+
+---Start a write whose callbacks must check current before taking effect.
+---@param session AnsibleVaultSession
+---@return integer|nil epoch
+function M.start_write(session)
+  if not M.current(session) then
+    return nil
+  end
+  session.epoch = (session.epoch or 0) + 1
+  return session.epoch
+end
+
+---Invalidate outstanding callbacks, without invalidating a newer write.
+---@param session AnsibleVaultSession
+---@param epoch? integer Omit when tearing down the entire session
+function M.invalidate(session, epoch)
+  if epoch ~= nil and session.epoch ~= epoch then
+    return
+  end
+  session.epoch = (session.epoch or 0) + 1
+end
+
 ---Stop managing a buffer.
 ---
 ---`restore` says when normal write behaviour may come back:
@@ -84,7 +112,7 @@ function M.release(buf, restore)
   sessions[buf] = nil
   -- Anything still in flight for this session is now stale: it must not write,
   -- clear 'modified', or release a lock a later operation took.
-  session.epoch = session.epoch + 1
+  M.invalidate(session)
 
   for _, id in ipairs(session.autocmds or {}) do
     pcall(vim.api.nvim_del_autocmd, id)
@@ -137,7 +165,7 @@ end
 local function run_write(session, event)
   local buf = event.buf
 
-  if sessions[buf] ~= session then
+  if not M.current(session) then
     error("this buffer is no longer managed by ansible-vault.nvim; reopen it with :VaultEdit", 0)
   end
 
@@ -313,7 +341,7 @@ local function write_plaintext(session, path, bang)
     end
   end
 
-  notify("Saved decrypted content: " .. path, vim.log.levels.INFO)
+  vim.notify("Saved decrypted content: " .. path, vim.log.levels.INFO)
   return true, nil
 end
 
@@ -354,7 +382,7 @@ function M.enter(buf)
     return false
   end
 
-  notify("Buffer holds decrypted content. :w saves it as plaintext.", vim.log.levels.INFO)
+  vim.notify("Buffer holds decrypted content. :w saves it as plaintext.", vim.log.levels.INFO)
   return true
 end
 
