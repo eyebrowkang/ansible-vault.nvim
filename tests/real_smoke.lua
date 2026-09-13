@@ -18,6 +18,16 @@ if vim.fn.executable(ansible_vault) ~= 1 then
   error("real ansible-vault binary is not executable: " .. ansible_vault)
 end
 
+-- PyYAML comes from the same environment as the real binary, so what the plugin
+-- wrote is read back by an actual YAML parser rather than by the plugin's own.
+local python = vim.fn.fnamemodify(ansible_vault, ":h") .. "/python"
+if vim.fn.executable(python) ~= 1 then
+  python = vim.fn.getcwd() .. "/.venv/bin/python"
+end
+if vim.fn.executable(python) ~= 1 then
+  error("a Python with PyYAML is required beside " .. ansible_vault)
+end
+
 -- The ambient environment must not decide what these tests resolve.
 for key in pairs(vim.fn.environ()) do
   if key:match("^ANSIBLE_") then
@@ -60,6 +70,24 @@ local function run_vault(args, stdin)
   local argv = { ansible_vault }
   vim.list_extend(argv, args)
   return vim.system(argv, { stdin = stdin, text = false }):wait(60000)
+end
+
+---Parse a YAML document with PyYAML and hand back what it holds.
+---
+---The independent oracle for the YAML the plugin writes: a value is only really
+---preserved if a parser that has never seen this code reads the same bytes back.
+---@param text string
+---@return any
+local function yaml_load(text)
+  local result = vim
+    .system({
+      python,
+      "-c",
+      "import json, sys, yaml; json.dump(yaml.safe_load(sys.stdin.read()), sys.stdout)",
+    }, { stdin = text, text = true })
+    :wait(60000)
+  assert_eq(result.code, 0, "PyYAML could not read the document: " .. tostring(result.stderr))
+  return vim.json.decode(result.stdout)
 end
 
 ---@return boolean opened, string plaintext
@@ -422,6 +450,41 @@ check("inline Decrypt then range Encrypt round trips through real Ansible", func
     return table.concat(lines(buf), "\n"):find("!vault", 1, true) ~= nil
   end, "re-encrypt did not finish")
   assert_eq(decrypt_inline(buf, pass, dir), "one\ntwo\n", "the value must survive a full round trip")
+end)
+
+---A keyless list item (`- !vault |`) has no mapping past its dash, so the block
+---it decrypts into is indented from the sequence. A body pushed two spaces
+---further is still valid YAML — and is silently a different value, with two
+---leading spaces on every line. Only a real parser can settle that.
+check("a keyless list item decrypts to the value YAML reads back", function()
+  local dir = temp_dir()
+  local pass = password_file(dir, "pass", "secret")
+  reset({ password_files = pass })
+
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(buf)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "- |", "  first", "  second", "- other" })
+  vim.cmd("1,3VaultEncrypt")
+  wait_until(function()
+    return table.concat(lines(buf), "\n"):find("!vault", 1, true) ~= nil
+  end, "keyless list encrypt did not finish")
+  assert_eq(decrypt_inline(buf, pass, dir), "first\nsecond\n", "the list item's bytes must reach Ansible intact")
+
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  vim.cmd("VaultDecrypt")
+  wait_until(function()
+    return table.concat(lines(buf), "\n"):find("!vault", 1, true) == nil
+  end, "keyless list decrypt did not finish")
+
+  local document = yaml_load(table.concat(lines(buf), "\n") .. "\n")
+  assert_eq(document[1], "first\nsecond\n", "PyYAML must read back exactly the decrypted bytes")
+  assert_eq(document[2], "other", "the neighbouring list item must still be its own value")
+
+  vim.cmd("1," .. (#lines(buf) - 1) .. "VaultEncrypt")
+  wait_until(function()
+    return table.concat(lines(buf), "\n"):find("!vault", 1, true) ~= nil
+  end, "keyless list re-encrypt did not finish")
+  assert_eq(decrypt_inline(buf, pass, dir), "first\nsecond\n", "the value must survive a full round trip")
 end)
 
 check("inline Edit writes the edited value back into the buffer only", function()
