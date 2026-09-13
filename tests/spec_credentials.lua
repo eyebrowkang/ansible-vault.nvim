@@ -211,6 +211,36 @@ return function(H, tests)
     yes(vim.tbl_contains(complete("VaultEncrypt --vault-password-file vault-pass --"), "--vault-password-file"))
   end
 
+  ---The end-to-end claim: a completed path with a space in it is one argument
+  ---when the command is run, not two. Asserted by running what completion
+  ---produced and checking the argv the child received.
+  tests["a completed path with spaces reaches the child as one argument"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake, { password_files = false })
+    local path = H.make_password_file(fake.dir, "secret")
+    vim.cmd("cd " .. vim.fn.fnameescape(fake.dir))
+
+    local prefix = "VaultEncrypt --vault-password-file "
+    local directory = complete(prefix .. "dir")
+    eq(directory, { "dir\\ with\\ space/" }, "a space must come back escaped, not bare")
+
+    -- Completing again from what the first step produced is how a user gets to
+    -- the file, so the escaped form has to be a valid lead as well as a result.
+    local file_name = complete(prefix .. directory[1])
+    eq(file_name, { "dir\\ with\\ space/pass\\ file" })
+
+    local buf = H.new_buffer({ "plain: value" })
+    vim.cmd(prefix .. file_name[1])
+    H.wait_until(function()
+      return H.encrypted(buf)
+    end, "the completed argument must be a usable command line")
+    yes(
+      H.log_has_line(fake.log, "ARG:dir with space/pass file"),
+      "the escaping must come back off again, as one argv item: " .. H.read_file(fake.log)
+    )
+    eq(H.read_file(path), "secret\n", "and that is the password file that was completed")
+  end
+
   tests["completion offers Create the one file name it takes"] = function()
     completion_dir()
     yes(vim.tbl_contains(complete("VaultCreate "), "vault-pass"))
