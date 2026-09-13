@@ -84,6 +84,34 @@ expect_absent() {
   fi
 }
 
+# `fs.atomic_write` stages ciphertext beside its target. A successful rename
+# removes that sibling, but inspect any survivor directly rather than relying
+# only on Neovim's configured state directories. The generated scenario itself
+# intentionally contains the canary, so scanning the entire work tree would
+# report the harness rather than a plugin leak.
+scan_atomic_siblings() {
+  local label="$1" needle="$2" dir="$3"
+  local count=0 leaked=0 file
+  while IFS= read -r -d '' file; do
+    count=$((count + 1))
+    if grep -q -- "$needle" "$file" 2>/dev/null; then
+      if [ "$leaked" -eq 0 ]; then
+        echo "    LEAK $label:"
+      fi
+      echo "           $file"
+      leaked=1
+    fi
+  done < <(find "$dir" -maxdepth 1 -type f -name '.*.ansible-vault.nvim.*' -print0 2>/dev/null)
+
+  if [ "$leaked" -ne 0 ]; then
+    status=1
+  elif [ "$count" -eq 0 ]; then
+    echo "    ok   $label: no atomic siblings remain"
+  else
+    echo "    ok   $label: $count ciphertext-only sibling(s)"
+  fi
+}
+
 # Run one scenario: build a fresh state tree, run the given Lua until it prints
 # READY, then SIGKILL it and look for the secret on disk.
 #
@@ -221,7 +249,67 @@ vim.cmd("VaultCreate " .. WORK .. "/created.yml")
 vim.api.nvim_buf_set_lines(0, 0, -1, false, { "api_key: " .. SECRET })
 '
 
-# 5. The explicit decrypt-and-save path. The target file is SUPPOSED to hold the
+# 5. A successful Create ends its plaintext session before the process dies. The
+#    target and any atomic sibling must contain ciphertext only.
+run_scenario "Create saved then process killed" '
+local target = WORK .. "/created.yml"
+vim.cmd("VaultCreate " .. target)
+local scratch = vim.api.nvim_get_current_buf()
+vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "api_key: " .. SECRET })
+vim.cmd("silent write")
+assert(wait_for(function() return not vim.api.nvim_buf_is_valid(scratch) end), "Create scratch was not disposed")
+assert(not holds_secret(vim.api.nvim_get_current_buf()), "Create returned plaintext instead of ciphertext")
+'
+expect_absent "Create wrote ciphertext, not the canary" "$SECRET" "$WORK/created.yml"
+scan_atomic_siblings "Create atomic siblings" "$SECRET" "$WORK"
+
+# 6. Whole-file Edit must likewise remove its scratch after ciphertext reaches the
+#    original target.
+run_scenario "whole Edit saved then process killed" '
+vim.cmd("silent edit " .. WORK .. "/vault.yml")
+local source = vim.api.nvim_get_current_buf()
+vim.cmd("VaultEdit")
+assert(wait_for(function() return vim.api.nvim_get_current_buf() ~= source end), "Edit scratch never opened")
+local scratch = vim.api.nvim_get_current_buf()
+assert(holds_secret(scratch), "Edit scratch should hold plaintext")
+vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "api_key: " .. SECRET, "changed: yes" })
+vim.cmd("silent write")
+assert(wait_for(function() return not vim.api.nvim_buf_is_valid(scratch) end), "Edit scratch was not disposed")
+assert(vim.api.nvim_get_current_buf() == source, "Edit did not return to its source")
+assert(not holds_secret(source), "Edit returned plaintext instead of ciphertext")
+'
+expect_absent "whole Edit wrote ciphertext, not the canary" "$SECRET" "$WORK/vault.yml"
+scan_atomic_siblings "whole Edit atomic siblings" "$SECRET" "$WORK"
+
+# 7. Inline Edit writes ciphertext into the source buffer only, then disposes its
+#    scratch. The source is deliberately not written a second time: that remains
+#    the user's ordinary save decision.
+run_scenario "inline Edit saved then process killed" '
+local target = WORK .. "/vars.yml"
+local source = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_set_current_buf(source)
+vim.api.nvim_buf_set_name(source, target)
+vim.api.nvim_buf_set_lines(source, 0, -1, false, { "api_key: " .. SECRET })
+vim.cmd("1VaultEncrypt")
+assert(wait_for(function()
+  return not holds_secret(source)
+end), "inline fixture was not encrypted")
+vim.cmd("silent write")
+vim.api.nvim_win_set_cursor(0, { 1, 0 })
+vim.cmd("VaultEdit")
+assert(wait_for(function() return vim.api.nvim_get_current_buf() ~= source end), "inline Edit scratch never opened")
+local scratch = vim.api.nvim_get_current_buf()
+assert(holds_secret(scratch), "inline scratch should hold plaintext")
+vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { SECRET .. "-changed" })
+vim.cmd("silent write")
+assert(wait_for(function() return not vim.api.nvim_buf_is_valid(scratch) end), "inline scratch was not disposed")
+assert(vim.api.nvim_get_current_buf() == source, "inline Edit did not return to its source")
+assert(not holds_secret(source), "inline Edit left plaintext in the source")
+'
+expect_absent "inline Edit did not persist its unsaved source plaintext" "$SECRET" "$WORK/vars.yml"
+scan_atomic_siblings "inline Edit atomic siblings" "$SECRET" "$WORK"
+
+# 8. The explicit decrypt-and-save path. The target file is SUPPOSED to hold the
 #    plaintext afterwards; everything else still must not.
 run_scenario "explicit Decrypt then save" '
 vim.cmd("silent edit " .. WORK .. "/vault.yml")
@@ -232,7 +320,7 @@ vim.cmd("silent write")
 '
 expect_present "the file the user explicitly saved holds the plaintext, as asked" "$SECRET" "$WORK/vault.yml"
 
-# 6. Decrypt, re-encrypt, then save. Only ciphertext was ever asked for, so no
+# 9. Decrypt, re-encrypt, then save. Only ciphertext was ever asked for, so no
 #    copy of the plaintext may be left anywhere.
 run_scenario "Decrypt then Encrypt then save" '
 vim.cmd("silent edit " .. WORK .. "/vault.yml")
@@ -245,8 +333,8 @@ vim.cmd("silent write")
 '
 expect_absent "the re-encrypted file holds no plaintext" "$SECRET" "$WORK/vault.yml"
 
-# 7. Abandoning a decrypt by reloading the file. The only thing ever asked for
-#    was ciphertext, so no copy of the plaintext may survive — including in the
+# 10. Abandoning a decrypt by reloading the file. The only thing ever asked for
+#     was ciphertext, so no copy of the plaintext may survive — including in the
 #    undo state the reload leaves behind.
 run_scenario "Decrypt then reload then save" '
 vim.cmd("silent edit " .. WORK .. "/vault.yml")
@@ -260,8 +348,8 @@ vim.cmd("silent write")
 '
 expect_absent "the reloaded file holds no plaintext" "$SECRET" "$WORK/vault.yml"
 
-# 8. An interactive password must not be written anywhere, and the helper script
-#    that carries it must contain no secret of its own.
+# 11. An interactive password must not be written anywhere, and the helper script
+#     that carries it must contain no secret of its own.
 echo "  interactive password residue:"
 IWORK="$BASE/interactive"
 mkdir -p "$IWORK/run" "$IWORK/tmp"

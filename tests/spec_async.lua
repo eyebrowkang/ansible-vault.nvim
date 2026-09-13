@@ -50,13 +50,28 @@ return function(H, tests)
 
       slow(0.4, "encrypt")
       local before = H.read_file(path)
+      local quitting
+      H.sabotage("QuitPre", {
+        callback = function()
+          quitting = vim.api.nvim_get_current_buf()
+        end,
+      })
       vim.cmd("silent " .. command)
+
+      -- The protected scratch stays current through the quit phase. Replacing it
+      -- synchronously from BufWriteCmd would make :wq/:x quit the source instead.
+      eq(quitting, scratch, ":" .. command .. " must quit the scratch it saved")
 
       -- No waiting: if the write were reported before the child finished, the
       -- file would still be the old ciphertext at this point.
       no(H.read_file(path) == before, ":" .. command .. " must not return before the write landed")
       yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
       eq(#vim.api.nvim_list_wins(), windows - 1, "the window should be gone once the write succeeded")
+      H.wait_until(function()
+        return not vim.api.nvim_buf_is_valid(scratch)
+      end, ":" .. command .. " must wipe its now-hidden plaintext scratch")
+      eq(vim.api.nvim_get_current_buf(), source, ":" .. command .. " must not reopen the closing scratch window")
+      yes(H.encrypted(source), "the remaining source buffer should show refreshed ciphertext")
       eq(H.calls(fake, "encrypt"), 1)
     end
 
@@ -77,6 +92,89 @@ return function(H, tests)
       eq(#vim.api.nvim_list_wins(), windows, ":" .. command .. " must not quit on a failed write")
       eq(vim.api.nvim_get_current_buf(), scratch)
       eq(H.calls(fake, "encrypt"), 1)
+    end
+  end
+
+  --- A split can leave the saved scratch visible after :wq/:x closes the writing
+  --- window. Save-ending semantics apply to every view of that same plaintext.
+  for _, command in ipairs({ "wq", "x" }) do
+    tests[":" .. command .. " replaces every remaining view of a saved scratch"] = function()
+      local fake, source, path = whole_edit_fixture()
+      vim.cmd("split")
+      local scratch = H.open_scratch("VaultEdit", source)
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: saved in a split" })
+      vim.cmd("split")
+      eq(#vim.fn.win_findbuf(scratch), 2, "precondition: two windows show the protected scratch")
+      local windows = #vim.api.nvim_list_wins()
+
+      vim.cmd("silent " .. command)
+      eq(#vim.api.nvim_list_wins(), windows - 1, ":" .. command .. " should close only its writing window")
+      H.wait_until(function()
+        return not vim.api.nvim_buf_is_valid(scratch)
+      end, ":" .. command .. " must dispose a scratch still visible in another window")
+
+      for _, win in ipairs(vim.api.nvim_list_wins()) do
+        no(vim.api.nvim_win_get_buf(win) == scratch, "no surviving window may show plaintext after a successful save")
+      end
+      eq(vim.api.nvim_get_current_buf(), source)
+      yes(H.encrypted(source))
+      yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
+      eq(H.calls(fake, "encrypt"), 1)
+    end
+  end
+
+  --- With 'hidden' off, closing the final scratch window unloads it before the
+  --- scheduled post-write cleanup gets a turn. It must still be wiped rather than
+  --- being left as an unloaded ansible-vault:// buffer after :wq or :x.
+  for _, command in ipairs({ "wq", "x" }) do
+    for _, kind in ipairs({ "whole", "inline", "create" }) do
+      tests[":" .. command .. " with hidden=false wipes a successful " .. kind .. " scratch"] = function()
+        vim.o.hidden = false
+        local source, scratch, target
+
+        if kind == "whole" then
+          local _, file_source, path = whole_edit_fixture()
+          source, target = file_source, path
+          vim.cmd("split")
+          scratch = H.open_scratch("VaultEdit", source)
+          vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: saved" })
+        elseif kind == "inline" then
+          local _, inline_source, inline_scratch, path = inline_edit_fixture()
+          source, scratch, target = inline_source, inline_scratch, path
+          vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "saved" })
+        else
+          local fake = H.create_fake_vault()
+          H.reset_config(fake)
+          H.new_buffer({ "keep: open" })
+          vim.cmd("split")
+          target = fake.dir .. "/created.yml"
+          vim.cmd("VaultCreate " .. vim.fn.fnameescape(target))
+          scratch = vim.api.nvim_get_current_buf()
+          vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "created: saved" })
+        end
+
+        local scratch_name = vim.api.nvim_buf_get_name(scratch)
+        vim.cmd("silent " .. command)
+        H.wait_until(function()
+          return not vim.api.nvim_buf_is_valid(scratch)
+        end, ":" .. command .. " must wipe an unloaded " .. kind .. " scratch")
+        eq(vim.fn.bufexists(scratch_name), 0, "the disposed scratch URI must not block another session")
+
+        if kind == "inline" then
+          eq(vim.api.nvim_get_current_buf(), source)
+          yes(vim.bo[source].modified, "inline Edit still leaves its source for a normal write")
+          local reopened = H.open_scratch("VaultEdit", source)
+          eq(vim.api.nvim_buf_get_name(reopened), scratch_name, "inline Edit must be reopenable after :" .. command)
+        elseif kind == "whole" then
+          eq(vim.api.nvim_get_current_buf(), source)
+          yes(H.encrypted(source), "whole-file Edit should leave refreshed ciphertext in its source")
+          local reopened = H.open_scratch("VaultEdit", source)
+          eq(vim.api.nvim_buf_get_name(reopened), scratch_name, "whole-file Edit must be reopenable after :" .. command)
+        else
+          local opened = H.open_file(target)
+          yes(H.encrypted(opened), "Create should leave a reopenable ciphertext target")
+        end
+      end
     end
   end
 
@@ -160,6 +258,9 @@ return function(H, tests)
     yes(message:find("failed to write", 1, true), message)
     -- And it still works once the directory does.
     vim.cmd("silent write")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end, "a successful Create retry should consume its plaintext scratch")
     yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
   end
 
@@ -267,13 +368,16 @@ return function(H, tests)
 
     -- The refusal left the source as it was found, so the edit can still be saved.
     vim.cmd("silent write")
-    no(vim.bo[scratch].modified)
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end, "a successful retry should consume the plaintext scratch")
+    eq(vim.api.nvim_get_current_buf(), source)
+    yes(vim.bo[source].modified, "the updated source still belongs to the user to save")
     no(vim.deep_equal(H.lines(source), input), "the retry must actually replace the block")
     yes(H.text(source):find("password: !vault |", 1, true) ~= nil)
     eq(H.lines(source)[1], "before: keep", "only the block may be replaced")
     eq(H.read_file(path), disk, "an inline save still does not save the source file")
-    vim.cmd("silent write")
-    eq(H.calls(fake, "encrypt_string"), 2, "a following save must work too")
+    eq(H.calls(fake, "encrypt_string"), 1, "only the successful retry should run encryption")
   end
 
   tests["a source destroyed while the child runs cannot be written back to"] = function()
@@ -288,6 +392,41 @@ return function(H, tests)
     no(vim.api.nvim_buf_is_valid(source))
     eq(H.read_file(path), disk, "the source file must be untouched either way")
     yes(vim.bo[scratch].modified)
+  end
+
+  tests["inline Edit keeps its scratch if the source disappears after publishing"] = function()
+    local _, source, scratch, path = inline_edit_fixture()
+    local disk = H.read_file(path)
+    local original_bufhidden = vim.bo[scratch].bufhidden
+    -- Deleting the source takes its window with it. Keep one unrelated window
+    -- around so :wq closes only the scratch and the post-write assertion runs.
+    vim.cmd("botright new")
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "keep: open" })
+    vim.api.nvim_set_current_win(vim.fn.win_findbuf(scratch)[1])
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "new" })
+    H.patch(vim, "notify", function(message)
+      if tostring(message):find("Encrypted password back into", 1, true) then
+        pcall(vim.api.nvim_buf_delete, source, { force = true })
+      end
+    end)
+
+    -- The normal close would unload the only recovery copy without the brief
+    -- per-buffer hide installed by the successful-write finalizer.
+    vim.o.hidden = false
+    vim.cmd("silent wq")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(source)
+    end, "the hostile post-publish hook should remove the source")
+    vim.wait(50, function()
+      return false
+    end, 10)
+
+    yes(vim.api.nvim_buf_is_valid(scratch), "the only remaining plaintext must stay available for recovery")
+    H.assert_hardened(scratch)
+    eq(vim.bo[scratch].bufhidden, original_bufhidden, "recovery must restore the scratch's normal close behavior")
+    eq(H.lines(scratch), { "new" })
+    no(vim.bo[scratch].modified, "the encryption result did land before the source disappeared")
+    eq(H.read_file(path), disk, "inline Edit never saves the source file")
   end
 
   tests["a source edited while the child runs cannot be written back to"] = function()
@@ -314,9 +453,37 @@ return function(H, tests)
     yes(vim.bo[scratch].modified)
     eq(H.read_file(path), "someone: else\n", "an inline write never saves the source file")
     vim.cmd("silent write!")
-    no(vim.bo[scratch].modified)
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end, "a successful inline :w! should consume the plaintext scratch")
+    eq(vim.api.nvim_get_current_buf(), source)
+    yes(vim.bo[source].modified)
     yes(H.text(source):find("password: !vault |", 1, true) ~= nil)
     eq(H.read_file(path), "someone: else\n", "not even with a bang")
+  end
+
+  for _, disruption in ipairs({ "changed", "renamed", "gone" }) do
+    tests["whole Edit does not open a scratch when its source is " .. disruption .. " during decryption"] = function()
+      local fake, source, path = whole_edit_fixture()
+      local scratch_name = "ansible-vault://" .. path
+      slow(0.5, "decrypt")
+      vim.defer_fn(function()
+        if disruption == "changed" then
+          vim.api.nvim_buf_set_lines(source, 0, 1, false, { "plain: changed while opening" })
+        elseif disruption == "renamed" then
+          vim.api.nvim_buf_set_name(source, path .. ".renamed")
+        else
+          pcall(vim.api.nvim_buf_delete, source, { force = true })
+        end
+      end, 100)
+
+      vim.cmd("VaultEdit")
+      H.wait_until(function()
+        return H.notification_contains(disruption == "gone" and "no longer exists" or "cancelled")
+      end, "the opening race must be reported")
+      eq(vim.fn.bufexists(scratch_name), 0, "no plaintext scratch may open from a stale source")
+      eq(H.calls(fake, "decrypt"), 1)
+    end
   end
 
   --- External change to a fixed target ----------------------------------
@@ -330,8 +497,136 @@ return function(H, tests)
     eq(H.read_file(path), "someone: else\n", "a conflicting write must not be silently overwritten")
     yes(vim.bo[scratch].modified)
     vim.cmd("silent write!")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end, "a successful whole-file :w! should consume the plaintext scratch")
+    eq(vim.api.nvim_get_current_buf(), source)
     yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
-    no(vim.bo[scratch].modified)
+    no(vim.bo[source].modified)
+    yes(H.encrypted(source))
+  end
+
+  for _, disruption in ipairs({ "changed", "renamed", "gone" }) do
+    tests["whole Edit refuses a source that was " .. disruption .. " after opening"] = function()
+      local fake, source, path = whole_edit_fixture()
+      local scratch = H.open_scratch("VaultEdit", source)
+      local before = H.read_file(path)
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: mine" })
+
+      if disruption == "changed" then
+        vim.api.nvim_buf_set_lines(source, 0, 1, false, { "plain: someone else" })
+      elseif disruption == "renamed" then
+        vim.api.nvim_buf_set_name(source, path .. ".renamed")
+      else
+        pcall(vim.api.nvim_buf_delete, source, { force = true })
+      end
+
+      local message = H.write_fails()
+      yes(message:find(disruption == "gone" and "no longer exists" or disruption, 1, true), message)
+      eq(H.read_file(path), before, "a conflicting source must stop publication before the child runs")
+      yes(vim.bo[scratch].modified, "the protected scratch must keep the unsaved plaintext for recovery")
+      eq(H.calls(fake, "encrypt"), 0)
+      H.write_fails("silent write!")
+      eq(H.calls(fake, "encrypt"), 0, ":w! must not override a source-buffer conflict")
+    end
+  end
+
+  tests["a whole Edit source changed during encryption prevents stale publication"] = function()
+    local fake, source, path = whole_edit_fixture()
+    local scratch = H.open_scratch("VaultEdit", source)
+    local before = H.read_file(path)
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: mine" })
+    slow(0.5, "encrypt")
+    vim.defer_fn(function()
+      vim.api.nvim_buf_set_lines(source, 0, 1, false, { "plain: source changed mid-write" })
+    end, 100)
+
+    H.write_fails()
+    eq(H.read_file(path), before, "a late source edit must not be overwritten")
+    eq(H.lines(source)[1], "plain: source changed mid-write")
+    yes(vim.bo[scratch].modified)
+    eq(H.calls(fake, "encrypt"), 1)
+  end
+
+  for _, disruption in ipairs({ "renamed", "gone" }) do
+    tests["a whole Edit source " .. disruption .. " during encryption prevents publication"] = function()
+      local fake, source, path = whole_edit_fixture()
+      local scratch = H.open_scratch("VaultEdit", source)
+      local before = H.read_file(path)
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: mine" })
+      slow(0.5, "encrypt")
+      vim.defer_fn(function()
+        if disruption == "renamed" then
+          vim.api.nvim_buf_set_name(source, path .. ".renamed")
+        else
+          pcall(vim.api.nvim_buf_delete, source, { force = true })
+        end
+      end, 100)
+
+      local message = H.write_fails()
+      yes(message:find(disruption == "gone" and "no longer exists" or "renamed", 1, true), message)
+      eq(H.read_file(path), before, "a late source conflict must not overwrite the target")
+      yes(vim.bo[scratch].modified, "the protected scratch must retain the user's recovery text")
+      eq(H.calls(fake, "encrypt"), 1)
+      H.write_fails("silent write!")
+      eq(H.calls(fake, "encrypt"), 1, ":w! must not retry past a source-buffer conflict")
+    end
+  end
+
+  tests["a Create scratch changed during encryption keeps the newer plaintext"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local path = fake.dir .. "/created.yml"
+    vim.cmd("VaultCreate " .. vim.fn.fnameescape(path))
+    local scratch = vim.api.nvim_get_current_buf()
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: captured" })
+    slow(0.5, "encrypt")
+    vim.defer_fn(function()
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: newer" })
+    end, 100)
+
+    local message = H.write_fails()
+    yes(message:find("protected buffer changed", 1, true), message)
+    eq(vim.fn.filereadable(path), 0, "a stale Create result must not create ciphertext")
+    eq(H.lines(scratch), { "plain: newer" })
+    yes(vim.bo[scratch].modified)
+    eq(H.calls(fake, "encrypt"), 1)
+  end
+
+  tests["an inline Edit scratch changed during encryption keeps the newer plaintext"] = function()
+    local fake, source, scratch, path, input = inline_edit_fixture()
+    local disk = H.read_file(path)
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "captured" })
+    slow(0.5, "encrypt_string")
+    vim.defer_fn(function()
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "newer" })
+    end, 100)
+
+    local message = H.write_fails()
+    yes(message:find("protected buffer changed", 1, true), message)
+    eq(H.lines(source), input, "a stale inline result must not replace the source block")
+    eq(H.read_file(path), disk)
+    eq(H.lines(scratch), { "newer" })
+    yes(vim.bo[scratch].modified)
+    eq(H.calls(fake, "encrypt_string"), 1)
+  end
+
+  tests["a whole Edit scratch changed during encryption keeps the newer plaintext"] = function()
+    local fake, source, path = whole_edit_fixture()
+    local scratch = H.open_scratch("VaultEdit", source)
+    local before = H.read_file(path)
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: captured" })
+    slow(0.5, "encrypt")
+    vim.defer_fn(function()
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: newer" })
+    end, 100)
+
+    local message = H.write_fails()
+    yes(message:find("protected buffer changed", 1, true), message)
+    eq(H.read_file(path), before, "a stale encryption result must not replace the ciphertext")
+    eq(H.lines(scratch), { "plain: newer" })
+    yes(vim.bo[scratch].modified)
+    eq(H.calls(fake, "encrypt"), 1)
   end
 
   tests["a decrypted buffer refuses to overwrite a file that changed under it"] = function()

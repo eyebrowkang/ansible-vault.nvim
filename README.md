@@ -39,9 +39,11 @@ Open an encrypted file and run:
 ```
 
 With no credentials configured, enter the vault password when prompted. Edit in
-the separate buffer, then `:w` to encrypt and save to the original file. Enter
-the password again if prompted; passwords are not cached. Use `:wq` to save and
-close, or `:q` to close after saving.
+the separate buffer, then `:w` to encrypt and save to the original file. A
+successful write ends the protected editing session and returns to the refreshed
+ciphertext buffer; run `:VaultEdit` again for another plaintext edit. Enter the
+password again if prompted; passwords are not cached. `:wq` and `:x` wait for
+the real save result and close only after success.
 
 **Want plaintext on disk instead?** Use `:VaultDecrypt`, then `:w`.
 That write saves **plaintext**, without re-encryption, another password prompt
@@ -51,21 +53,23 @@ or an extra confirmation.
 
 | Command | Whole file | Inline YAML value |
 |---------|------------|-------------------|
-| `:VaultCreate[!] {file}` | Open an empty buffer; `:w` encrypts to the chosen file | Not applicable |
+| `:VaultCreate[!] {file}` | Open an empty protected buffer; a successful `:w` encrypts to the chosen file, disposes it, and shows ciphertext | Not applicable |
 | `:VaultEncrypt` | Encrypt the entire buffer; then `:w` to save | With `[range]`, encrypt one value; then save the source YAML |
 | `:VaultDecrypt` | Replace ciphertext with plaintext; `:w` saves plaintext | Replace one `!vault` block with plaintext; `:w` saves the YAML as shown |
 | `:VaultView` | Read-only floating view; writing is refused | Read-only view of one value; writing is refused |
-| `:VaultEdit` | Separate editing buffer; `:w` encrypts to the original file | Separate editing buffer; `:w` encrypts back into the source buffer **only** |
+| `:VaultEdit` | Separate protected buffer; a successful `:w` encrypts to the original file, disposes it, and returns to refreshed ciphertext | Separate protected buffer; a successful `:w` encrypts back into the source buffer **only**, disposes it, and returns there |
 | `:VaultRekey` | Change credentials and save new ciphertext to the file | Change credentials for one block; then save the source YAML |
 
 Create and whole-file Edit save to a **fixed target**. They do not allow
-`:w other-file` or `:saveas` to choose a different file. Inline Edit never saves
-the source file: return to its buffer and run `:w` yourself. View refuses all
-writes; press `q` or `<Esc>` to close it.
+`:w other-file` or `:saveas` to choose a different file. Inline Edit opens the
+value in a split and never saves the source file: its successful protected save
+closes that split and returns to the source buffer, where you run a separate
+normal `:w` yourself. View refuses all writes; press `q` or `<Esc>` to close it.
 
+A successful Create or Edit save ends its protected editing session. Failed
+saves keep the protected buffer open and retain your changes for retry.
 Whole-file Edit and Rekey require an encrypted file with no unsaved buffer
-changes. Failed saves keep the editing buffer open and retain your changes;
-`:wq` and `:x` wait for the save to finish.
+changes; `:wq` and `:x` wait for the save to finish.
 
 ### Choosing the target
 
@@ -83,8 +87,9 @@ To encrypt a plain file, run `:VaultEncrypt`, then `:w`. To create a new vault:
 :VaultCreate group_vars/prod/vault.yml
 ```
 
-The file is not created until the first successful `:w`. `:VaultCreate!` allows
-replacing an existing file, but not a path already open in another buffer.
+The file is not created until the first successful `:w`, which closes the Create
+scratch and opens the new ciphertext file. `:VaultCreate!` allows replacing an
+existing file, but not a path already open in another buffer.
 
 ### Inline YAML
 
@@ -158,8 +163,9 @@ the plugin prompts for a password. To request a prompt for a particular command:
 ```
 
 Passwords are obtained separately for each operation and are not cached. Opening
-Edit and each Edit/Create save can prompt separately. Saving after Decrypt does
-not need a password.
+an Edit session and each attempted Edit/Create write can prompt separately; a
+successful Create/Edit write ends that session. Saving after Decrypt does not
+need a password.
 
 ### 2. Use existing password files or vault IDs
 
