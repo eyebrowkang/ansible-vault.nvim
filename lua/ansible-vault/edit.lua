@@ -425,11 +425,19 @@ local function discard_buffer(buf)
 end
 
 ---Create and name a protected buffer without leaving failed attempts behind.
+---
+---Deliberately unlisted. Its `ansible-vault://` name ends in the file name it
+---was decrypted from, so every statusline, tabline and bufferline that shows the
+---tail renders it as the source file: two entries reading `vault.yml`, one of
+---them ciphertext and one plaintext. A session buffer is not part of the user's
+---buffer list anyway — it exists for one edit and is disposed when that edit is
+---saved. `:ls!`, `<C-^>` and `:buffer {full-name}` still reach it, which is what
+---makes an unsaved one recoverable after navigating its window away.
 ---@param name string
 ---@return integer|nil buf
 ---@return any err
 local function named_buffer(name)
-  local buf = secure.create_buffer(true, false)
+  local buf = secure.create_buffer(false, false)
   local named, err = pcall(vim.api.nvim_buf_set_name, buf, name)
   if not named then
     discard_buffer(buf)
@@ -438,12 +446,30 @@ local function named_buffer(name)
   return buf, nil
 end
 
+---The buffer whose name is exactly `path`, if there is one.
+---
+---Deliberately not `bufnr()`: that treats its argument as a *pattern* and
+---accepts a match anywhere in a buffer's name, so it answers a vault file's path
+---with this session's own `ansible-vault://` scratch — which contains it — or
+---with an unrelated `vault.yml.bak` that merely has it as a prefix.
+---@param path string
+---@return integer|nil
+local function buffer_named(path)
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_get_name(buf) == path then
+      return buf
+    end
+  end
+  return nil
+end
+
+---Open the ciphertext file a finished session hands the user back to.
 ---@param path string
 ---@return integer|nil buf
 ---@return string|nil err
 local function load_target_buffer(path)
-  local existing = vim.fn.bufnr(path)
-  if existing > 0 and buffer.is_valid(existing) and vim.bo[existing].modified then
+  local existing = buffer_named(path)
+  if existing and vim.bo[existing].modified then
     return nil, path .. " is open with unsaved changes"
   end
 
@@ -451,12 +477,22 @@ local function load_target_buffer(path)
   if not added or type(buf) ~= "number" or buf <= 0 then
     return nil, "could not open " .. path
   end
+
+  -- `bufadd()` makes an *unlisted* buffer, and this one becomes the buffer the
+  -- user is working in. Left unlisted, their own file is a dead end: `:ls` does
+  -- not mention it and `:bnext` cannot come back to it once they navigate away.
+  -- Set before loading, so `BufAdd` arrives ahead of `BufReadPre`/`BufReadPost`
+  -- the way it does for `:edit`, rather than after everything else.
+  pcall(function()
+    vim.bo[buf].buflisted = true
+  end)
+
   if not vim.api.nvim_buf_is_loaded(buf) then
     local loaded, load_err = pcall(vim.fn.bufload, buf)
     if not loaded then
       return nil, "could not read " .. path .. ": " .. tostring(load_err)
     end
-  elseif existing > 0 then
+  elseif existing then
     local refreshed, refresh_err = pcall(vim.api.nvim_buf_call, buf, function()
       vim.cmd("edit!")
     end)

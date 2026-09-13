@@ -681,6 +681,43 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
     eq(H.read_file(stdin), "one\ntwo\n", "an unedited value must be re-encrypted unchanged")
   end
 
+  ---A session buffer's `ansible-vault://` name ends in the file name it came
+  ---from, so a listed one reads as a second `vault.yml` in everything that shows
+  ---only the tail. It stays out of the buffer list — and stays reachable, because
+  ---an unsaved edit has to survive its window being navigated away.
+  for _, kind in ipairs({ "whole", "inline", "create" }) do
+    tests["a " .. kind .. " session buffer stays out of the buffer list"] = function()
+      local fake = H.create_fake_vault()
+      H.reset_config(fake)
+      local scratch
+
+      if kind == "create" then
+        vim.cmd("VaultCreate " .. vim.fn.fnameescape(fake.dir .. "/created.yml"))
+        scratch = vim.api.nvim_get_current_buf()
+      else
+        local input = kind == "whole" and H.envelope("plain: old\n") or H.inline("old", "plain:")
+        local source = H.new_file_buffer(fake.dir, "vault.yml", input)
+        vim.api.nvim_win_set_cursor(0, { 1, 0 })
+        scratch = H.open_scratch("VaultEdit", source)
+      end
+
+      local name = vim.api.nvim_buf_get_name(scratch)
+      no(vim.bo[scratch].buflisted, "a session buffer must not sit beside the file it came from")
+      for _, info in ipairs(vim.fn.getbufinfo({ buflisted = 1 })) do
+        no(info.bufnr == scratch, "the buffer list must not carry the plaintext session buffer")
+      end
+
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: unsaved" })
+      vim.cmd("enew")
+      no(vim.api.nvim_get_current_buf() == scratch, "precondition: the window moved off the session buffer")
+      eq(vim.fn.bufexists(name), 1, "an unlisted session buffer must still exist by name")
+      vim.cmd("buffer " .. vim.fn.fnameescape(name))
+      eq(vim.api.nvim_get_current_buf(), scratch, ":buffer {name} must bring an unsaved session buffer back")
+      yes(vim.bo[scratch].modified, "and it must still hold the edit")
+      H.assert_hardened(scratch)
+    end
+  end
+
   --- Create ---------------------------------------------------------------
 
   tests["Create first write opens ciphertext and mode 0600"] = function()
@@ -702,6 +739,49 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
     eq(vim.bo[0].buftype, "")
     yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
     eq(vim.fn.getfperm(path), "rw-------")
+
+    -- The file Create just made is the user's working buffer now, so it has to
+    -- be an ordinary listed one. Unlisted, it is a dead end: nothing lists it
+    -- and no buffer command comes back to it once they navigate away.
+    local created = vim.api.nvim_get_current_buf()
+    yes(vim.bo[created].buflisted, "the created file must be a listed buffer")
+    H.new_buffer({ "somewhere: else" })
+    local reachable = false
+    for _ = 1, #vim.fn.getbufinfo({ buflisted = 1 }) do
+      vim.cmd("bnext")
+      reachable = reachable or vim.api.nvim_get_current_buf() == created
+    end
+    yes(reachable, "buffer navigation must be able to come back to the file Create made")
+  end
+
+  ---A buffer is identified by its exact name here. Vim's own name lookups match
+  ---a *pattern* anywhere in a buffer name, which answers a vault file's path with
+  ---this session's `ansible-vault://` scratch, or with a neighbouring backup
+  ---whose name merely starts with it — and then reports that other buffer's
+  ---unsaved changes as the reason the file cannot be opened.
+  tests["Create opens its own file past look-alike buffer names"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local path = fake.dir .. "/vault.yml"
+
+    -- Unsaved, and named so that a pattern match on the target would find it.
+    local decoy = H.new_buffer({ "not the target" })
+    vim.api.nvim_buf_set_name(decoy, path .. ".bak")
+    vim.api.nvim_buf_set_lines(decoy, 0, -1, false, { "unsaved decoy" })
+    yes(vim.bo[decoy].modified, "precondition: the look-alike has unsaved changes")
+
+    vim.cmd("VaultCreate " .. vim.fn.fnameescape(path))
+    local scratch = vim.api.nvim_get_current_buf()
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "secret: created" })
+    vim.cmd("silent write")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end, "a look-alike buffer name must not keep Create from finishing")
+
+    eq(vim.api.nvim_buf_get_name(0), path, "the session must land on the file it wrote")
+    yes(vim.bo[0].buflisted)
+    yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
+    eq(H.lines(decoy), { "unsaved decoy" }, "the unrelated buffer must be left exactly as it was")
   end
 
   tests["a relative VaultCreate keeps its target across :cd"] = function()

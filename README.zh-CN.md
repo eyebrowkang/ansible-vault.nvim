@@ -55,6 +55,10 @@ use { "eyebrowkang/ansible-vault.nvim" }
 | `:VaultEdit` | 独立受保护 buffer；成功 `:w` 加密写回原文件、销毁该 buffer 并返回刷新后的密文 | 独立受保护 buffer；成功 `:w` **只**加密回填到源 buffer、销毁该 buffer 并返回源 buffer |
 | `:VaultRekey` | 更换凭据，并把新密文保存到文件 | 更换一个 block 的凭据，然后保存源 YAML |
 
+Create 和 Edit 的 buffer 是 **unlisted** 的：它们名为 `ansible-vault://…`，若列出
+就会与来源文件同名并排出现。它们只存在于自己的窗口中，直到结束会话的那次保存。
+如果窗口切走时还有未保存的修改，用 `<C-^>` 可以切回来，`:ls!` 能列出它。
+
 Create 和整文件 Edit 的保存目标**固定**，不能用 `:w other-file` 或 `:saveas`
 改写到其他文件。inline Edit 在分屏窗口中打开该值，且不保存源文件：其受保护写入成功后
 会关闭该分屏并返回源 buffer，再由你执行普通 `:w`。View 拒绝所有写入；按 `q` 或
