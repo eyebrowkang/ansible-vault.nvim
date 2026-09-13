@@ -211,6 +211,22 @@ return function(H, tests)
     yes(vim.tbl_contains(complete("VaultEncrypt --vault-password-file vault-pass --"), "--vault-password-file"))
   end
 
+  tests["completion offers Create the one file name it takes"] = function()
+    completion_dir()
+    yes(vim.tbl_contains(complete("VaultCreate "), "vault-pass"))
+    yes(vim.tbl_contains(complete("VaultCreate --ask-vault-password "), "vault-pass"), "a flag first is still fine")
+
+    -- The parser refuses a second one with "expected at most 1 file name".
+    for _, candidate in ipairs(complete("VaultCreate new.yml ")) do
+      yes(vim.startswith(candidate, "--"), "Create takes one file name, so only flags are left: " .. candidate)
+    end
+    -- A flag's value is not a file name of its own, so one is still expected.
+    yes(
+      vim.tbl_contains(complete("VaultCreate --vault-password-file vault-pass "), "vault-other"),
+      "a password file must not be mistaken for the file to create"
+    )
+  end
+
   tests["completion leaves the vault id label to the user"] = function()
     completion_dir()
     eq(complete("VaultEncrypt --vault-id "), {}, "nothing here knows what a project calls its identities")

@@ -318,6 +318,36 @@ local function complete_vault_id(arg_lead)
   return candidates
 end
 
+---Read what is already on the command line the way the parser will read it.
+---
+---Walking rather than looking at each token on its own: a flag's *value* is not
+---itself an argument, so `--vault-password-file secrets` has named one flag and
+---no file name, and the file name `:VaultCreate` is still waiting for.
+---@param given string[]
+---@param flags table
+---@return table<string, boolean> typed Flags already named
+---@return integer positionals File names already given
+local function scan_given(given, flags)
+  local typed, positionals = {}, 0
+
+  local index = 1
+  while index <= #given do
+    local arg = given[index]
+    local flag = flags[arg]
+    if flag then
+      typed[arg] = true
+      index = index + (flag.value and 2 or 1)
+    else
+      if not arg:match("^%-") then
+        positionals = positionals + 1
+      end
+      index = index + 1
+    end
+  end
+
+  return typed, positionals
+end
+
 ---@param arg_lead string
 ---@param cmd_line string
 ---@param cursor_pos integer
@@ -344,10 +374,7 @@ local function complete_args(arg_lead, cmd_line, cursor_pos, command)
   -- An argument already given is not a suggestion. Repeating a flag that takes
   -- one value silently replaces it, and a flag that contradicts one already
   -- there fails the whole command, so neither belongs in the list.
-  local typed = {}
-  for _, arg in ipairs(given) do
-    typed[arg] = true
-  end
+  local typed, positionals = scan_given(given, flags)
 
   local candidates = {}
   for _, name in ipairs(flag_names(flags)) do
@@ -357,7 +384,7 @@ local function complete_args(arg_lead, cmd_line, cursor_pos, command)
     end
   end
 
-  if command.positionals and not arg_lead:match("^%-") then
+  if command.positionals and positionals < command.positionals and not arg_lead:match("^%-") then
     vim.list_extend(candidates, vim.fn.getcompletion(arg_lead, "file"))
   end
 
