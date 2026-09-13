@@ -4,6 +4,75 @@ All notable changes to this project are documented here.
 [git-cliff](https://git-cliff.org) seeds a draft from commit history; maintainers
 then curate and commit each release entry before its tag is created.
 
+## [0.3.0](https://github.com/eyebrowkang/ansible-vault.nvim/releases/tag/v0.3.0) - 2026-09-13
+
+This release finishes the Create and Edit lifecycle: a successful save now ends
+the protected editing session instead of leaving a plaintext buffer open beside
+the file it wrote. Command arguments gain real completion, and the manual is
+reachable through `:help ansible-vault` at last.
+
+### Breaking Changes
+
+- **BREAKING** A successful `:VaultCreate` or `:VaultEdit` save ends that
+  editing session. The protected buffer is disposed and its window shows the
+  durable result instead: the new ciphertext file, the refreshed whole-file
+  source, or the source buffer an inline value was written back into. An inline
+  edit also closes the split it opened. Previously the plaintext buffer stayed
+  open for repeated saves; run `:VaultEdit` again for another edit. A failed
+  save is unchanged — the buffer stays open with your changes for a retry.
+
+### Features
+
+- Command arguments complete from what precedes the cursor. A flag position
+  offers the flags that command still accepts, minus the ones already given and
+  the ones those rule out. `--vault-password-file` and
+  `--new-vault-password-file` complete file names, and `:VaultCreate` completes
+  its one filename until it has been given.
+- `--vault-id`, `--new-vault-id` and `--encrypt-vault-id` complete vault id
+  labels from the identities your project already names: the label on the
+  current buffer's own ciphertext first, then `setup()`, then Ansible's
+  `vault_identity_list` and `vault_encrypt_identity`. Past the `@` of a vault
+  id, the source completes as a password file or a `prompt` source. Labels are
+  suggestions, not a vocabulary: a new one still completes to nothing and is
+  still valid to type. Completion only ever reads — it starts no child process
+  and asks for no password.
+- Completed paths are backslash-escaped, so a credential under a directory with
+  a space in its name stays one argument.
+- Whole-file `:VaultEdit` refuses to publish when the buffer it was decrypted
+  from has changed, been renamed or been deleted, and no session publishes a
+  result computed from text that changed while `ansible-vault` was running.
+
+### Bug Fixes
+
+- `:w` after `:VaultDecrypt` could refuse to save at all, reporting
+  "vault.yml already exists; use :w! to overwrite it" for the very file the
+  buffer was decrypted from. A bare `:w` now saves that file, and keeps it as
+  the target across `:cd`; use `:w ./copy.yml` for a deliberate plaintext copy
+  in the current directory.
+- A buffer saved after `:VaultDecrypt` went on showing as modified until an
+  unrelated event redrew it. Neovim fires none of its own write events once a
+  `BufWriteCmd` handles the write, so that save now reports itself with
+  `BufWritePre` and `BufWritePost`. Create and Edit saves stay silent
+  deliberately: they write ciphertext elsewhere, and those events would hand a
+  decrypted buffer to every formatter and linter listening for them.
+- The ciphertext file a finished Create or Edit session handed back was an
+  unlisted buffer: `:ls` did not mention it and `:bnext` could not return to it
+  once you navigated away. It is now an ordinary listed buffer. The protected
+  editing buffers go the other way and are unlisted, so they no longer appear
+  beside the file they came from under the same name; `:ls!`, `<C-^>` and
+  `:buffer {full-name}` still reach an unsaved one.
+- Opening the file a session had written could fail with "is open with unsaved
+  changes" about an unrelated buffer, because the lookup matched any buffer name
+  containing that path — a neighbouring `vault.yml.bak`, or the session's own
+  buffer. Names are now compared exactly.
+- `:help ansible-vault` failed with E149, and so did every other tag in the
+  manual. The generated `doc/tags` is now committed, so the manual works for a
+  clone into 'packpath' or a checkout used directly, not only where a plugin
+  manager happened to build it.
+- Completion no longer offers arguments the command would then refuse: a flag
+  that contradicts one already given, a second `--encrypt-vault-id` that would
+  only replace the first, or a second filename for `:VaultCreate`.
+
 ## [0.2.0](https://github.com/eyebrowkang/ansible-vault.nvim/releases/tag/v0.2.0) - 2026-09-13
 
 This release reduces the plugin to six scope-aware commands and four settings.
