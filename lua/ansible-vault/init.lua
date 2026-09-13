@@ -122,6 +122,59 @@ local function flag_names(flags)
   return names
 end
 
+---Argument combinations that name two different answers to the same question.
+---
+---One ordered list rather than a check in the parser and another in completion:
+---a rule the two disagreed about would be a flag offered and then refused. Each
+---entry reads "`flag` cannot be combined with any of `with`". `--vault-id` and
+---`--vault-password-file` are deliberately absent from each other — several
+---credentials are one identity list, and only an interactive ask replaces them.
+---@type { flag: string, with: string[], message: string }[]
+local CONFLICTS = {
+  {
+    flag = "--ask-vault-password",
+    with = { "--vault-id", "--vault-password-file" },
+    message = "--ask-vault-password cannot be combined with --vault-id or --vault-password-file",
+  },
+  {
+    flag = "--new-vault-id",
+    with = { "--new-vault-password-file" },
+    message = "--new-vault-id and --new-vault-password-file are mutually exclusive",
+  },
+}
+
+---The first conflict `given` contains, if any.
+---@param given table<string, boolean>
+---@return string|nil message
+local function conflict_in(given)
+  for _, rule in ipairs(CONFLICTS) do
+    if given[rule.flag] then
+      for _, other in ipairs(rule.with) do
+        if given[other] then
+          return rule.message
+        end
+      end
+    end
+  end
+  return nil
+end
+
+---Whether `name` may still be given once `given` has been.
+---@param name string
+---@param given table<string, boolean>
+---@return boolean
+local function still_offerable(name, given)
+  for _, rule in ipairs(CONFLICTS) do
+    local blocked = rule.flag == name and rule.with or (vim.tbl_contains(rule.with, name) and { rule.flag })
+    for _, other in ipairs(blocked or {}) do
+      if given[other] then
+        return false
+      end
+    end
+  end
+  return true
+end
+
 ---Turn command arguments into configuration overrides.
 ---
 ---Credential flags *replace* the configured credentials rather than adding to
@@ -135,6 +188,7 @@ local function parse_operation_options(args, command)
   local flags = FLAG_SETS[command.flags]
   local result = { overrides = {}, positionals = {} }
   local seen = {}
+  local given = {}
 
   local index = 1
   while index <= #args do
@@ -154,6 +208,7 @@ local function parse_operation_options(args, command)
       end
 
       seen[flag.key] = true
+      given[arg] = true
       if flag.list then
         result.overrides[flag.key] = result.overrides[flag.key] or {}
         table.insert(result.overrides[flag.key], value)
@@ -170,12 +225,9 @@ local function parse_operation_options(args, command)
     end
   end
 
-  if seen.ask_password and (seen.password_files or seen.vault_ids) then
-    return nil, "--ask-vault-password cannot be combined with --vault-id or --vault-password-file"
-  end
-
-  if seen.new_vault_id and seen.new_password_file then
-    return nil, "--new-vault-id and --new-vault-password-file are mutually exclusive"
+  local conflict = conflict_in(given)
+  if conflict then
+    return nil, conflict
   end
 
   -- Naming any credential on the command line means the configured ones do not
@@ -185,11 +237,11 @@ local function parse_operation_options(args, command)
     { "new_vault_id", "new_password_file" },
   }
   for _, group in ipairs(EXCLUSIVE_GROUPS) do
-    local given = false
+    local any = false
     for _, key in ipairs(group) do
-      given = given or seen[key] == true
+      any = any or seen[key] == true
     end
-    if given then
+    if any then
       for _, key in ipairs(group) do
         if not seen[key] then
           result.overrides[key] = false
@@ -289,7 +341,22 @@ local function complete_args(arg_lead, cmd_line, cursor_pos, command)
     return {}
   end
 
-  local candidates = flag_names(flags)
+  -- An argument already given is not a suggestion. Repeating a flag that takes
+  -- one value silently replaces it, and a flag that contradicts one already
+  -- there fails the whole command, so neither belongs in the list.
+  local typed = {}
+  for _, arg in ipairs(given) do
+    typed[arg] = true
+  end
+
+  local candidates = {}
+  for _, name in ipairs(flag_names(flags)) do
+    local repeatable = flags[name].list or not typed[name]
+    if repeatable and still_offerable(name, typed) then
+      table.insert(candidates, name)
+    end
+  end
+
   if command.positionals and not arg_lead:match("^%-") then
     vim.list_extend(candidates, vim.fn.getcompletion(arg_lead, "file"))
   end
