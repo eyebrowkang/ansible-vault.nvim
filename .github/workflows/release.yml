@@ -13,6 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check curated release notes
+        run: make release-notes VERSION="${{ github.ref_name }}" > /dev/null
+
       - name: Setup Neovim
         uses: rhysd/action-setup-vim@v1
         with:
@@ -50,22 +53,15 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          # git-cliff needs tags to determine this release's commit range.
-          fetch-depth: 0
 
-      - name: Generate release notes
-        id: notes
-        uses: orhun/git-cliff-action@v4
-        with:
-          config: cliff.toml
-          args: --current --strip header
-        env:
-          OUTPUT: RELEASE_NOTES.md
+      - name: Prepare curated release notes
+        run: |
+          make release-notes VERSION="${{ github.ref_name }}" > "$RUNNER_TEMP/release-notes.md"
+          test -s "$RUNNER_TEMP/release-notes.md"
 
       - name: Publish the release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
-          body: ${{ steps.notes.outputs.content }}
+          body_path: ${{ runner.temp }}/release-notes.md

@@ -1,10 +1,10 @@
 # Design notes
 
-This is the only file here written for people **changing** the plugin.
-`README.md`, `README.zh-CN.md` and `doc/ansible-vault.txt` are written for
-people **using** it: they describe behaviour and never justify it. Keep that
-split — reasoning belongs in this file or in a comment next to the code it
-explains.
+This file records decisions for people **changing** the plugin. `RELEASING.md`
+covers release mechanics. `README.md`, `README.zh-CN.md` and
+doc/ansible-vault.txt are written for people **using** the plugin: they describe
+behaviour and never justify it. Keep that split — reasoning belongs in this file
+or in a comment next to the code it explains.
 
 The code already says what the plugin does, and this file does not repeat it.
 What it records is what the code cannot: the order in which goals win, what is

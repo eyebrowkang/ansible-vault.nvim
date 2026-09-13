@@ -80,7 +80,7 @@ jobs:
       - name: Run crash-leak test
         run: make test-leak
 
-  # Release notes are generated from the commit history, so the subject line has
+  # git-cliff drafts release notes from commit history, so the subject line has
   # to parse. Squash merges take the pull request title as the subject.
   commit-convention:
     if: github.event_name == 'pull_request'
