@@ -17,6 +17,9 @@ return function(H, tests)
 vim.opt.runtimepath:prepend(%q)
 require('ansible-vault').setup({ ansible_vault_path = %q, password_files = %q })
 vim.cmd('checkhealth ansible-vault')
+assert(vim.wait(10000, function()
+  return vim.bo.filetype == 'checkhealth'
+end, 10), 'timed out waiting for checkhealth')
 local report = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), '\n')
 assert(report:find('ansible-vault.nvim', 1, true), report)
 assert(report:find('Credential source: password_files', 1, true), report)
@@ -59,6 +62,9 @@ require('ansible-vault').setup({
   encrypt_vault_id = 'prod',
 })
 vim.cmd('checkhealth ansible-vault')
+assert(vim.wait(10000, function()
+  return vim.bo.filetype == 'checkhealth'
+end, 10), 'timed out waiting for checkhealth')
 local report = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), '\n')
 assert(report:find('Configured vault IDs: 2', 1, true), report)
 assert(not report:find('not readable', 1, true), report)
