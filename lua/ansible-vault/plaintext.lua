@@ -285,31 +285,41 @@ function M.manage(session)
   return session
 end
 
----Whether a write to `path` is this buffer saving itself, as opposed to an
----explicit `:w {other-file}`.
+---Make one filesystem path absolute without expanding wildcards in its name.
+---@param path string
+---@return string
+local function absolute_path(path)
+  return vim.fn.fnamemodify(path, ":p")
+end
+
+---Resolve a plaintext write target and whether it saves this buffer itself.
 ---
----A buffer with no name has nothing for a write to be "other" than, so `:w
----{path}` on one *is* that buffer being saved — which is what Neovim does for an
----ordinary buffer, where 'cpoptions' contains `F` by default. It does not do it
----for an `acwrite` buffer, because the handler owns the write, so the name is
----adopted here instead. Without that, the first `:w {path}` would leave the
----buffer looking unsaved and the second would not.
+---For a named buffer, `event.file` is normally Neovim's short `b_fname` for an
+---own-file write, even if the user spelled that file absolutely. That short name
+---can survive `:cd` on an `acwrite` buffer, so expanding it against the current
+---cwd can put plaintext in the wrong directory. The full buffer name is the
+---authoritative destination in that case. The one ambiguous form after `:cd` is
+---`:w {stale-short-name}`; favoring the self-save reading avoids an unintended
+---plaintext copy, while `:w ./name` and absolute paths remain unambiguous.
 ---@param session AnsibleVaultSession
 ---@param path string
----@return boolean
-local function writes_itself(session, path)
-  -- `:saveas` renames the buffer and *then* writes, so a write to the buffer's
-  -- current name is this buffer saving itself even when that is not the file it
-  -- was decrypted from. Without this the buffer could never be saved again: the
-  -- write would be taken for a copy, 'modified' would stay set, and `:wq` would
-  -- refuse to quit for the rest of the session.
+---@return string path
+---@return boolean own
+local function plaintext_target(session, path)
   local name = vim.api.nvim_buf_get_name(session.buf)
   if name ~= "" then
-    return path == name or path == session.target
+    if path == vim.fn.bufname(session.buf) then
+      return absolute_path(name), true
+    end
+
+    path = absolute_path(path)
+    return path, path == absolute_path(name) or path == session.target
   end
 
-  -- Unnamed: there is nothing for the write to be "other" than.
-  return session.target == nil or path == session.target
+  path = absolute_path(path)
+  -- An unnamed buffer has nothing for a write to be "other" than. `acwrite`
+  -- needs to adopt the name itself because its handler owns the write.
+  return path, session.target == nil or path == session.target
 end
 
 ---Save the plaintext a `:VaultDecrypt`ed buffer is holding.
@@ -324,7 +334,8 @@ end
 ---@return string|nil err
 local function write_plaintext(session, path, bang)
   local buf = session.buf
-  local own = writes_itself(session, path)
+  local own
+  path, own = plaintext_target(session, path)
 
   if own and path == session.target then
     if not bang and not fs.same_signature(session.signature, fs.signature(path)) then
@@ -376,11 +387,12 @@ function M.enter(buf)
   end
 
   local name = vim.api.nvim_buf_get_name(buf)
+  local target = name ~= "" and absolute_path(name) or nil
   local session = M.manage({
     buf = buf,
     kind = "plaintext",
-    target = name ~= "" and name or nil,
-    signature = name ~= "" and fs.signature(name) or nil,
+    target = target,
+    signature = target and fs.signature(target) or nil,
     write = write_plaintext,
   })
 

@@ -258,9 +258,10 @@ save you request with Decrypt.
   ordinary in-memory undo remains available after range encryption. Reloads may
   clear undo history. See `:help ansible-vault-security`.
 - Partial writes such as `:1w file` and append writes such as `:w >> file` are
-  refused in protected buffers. Decrypt allows intentional whole-buffer plaintext
-  saves, including to another file; Edit/Create have fixed targets and View
-  refuses writing entirely.
+  refused in protected buffers. For a named decrypted buffer, bare `:w` keeps its
+  target across `:cd`; use `:w ./copy.yml` for an intentional plaintext copy in
+  the current directory, or `:saveas ./name` to adopt a new target. Edit/Create
+  have fixed targets and View refuses writing entirely.
 - Registers, ShaDa, the clipboard, other plugins, shell commands and terminal
   recording are outside this protection. Global `'shada'`, `'backup'` and
   `'writebackup'` settings are not changed. Neither process memory nor OS swap,
