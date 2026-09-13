@@ -287,12 +287,17 @@ function H.resolve_credentials(opts, context)
   return result
 end
 
-function H.make_project(cfg_lines)
+---A project tree whose config file is named `cfg_name`, `ansible.cfg` by default.
+---
+---The name matters: Ansible reads `ansible.cfg` from its working directory but
+---only ever reads `.ansible.cfg` from `$HOME`, so a project using the dotted name
+---is only found when the config is named to the child explicitly.
+function H.make_project(cfg_lines, cfg_name)
   local root = H.temp_dir()
   vim.fn.mkdir(root .. "/group_vars/prod", "p")
   H.write_file(root .. "/.vault_pass", "cfgsecret\n")
   vim.fn.setfperm(root .. "/.vault_pass", "rw-------")
-  H.write_file(root .. "/ansible.cfg", table.concat(cfg_lines, "\n") .. "\n")
+  H.write_file(root .. "/" .. (cfg_name or "ansible.cfg"), table.concat(cfg_lines, "\n") .. "\n")
   return root
 end
 

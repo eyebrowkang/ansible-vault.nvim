@@ -7,6 +7,11 @@
 ---Relative paths inside the config then resolve exactly the way Ansible resolves
 ---them, which is relative to the config file itself.
 ---
+---The directory alone is not enough, because the config Ansible would pick up
+---there is not always the one found here: `.ansible.cfg` is read from `$HOME`
+---only, never from the working directory. So the file that was actually selected
+---is handed to the child as `ANSIBLE_CONFIG` — see `M.config_env`.
+---
 ---Knowing what Ansible would resolve on its own also lets the plugin stay out of
 ---the way: passing `--vault-password-file` when `ansible.cfg` already supplies one
 ---makes `ansible-vault encrypt` fail outright with
@@ -247,6 +252,12 @@ function M.resolve(file_path)
   start_dir = start_dir or vim.fn.getcwd()
 
   local cfg_path, cfg_source = find_config(start_dir)
+  -- Settled here, once, while Neovim's working directory is still the one the
+  -- path was written against: the child runs somewhere else, and this same path
+  -- is what tells it which config to read.
+  if cfg_path then
+    cfg_path = vim.fn.fnamemodify(cfg_path, ":p")
+  end
 
   local file_settings = {}
   if cfg_path then
@@ -292,6 +303,25 @@ function M.resolve(file_path)
     credential_source = credential_source,
     label = label,
   }
+end
+
+---The environment that makes the child read the config this module selected.
+---
+---Without it the child only gets a working directory and Ansible re-runs its own
+---discovery there — which finds `ansible.cfg` but never `.ansible.cfg`, since that
+---name is only ever read from `$HOME`. A project using the dotted name would have
+---its credentials reported as available here and resolve to nothing in the child.
+---
+---This names the file Ansible was going to read anyway, so it cannot change which
+---layer wins. Only the child sees it: the user's own environment is not the
+---plugin's to rewrite.
+---@param cfg AnsibleVaultCfg
+---@return table
+function M.config_env(cfg)
+  if not cfg.cfg_path then
+    return {}
+  end
+  return { ANSIBLE_CONFIG = cfg.cfg_path }
 end
 
 return M
