@@ -235,27 +235,22 @@ function M.manage(session)
     callback = function(event)
       run_write(session, event)
     end,
-  }))
-    and installed(
-      pcall(
-        secure.refuse_partial_writes,
-        buf,
-        "a partial or appending write would put this buffer's plaintext on disk "
-          .. "unencrypted, bypassing the vault writer; write the whole buffer instead"
-      )
+  })) and installed(
+    pcall(
+      secure.refuse_partial_writes,
+      buf,
+      "a partial or appending write would put this buffer's plaintext on disk "
+        .. "unencrypted, bypassing the vault writer; write the whole buffer instead"
     )
-    and installed(pcall(vim.api.nvim_create_autocmd, { "BufUnload", "BufWipeout", "BufReadPre" }, {
-      buffer = buf,
-      desc = "Drop the Ansible Vault session for a buffer being replaced",
-      callback = function()
-        -- BufUnload fires while the plaintext is still in the buffer, so the
-        -- options stay locked down until a read has replaced it.
-        M.release(buf, "on_read")
-      end,
-    }))
-    and vim.bo[buf].buftype == "acwrite"
-    and vim.bo[buf].swapfile == false
-    and vim.bo[buf].undofile == false
+  ) and installed(pcall(vim.api.nvim_create_autocmd, { "BufUnload", "BufWipeout", "BufReadPre" }, {
+    buffer = buf,
+    desc = "Drop the Ansible Vault session for a buffer being replaced",
+    callback = function()
+      -- BufUnload fires while the plaintext is still in the buffer, so the
+      -- options stay locked down until a read has replaced it.
+      M.release(buf, "on_read")
+    end,
+  })) and vim.bo[buf].buftype == "acwrite" and vim.bo[buf].swapfile == false and vim.bo[buf].undofile == false
 
   if not secured then
     for _, id in ipairs(session.autocmds) do
