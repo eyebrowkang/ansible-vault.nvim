@@ -24,7 +24,9 @@
 ---Interactively entered passwords are handed to the child process through its
 ---environment and read back by a static helper script that contains no secret. If
 ---that helper cannot be installed the operation fails; there is no fallback that
----writes the password to a file.
+---writes the password to a file. That is also how Ansible's asking sources
+---(`prod@prompt`) are served: the child has no terminal to ask from, so the
+---question is put here and only the answer is passed on.
 local ansible_cfg = require("ansible-vault.ansible_cfg")
 
 local M = {}
@@ -37,11 +39,36 @@ local ENCRYPT_IDENTITY_ENV = "ANSIBLE_VAULT_ENCRYPT_IDENTITY"
 local ASK_ENV = "ANSIBLE_ASK_VAULT_PASS"
 
 local DIR_MODE = 448 -- 0700
-local ASKPASS_SCRIPT = "#!/bin/sh\n# Written by ansible-vault.nvim. Contains no secret.\nprintf '%s' \"${"
-  .. PASSWORD_ENV
-  .. '-}"\n'
 
-local askpass_path = nil
+---Ansible's magic vault id sources, which make `ansible-vault` ask for the
+---password itself.
+---
+---It cannot, when the plugin runs it: the child has no terminal, and its stdin is
+---already carrying the content being encrypted. So a `prompt` source handed
+---straight through either reads that content as the password or waits for an
+---answer that never comes. The plugin asks instead — see `M.resolve`.
+local PROMPT_SOURCES = { prompt = true, prompt_ask_vault_pass = true }
+
+---One operation can have to ask for several passwords, one per identity, and they
+---must not be able to reach each other: each answer gets its own slot, with its
+---own helper script and its own environment variable. Slot 1 keeps the original
+---names because it is the only slot a single-credential operation ever uses.
+---@param slot integer
+---@return string
+local function password_env(slot)
+  return slot == 1 and PASSWORD_ENV or string.format("%s_%d", PASSWORD_ENV, slot)
+end
+
+---@param slot integer
+---@return string
+local function askpass_script(slot)
+  return "#!/bin/sh\n# Written by ansible-vault.nvim. Contains no secret.\nprintf '%s' \"${"
+    .. password_env(slot)
+    .. '-}"\n'
+end
+
+---@type table<integer, string>
+local askpass_paths = {}
 
 ---Extra environment a specific subcommand needs, whatever the credentials are.
 ---
@@ -82,13 +109,33 @@ function M.expand_path(path)
   return vim.fn.expand(path)
 end
 
+---Whether a vault id source is one that makes `ansible-vault` ask for itself.
+---
+---Public because `:checkhealth` must not report such a source as an unreadable
+---file, and a second list of the magic names could disagree with this one.
+---@param source any
+---@return boolean
+function M.is_prompt_source(source)
+  return type(source) == "string" and PROMPT_SOURCES[source] == true
+end
+
+---@param vault_id any
+---@return string|nil label
+---@return string|nil source
+local function split_vault_id(vault_id)
+  if type(vault_id) ~= "string" then
+    return nil, nil
+  end
+  return vault_id:match("^([^@]+)@(.+)$")
+end
+
 ---Expand the source half of a `label@source` vault id, leaving Ansible's magic
----`prompt` sources alone.
+---`prompt` sources alone: they are not paths, and they are answered in `resolve`.
 ---@param vault_id string
 ---@return string
 function M.expand_vault_id(vault_id)
-  local label, source = vault_id:match("^([^@]+)@(.+)$")
-  if not label or not source or source == "prompt" or source == "prompt_ask_vault_pass" then
+  local label, source = split_vault_id(vault_id)
+  if not label or not source or M.is_prompt_source(source) then
     return vault_id
   end
   return label .. "@" .. M.expand_path(source)
@@ -134,11 +181,13 @@ end
 
 --- Password helper script -------------------------------------------------
 
+---@param slot integer
 ---@return string|nil path
 ---@return string|nil err
-local function ensure_askpass()
-  if askpass_path and uv.fs_stat(askpass_path) then
-    return askpass_path, nil
+local function ensure_askpass(slot)
+  local cached = askpass_paths[slot]
+  if cached and uv.fs_stat(cached) then
+    return cached, nil
   end
 
   if not uv.getuid then
@@ -166,14 +215,14 @@ local function ensure_askpass()
 
   -- Written through a rename so a second Neovim starting at the same moment
   -- never observes the script mid-truncation and reads an empty password.
-  local path = dir .. "/askpass.sh"
+  local path = string.format("%s/askpass%s.sh", dir, slot == 1 and "" or tostring(slot))
   local tmp = string.format("%s.%d", path, uv.getpid())
 
   local fd, open_err = uv.fs_open(tmp, "w", DIR_MODE)
   if not fd then
     return nil, open_err or ("could not write " .. path)
   end
-  uv.fs_write(fd, ASKPASS_SCRIPT)
+  uv.fs_write(fd, askpass_script(slot))
   uv.fs_close(fd)
   uv.fs_chmod(tmp, DIR_MODE)
 
@@ -183,8 +232,95 @@ local function ensure_askpass()
     return nil, rename_err or ("could not install " .. path)
   end
 
-  askpass_path = path
+  askpass_paths[slot] = path
   return path, nil
+end
+
+--- Asking for a password ----------------------------------------------------
+
+---What one operation has had to ask for.
+---
+---Never held beyond that operation: the prompt runs per operation, and an answer
+---lives only in this table and in the child's environment, both of which go out
+---of scope when the operation ends. Caching would put a secret in the Lua heap
+---for a window the user cannot see or audit.
+---@class AnsibleVaultAnswers
+---@field env table<string, string> Password variables for the child
+---@field by_identity table<string, string> Original `label@prompt` -> replacement
+---@field count integer Slots handed out so far
+
+---@return AnsibleVaultAnswers
+local function new_answers()
+  return { env = {}, by_identity = {}, count = 0 }
+end
+
+---Ask for one password and install the helper that will read it back.
+---@param answers AnsibleVaultAnswers
+---@param label string|nil Identity the question is for, when it is for one
+---@return string|nil helper Path to the script that prints the answer
+---@return string|nil err Message to report when there is no answer to hand over
+local function ask(answers, label)
+  local question = label and string.format("Vault password (%s): ", label) or "Ansible Vault Password: "
+  local ok, password = pcall(vim.fn.inputsecret, question)
+  vim.cmd("redraw")
+
+  if not ok or not is_nonempty_string(password) then
+    return nil, "Password is required"
+  end
+
+  -- Fail closed. The only other way to hand a typed password to `ansible-vault`
+  -- is a file, and a file is exactly what this plugin promises never to write.
+  local slot = answers.count + 1
+  local helper, helper_err = ensure_askpass(slot)
+  if not helper then
+    return nil,
+      "Cannot pass the vault password without writing it to disk ("
+        .. (helper_err or "unknown reason")
+        .. "); use password_files or vault_ids instead"
+  end
+
+  answers.count = slot
+  answers.env[password_env(slot)] = password
+  return helper, nil
+end
+
+---Replace every identity whose source asks with one the plugin has answered.
+---
+---An identity that appears twice is one credential named twice and is asked for
+---once. Two identities are never merged because their labels match: they are
+---separate credentials, and sharing an answer would seal content with a password
+---typed for something else.
+---@param answers AnsibleVaultAnswers
+---@param identities any
+---@return string[]|nil replaced
+---@return boolean changed
+---@return string|nil err
+local function without_prompts(answers, identities)
+  local result, changed = {}, false
+  if type(identities) ~= "table" then
+    return result, changed, nil
+  end
+
+  for _, identity in ipairs(identities) do
+    local label, source = split_vault_id(identity)
+    if label and M.is_prompt_source(source) then
+      changed = true
+      local replacement = answers.by_identity[identity]
+      if not replacement then
+        local helper, err = ask(answers, label)
+        if not helper then
+          return nil, changed, err
+        end
+        replacement = label .. "@" .. helper
+        answers.by_identity[identity] = replacement
+      end
+      table.insert(result, replacement)
+    else
+      table.insert(result, identity)
+    end
+  end
+
+  return result, changed, nil
 end
 
 --- Planning ---------------------------------------------------------------
@@ -377,17 +513,26 @@ end
 ---Prepending our identities restores the documented precedence without touching
 ---the user's `ansible.cfg` or this process's environment. The configured entries
 ---are kept after ours, so content encrypted with one of them still decrypts.
+---
+---The configured entries are also what carries an inherited `label@prompt`, and
+---an answered one has to reach the child in its place — so the list is written
+---out for that alone, even when the plugin supplies no identity of its own.
 ---@param plan AnsibleVaultPlan
----@param identities string[]
+---@param pool AnsibleVaultPool
 ---@return table|nil env
 ---@return string|nil err
-local function identity_list_env(plan, identities)
-  local configured = plan.cfg.settings.vault_identity_list
-  if #identities == 0 or type(configured) ~= "table" or #configured == 0 then
+local function identity_list_env(plan, pool)
+  local configured = pool.configured
+  if type(configured) ~= "table" or #configured == 0 then
+    return nil, nil
+  end
+  if #pool.ours == 0 and not pool.answered then
+    -- Nothing to put in front of Ansible's own list and nothing replaced in it,
+    -- so leave it to resolve the way it always would.
     return nil, nil
   end
 
-  local entries = vim.list_extend(vim.deepcopy(identities), configured)
+  local entries = vim.list_extend(vim.deepcopy(pool.ours), configured)
   for _, entry in ipairs(entries) do
     if entry:find(",", 1, true) then
       -- The variable is comma separated with no escape, so a source containing
@@ -400,18 +545,24 @@ local function identity_list_env(plan, identities)
   return { [IDENTITY_LIST_ENV] = table.concat(entries, ",") }, nil
 end
 
+---The identities the child will be able to see.
+---@class AnsibleVaultPool
+---@field ours string[] What the plugin supplies, in order
+---@field configured string[] Ansible's own list, with answered prompts replaced
+---@field answered boolean Whether anything in `configured` was replaced
+
 ---@param plan AnsibleVaultPlan
----@param identities string[]
+---@param pool AnsibleVaultPool
 ---@param extra? table
 ---@return table|nil env
 ---@return string|nil err
-local function child_env(plan, identities, extra)
+local function child_env(plan, pool, extra)
   -- The plugin is supplying the secret, so the child must not also try to
   -- prompt: `ansible.cfg` may set `ask_vault_pass`, and with piped stdin and no
   -- tty that either blocks until the timeout or reads the content as a password.
   local env = { [ASK_ENV] = "False" }
 
-  local isolation, err = identity_list_env(plan, identities)
+  local isolation, err = identity_list_env(plan, pool)
   if err then
     return nil, err
   end
@@ -423,64 +574,66 @@ local function child_env(plan, identities, extra)
   return vim.tbl_extend("force", env, from_cfg, isolation or {}, extra or {}), nil
 end
 
----Resolve credentials, prompting only when nothing else supplies them.
+---Resolve credentials, asking for a password only when one has to be asked for.
+---
+---Two things are asked for here, and both are answered before the child starts:
+---the password for an operation nothing supplies a credential for, and the
+---password behind every `label@prompt` identity — the plugin's own and the ones
+---inherited from `ansible.cfg` or `ANSIBLE_VAULT_IDENTITY_LIST`. Every asking
+---source is replaced by a helper-backed one, so nothing the child is handed can
+---try to read a password from the pipe carrying its content.
 ---@param config table Effective plugin configuration
 ---@param context? { file_path?: string, header_label?: string }
 ---@param callback fun(creds: AnsibleVaultCredentials|nil)
 function M.resolve(config, context, callback)
   local plan = M.plan(config, context)
+  local answers = new_answers()
 
-  if not plan.needs_password then
-    local env, err = child_env(plan, plan.identities, nil)
-    if not env then
-      vim.notify("Cannot run ansible-vault: " .. err, vim.log.levels.ERROR)
-      callback(nil)
-      return
+  local function fail(message)
+    vim.notify(message, vim.log.levels.ERROR)
+    callback(nil)
+  end
+
+  local ours, answered, err = without_prompts(answers, plan.identities)
+  if not ours then
+    return fail(err)
+  end
+
+  local args = plan.args
+  if answered then
+    -- The flags carry the same identity strings, so replacing them where they
+    -- appear leaves everything else — order, flag choice, paths — as planned.
+    args = {}
+    for _, arg in ipairs(plan.args) do
+      table.insert(args, answers.by_identity[arg] or arg)
     end
-    callback({ args = plan.args, env = env, cwd = plan.cwd, plan = plan })
-    return
   end
 
-  -- Never held beyond the operation that needs it: the prompt runs per
-  -- operation, and the password lives only in this local and the child's
-  -- environment. Caching it would put a secret in the Lua heap for a window the
-  -- user cannot see or audit.
-  local ok, password = pcall(vim.fn.inputsecret, "Ansible Vault Password: ")
-  vim.cmd("redraw")
-
-  if not ok or not is_nonempty_string(password) then
-    vim.notify("Password is required", vim.log.levels.ERROR)
-    callback(nil)
-    return
+  if plan.needs_password then
+    local helper, ask_err = ask(answers, nil)
+    if not helper then
+      return fail(ask_err)
+    end
+    ours = { plan.our_label .. "@" .. helper }
+    args = credential_flags(plan.our_label, helper, plan.default_identity)
   end
 
-  -- Fail closed. The only other way to hand a typed password to `ansible-vault`
-  -- is a file, and a file is exactly what this plugin promises never to write.
-  local helper, helper_err = ensure_askpass()
-  if not helper then
-    vim.notify(
-      "Cannot pass the vault password without writing it to disk ("
-        .. (helper_err or "unknown reason")
-        .. "); use password_files or vault_ids instead",
-      vim.log.levels.ERROR
-    )
-    callback(nil)
-    return
+  local configured, configured_answered, configured_err =
+    without_prompts(answers, plan.cfg.settings.vault_identity_list)
+  if not configured then
+    return fail(configured_err)
   end
 
-  local env, env_err = child_env(plan, { plan.our_label .. "@" .. helper }, { [PASSWORD_ENV] = password })
+  local env, env_err = child_env(plan, {
+    ours = ours,
+    configured = configured,
+    answered = configured_answered,
+  }, answers.env)
   if not env then
-    vim.notify("Cannot run ansible-vault: " .. env_err, vim.log.levels.ERROR)
-    callback(nil)
-    return
+    return fail("Cannot run ansible-vault: " .. env_err)
   end
 
-  callback({
-    args = credential_flags(plan.our_label, helper, plan.default_identity),
-    env = env,
-    cwd = plan.cwd,
-    plan = plan,
-  })
+  callback({ args = args, env = env, cwd = plan.cwd, plan = plan })
 end
 
 --- Rekey -----------------------------------------------------------------

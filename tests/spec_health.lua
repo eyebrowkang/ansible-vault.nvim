@@ -42,4 +42,34 @@ io.stdout:write('HEALTH_OK\n'); io.stdout:flush()
     eq(result.code, 0, result.stdout .. result.stderr)
     yes(result.stdout:find("HEALTH_OK", 1, true))
   end
+
+  ---Both of Ansible's asking sources name a password the user types, not a file
+  ---to read, so neither can be "not readable".
+  tests["checkhealth does not report an asking vault id as unreadable"] = function()
+    local fake = H.create_fake_vault()
+    local script = H.temp_dir() .. "/health_prompt.lua"
+    H.write_file(
+      script,
+      string.format(
+        [[
+vim.opt.runtimepath:prepend(%q)
+require('ansible-vault').setup({
+  ansible_vault_path = %q,
+  vault_ids = { 'prod@prompt', 'dev@prompt_ask_vault_pass' },
+  encrypt_vault_id = 'prod',
+})
+vim.cmd('checkhealth ansible-vault')
+local report = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), '\n')
+assert(report:find('Configured vault IDs: 2', 1, true), report)
+assert(not report:find('not readable', 1, true), report)
+io.stdout:write('HEALTH_OK\n'); io.stdout:flush()
+]],
+        H.root,
+        fake.path
+      )
+    )
+    local result = vim.system({ vim.v.progpath, "--headless", "-u", "NONE", "-l", script }):wait(20000)
+    eq(result.code, 0, result.stdout .. result.stderr)
+    yes(result.stdout:find("HEALTH_OK", 1, true))
+  end
 end

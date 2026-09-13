@@ -65,8 +65,10 @@ local function check_vault_ids(values)
       labels[label] = true
     end
 
+    -- Both of Ansible's asking sources name a password the user types rather
+    -- than a file to read, so neither can be missing from disk.
     local source = vault_id:match("^[^@]+@(.+)$")
-    if source and source ~= "prompt" and not path_exists(credentials.expand_path(source)) then
+    if source and not credentials.is_prompt_source(source) and not path_exists(credentials.expand_path(source)) then
       health.warn(string.format("vault_id source is not readable: %s", credentials.expand_path(source)))
     end
   end

@@ -337,8 +337,11 @@ password_files ~
                                               *ansible-vault-config-vault_ids*
 vault_ids ~
     String or list of strings: vault identities such as
-    `"prod@~/.ansible/prod-pass"`. Source paths are expanded with |expand()|;
-    Ansible's `prompt` and `prompt_ask_vault_pass` sources are left as-is.
+    `"prod@~/.ansible/prod-pass"`. Source paths are expanded with |expand()|.
+    An identity whose source is `prompt` or `prompt_ask_vault_pass` is asked
+    for in Neovim, once per operation and separately per identity; the
+    password is never cached. This also applies to such an identity inherited
+    from `vault_identity_list` in your Ansible configuration.
     Example with multiple identities: >lua
         require("ansible-vault").setup({
           vault_ids = {
