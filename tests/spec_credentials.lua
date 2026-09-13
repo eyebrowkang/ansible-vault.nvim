@@ -99,6 +99,66 @@ return function(H, tests)
     end
   end
 
+  --- Argument completion ---------------------------------------------------
+
+  ---Driven through `getcompletion(..., "cmdline")` rather than by calling the
+  ---completion function: what matters is what the user is offered after typing
+  ---that line, which is Neovim's machinery plus ours.
+  local function complete(line)
+    return vim.fn.getcompletion(line, "cmdline")
+  end
+
+  ---A directory to complete against, with names that cannot collide with a flag.
+  local function completion_dir()
+    local dir = H.temp_dir()
+    H.write_file(dir .. "/vault-pass", "secret\n")
+    H.write_file(dir .. "/vault-other", "other\n")
+    vim.fn.mkdir(dir .. "/group_vars", "p")
+    vim.cmd("cd " .. vim.fn.fnameescape(dir))
+    return dir
+  end
+
+  for _, case in ipairs({
+    { "VaultEncrypt --vault-password-file ", "encrypt" },
+    { "VaultDecrypt --vault-password-file ", "decrypt" },
+    { "VaultRekey --new-vault-password-file ", "rekey's new credential" },
+  }) do
+    tests["completion offers files after " .. vim.trim(case[1])] = function()
+      completion_dir()
+      local offered = complete(case[1])
+      yes(vim.tbl_contains(offered, "vault-pass"), case[2] .. ": " .. vim.inspect(offered))
+      yes(vim.tbl_contains(offered, "group_vars/"), "a directory is a step towards a password file")
+      for _, candidate in ipairs(offered) do
+        no(vim.startswith(candidate, "--"), "a flag's value is never another flag: " .. candidate)
+      end
+      eq(complete(case[1] .. "vault-p"), { "vault-pass" }, "a partial name narrows to what it matches")
+    end
+  end
+
+  tests["completion still offers the flags a command accepts"] = function()
+    completion_dir()
+    eq(complete("VaultDecrypt --"), { "--ask-vault-password", "--vault-id", "--vault-password-file" })
+    eq(complete("VaultEncrypt --e"), { "--encrypt-vault-id" }, "only Encrypt-style commands take it")
+    eq(complete("VaultRekey --new-"), { "--new-vault-id", "--new-vault-password-file" })
+    yes(vim.tbl_contains(complete("VaultCreate "), "vault-pass"), "Create still completes its file name")
+  end
+
+  ---The cursor's own token decides nothing; the argument in front of it does.
+  tests["completion reads the flag in front of the cursor, not the whole line"] = function()
+    completion_dir()
+    local offered = complete("VaultEncrypt --vault-password-file vault-pass --vault-id x@/y --")
+    eq(offered, { "--ask-vault-password", "--encrypt-vault-id", "--vault-id", "--vault-password-file" })
+    yes(
+      vim.tbl_contains(complete("VaultEncrypt --ask-vault-password --vault-password-file "), "vault-pass"),
+      "a flag with no value of its own must not swallow the next one's completion"
+    )
+  end
+
+  tests["completion offers nothing for a value it cannot enumerate"] = function()
+    completion_dir()
+    eq(complete("VaultEncrypt --encrypt-vault-id "), {}, "a vault label is not a file and not a flag")
+  end
+
   tests["a credential path with spaces survives quoting and escaping"] = function()
     local fake = H.create_fake_vault()
     H.reset_config(fake, { password_files = false })

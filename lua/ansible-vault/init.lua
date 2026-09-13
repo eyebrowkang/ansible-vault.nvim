@@ -88,8 +88,10 @@ end
 
 ---Flags that name which credential opens a vault, spelled exactly as
 ---`ansible-vault` spells them.
+---`complete` names what the flag's *value* is, for argument completion. A flag
+---with a value but no `complete` is one whose value nothing here can enumerate.
 local CREDENTIAL_FLAGS = {
-  ["--vault-password-file"] = { key = "password_files", value = true, list = true },
+  ["--vault-password-file"] = { key = "password_files", value = true, list = true, complete = "file" },
   ["--vault-id"] = { key = "vault_ids", value = true, list = true },
   ["--ask-vault-password"] = { key = "ask_password", value = false },
 }
@@ -107,7 +109,7 @@ local FLAG_SETS = {
     ["--encrypt-vault-id"] = { key = "encrypt_vault_id", value = true },
   }),
   rekey = vim.tbl_extend("force", {}, CREDENTIAL_FLAGS, {
-    ["--new-vault-password-file"] = { key = "new_password_file", value = true },
+    ["--new-vault-password-file"] = { key = "new_password_file", value = true, complete = "file" },
     ["--new-vault-id"] = { key = "new_vault_id", value = true },
   }),
 }
@@ -203,12 +205,55 @@ local function parse_operation_options(args, command)
   return result, nil
 end
 
+---The arguments already complete to the left of the one being typed.
+---
+---`ArgLead` is only the text after the last space, so on its own it cannot say
+---*which* argument that text is. The command line up to the cursor can, and what
+---sits in front of the token under the cursor is what decides whether a flag
+---name, one flag's value, or a file name comes next.
+---
+---The first whitespace-delimited token is the range and command name together,
+---as in `'<,'>VaultEdit`, and is dropped. What follows goes through the same
+---tokenizer the command itself uses, so a quoted path counts as the one argument
+---it will become.
+---@param cmd_line string
+---@param cursor_pos integer
+---@return string[]
+local function given_args(cmd_line, cursor_pos)
+  local typed = cmd_line:sub(1, cursor_pos):match("^%s*%S+%s(.*)$")
+  if not typed then
+    return {}
+  end
+
+  local args = parse_command_args(typed)
+  if not typed:match("%s$") then
+    -- Still being typed, so it is not an argument that was given.
+    table.remove(args)
+  end
+  return args
+end
+
 ---@param arg_lead string
+---@param cmd_line string
+---@param cursor_pos integer
 ---@param command table
 ---@return string[]
-local function complete_args(arg_lead, command)
-  local candidates = flag_names(FLAG_SETS[command.flags])
+local function complete_args(arg_lead, cmd_line, cursor_pos, command)
+  local flags = FLAG_SETS[command.flags]
+  local given = given_args(cmd_line, cursor_pos)
+  local awaiting = flags[given[#given] or ""]
 
+  -- A flag that takes a value is followed by that value, never by another flag.
+  -- Offering flag names here suggested exactly the `--vault-id --encrypt-vault-id`
+  -- that the parser then rejects as a missing value.
+  if awaiting and awaiting.value then
+    if awaiting.complete == "file" then
+      return vim.fn.getcompletion(arg_lead, "file")
+    end
+    return {}
+  end
+
+  local candidates = flag_names(flags)
   if command.positionals and not arg_lead:match("^%-") then
     vim.list_extend(candidates, vim.fn.getcompletion(arg_lead, "file"))
   end
@@ -440,8 +485,8 @@ local function register_commands()
       nargs = "*",
       range = command.range or nil,
       bang = command.bang or nil,
-      complete = function(arg_lead)
-        return complete_args(arg_lead, command)
+      complete = function(arg_lead, cmd_line, cursor_pos)
+        return complete_args(arg_lead, cmd_line, cursor_pos, command)
       end,
       desc = command.desc,
       force = true,
