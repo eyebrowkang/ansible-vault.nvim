@@ -1,4 +1,4 @@
-.PHONY: all check test test-env test-real test-leak lint format changelog release-notes check-version
+.PHONY: all check helptags check-helptags test test-env test-real test-leak lint format changelog release-notes check-version
 
 all: lint test
 
@@ -21,9 +21,24 @@ test-real: test-env
 test-leak: test-env
 	ANSIBLE_VAULT_NVIM_REAL_BIN="$(CURDIR)/.venv/bin/ansible-vault" tests/crash_leak.sh
 
-lint:
+lint: check-helptags
 	stylua --check .
 	luacheck lua/ plugin/ tests/
+
+# `doc/tags` is generated, but it is committed: without it `:help ansible-vault`
+# fails outright, and a plugin manager is the only thing that would otherwise
+# build it. Anyone who clones into 'packpath' has no manager to do that.
+helptags:
+	nvim --headless -c 'helptags doc' -c q
+
+# Regenerate into a scratch copy and compare, so an edit that adds or removes a
+# help tag cannot leave the committed file behind.
+check-helptags:
+	@tmp=$$(mktemp -d) && cp doc/*.txt "$$tmp/" && nvim --headless -c "helptags $$tmp" -c q && \
+	  if ! diff -q "$$tmp/tags" doc/tags >/dev/null 2>&1; then \
+	    rm -rf "$$tmp"; printf '%s\n' 'doc/tags is missing or out of date; run: make helptags' >&2; exit 1; \
+	  fi; \
+	  rm -rf "$$tmp"
 
 format:
 	stylua .
