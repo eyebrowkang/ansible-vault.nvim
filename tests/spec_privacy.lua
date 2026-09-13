@@ -124,6 +124,48 @@ return function(H, tests)
     yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
   end
 
+  ---A Create or Edit scratch writes ciphertext to a *different* path, under a
+  ---`ansible-vault://` name nothing ever writes. Announcing that as a file write
+  ---would hand a buffer full of decrypted content to every formatter, linter and
+  ---save hook in the user's configuration — and a `*.yml` pattern matches that
+  ---URI. Only Decrypt's own-file save announces itself; see spec_core.
+  for _, kind in ipairs({ "create", "whole", "inline" }) do
+    tests["a " .. kind .. " protected save tells no write autocmd about its plaintext"] = function()
+      local fake = H.create_fake_vault()
+      H.reset_config(fake)
+      local scratch
+
+      if kind == "create" then
+        vim.cmd("VaultCreate " .. vim.fn.fnameescape(fake.dir .. "/created.yml"))
+        scratch = vim.api.nvim_get_current_buf()
+      else
+        local input = kind == "whole" and H.envelope("api_key: old\n") or H.inline("old", "api_key:")
+        local source = H.new_file_buffer(fake.dir, "vault.yml", input)
+        vim.api.nvim_win_set_cursor(0, { 1, 0 })
+        scratch = H.open_scratch("VaultEdit", source)
+      end
+
+      local seen = {}
+      for _, event in ipairs({ "BufWritePre", "BufWritePost" }) do
+        H.sabotage(event, {
+          pattern = "*",
+          callback = function(e)
+            table.insert(seen, event .. ":" .. tostring(e.file))
+          end,
+        })
+      end
+
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "api_key: " .. SECRET })
+      vim.cmd("silent write")
+      H.wait_until(function()
+        return not vim.api.nvim_buf_is_valid(scratch)
+      end, "the protected save should have succeeded")
+
+      eq(seen, {}, "a protected buffer's plaintext must not be offered to write autocmds")
+      eq(H.grep_under(fake.dir, SECRET), {}, "and no plaintext may have reached disk")
+    end
+  end
+
   --- Undo history ----------------------------------------------------------
 
   for _, scope in ipairs({ "whole", "inline" }) do
