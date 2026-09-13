@@ -159,6 +159,29 @@ return function(H, tests)
     eq(complete("VaultEncrypt --encrypt-vault-id "), {}, "a vault label is not a file and not a flag")
   end
 
+  for _, flag in ipairs({ "VaultEncrypt --vault-id", "VaultRekey --new-vault-id" }) do
+    tests["completion offers a password source after the @ of " .. flag] = function()
+      completion_dir()
+      local offered = complete(flag .. " prod@")
+      yes(vim.tbl_contains(offered, "prod@vault-pass"), vim.inspect(offered))
+      yes(vim.tbl_contains(offered, "prod@group_vars/"), "a directory leads to a password file")
+      yes(vim.tbl_contains(offered, "prod@prompt"), "asking in Neovim is a source like any other")
+
+      -- Neovim replaces the whole argument, so the label has to come back too.
+      eq(complete(flag .. " prod@vault-p"), { "prod@vault-pass" })
+      eq(complete(flag .. " prod@pro"), { "prod@prompt", "prod@prompt_ask_vault_pass" })
+    end
+  end
+
+  tests["completion leaves the vault id label to the user"] = function()
+    completion_dir()
+    eq(complete("VaultEncrypt --vault-id "), {}, "nothing here knows what a project calls its identities")
+    eq(complete("VaultEncrypt --vault-id pro"), {})
+    -- `credentials` requires a label before the separator, so completing without
+    -- one would offer an identity it then refuses to read.
+    eq(complete("VaultEncrypt --vault-id @"), {})
+  end
+
   tests["a credential path with spaces survives quoting and escaping"] = function()
     local fake = H.create_fake_vault()
     H.reset_config(fake, { password_files = false })

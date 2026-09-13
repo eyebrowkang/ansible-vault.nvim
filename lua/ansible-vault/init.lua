@@ -92,7 +92,7 @@ end
 ---with a value but no `complete` is one whose value nothing here can enumerate.
 local CREDENTIAL_FLAGS = {
   ["--vault-password-file"] = { key = "password_files", value = true, list = true, complete = "file" },
-  ["--vault-id"] = { key = "vault_ids", value = true, list = true },
+  ["--vault-id"] = { key = "vault_ids", value = true, list = true, complete = "vault_id" },
   ["--ask-vault-password"] = { key = "ask_password", value = false },
 }
 
@@ -110,7 +110,7 @@ local FLAG_SETS = {
   }),
   rekey = vim.tbl_extend("force", {}, CREDENTIAL_FLAGS, {
     ["--new-vault-password-file"] = { key = "new_password_file", value = true, complete = "file" },
-    ["--new-vault-id"] = { key = "new_vault_id", value = true },
+    ["--new-vault-id"] = { key = "new_vault_id", value = true, complete = "vault_id" },
   }),
 }
 
@@ -233,6 +233,39 @@ local function given_args(cmd_line, cursor_pos)
   return args
 end
 
+---Ansible's own spellings for "ask me", which are sources rather than paths.
+local PROMPT_SOURCES = { "prompt", "prompt_ask_vault_pass" }
+
+---Complete the source half of a `label@source` vault id.
+---
+---The label is the user's own name for an identity, and nothing here can know
+---which names their project uses, so completion begins at the `@`. What follows
+---it is a password file or one of Ansible's prompt sources. A label is required
+---before that `@`, because `credentials` reads an identity the same way and
+---would not accept what completing an empty one produced.
+---
+---Candidates carry the label back with them: Neovim replaces the whole ArgLead,
+---not just the part after the separator.
+---@param arg_lead string
+---@return string[]
+local function complete_vault_id(arg_lead)
+  local label, source = arg_lead:match("^([^@]+)@(.*)$")
+  if not label then
+    return {}
+  end
+
+  local candidates = {}
+  for _, prompt in ipairs(PROMPT_SOURCES) do
+    if vim.startswith(prompt, source) then
+      table.insert(candidates, label .. "@" .. prompt)
+    end
+  end
+  for _, path in ipairs(vim.fn.getcompletion(source, "file")) do
+    table.insert(candidates, label .. "@" .. path)
+  end
+  return candidates
+end
+
 ---@param arg_lead string
 ---@param cmd_line string
 ---@param cursor_pos integer
@@ -249,6 +282,9 @@ local function complete_args(arg_lead, cmd_line, cursor_pos, command)
   if awaiting and awaiting.value then
     if awaiting.complete == "file" then
       return vim.fn.getcompletion(arg_lead, "file")
+    end
+    if awaiting.complete == "vault_id" then
+      return complete_vault_id(arg_lead)
     end
     return {}
   end
