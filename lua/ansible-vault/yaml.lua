@@ -42,8 +42,15 @@ function M.indent_width(line)
   return #(line:match("^([ \t]*)") or "")
 end
 
+---Cut a trailing `#` comment off a scalar, leaving quoted text alone.
+---
+---A quote only opens a quoted scalar where one may start — the first non-space
+---character, the same rule `parse_key_line` applies to a key. Anywhere else it
+---is ordinary data: `don't # deployment password` is the plain scalar `don't`
+---with a comment after it, and treating the apostrophe as an opening quote
+---would encrypt the comment as part of the password.
 function M.strip_comment(line)
-  local quote, escaped
+  local quote, escaped, started
   local i = 1
   while i <= #line do
     local c = line:sub(i, i)
@@ -60,10 +67,13 @@ function M.strip_comment(line)
         end
         escaped = false
       end
-    elseif c == "'" or c == '"' then
+    elseif not started and (c == "'" or c == '"') then
       quote = c
+      started = true
     elseif c == "#" and (i == 1 or line:sub(i - 1, i - 1):match("%s")) then
       return line:sub(1, i - 1)
+    elseif c:match("%S") then
+      started = true
     end
     i = i + 1
   end

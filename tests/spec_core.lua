@@ -373,6 +373,9 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
   local shapes = {
     { "key", { "password: secret" }, "secret", "password: !vault |" },
     { "quoted-key-comment", { [['a: b': "sec#ret" # comment]] }, "sec#ret", "'a: b': !vault |" },
+    -- The apostrophe is data, so the trailing comment is still a comment and
+    -- never part of the secret handed to ansible-vault.
+    { "apostrophe-comment", { [[password: don't # deployment password]] }, "don't", "password: !vault |" },
     { "nested-list-key", { "    - password: value" }, "value", "    - password: !vault |" },
     { "bare-list", { "    - value" }, "value", "    - !vault |" },
     { "scalar", { "plain-value" }, "plain-value", nil },

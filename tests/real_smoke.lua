@@ -373,6 +373,9 @@ check("range Encrypt preserves each value's exact bytes through real Ansible", f
     { { "password: |+", "  first", "", "" }, "first\n\n\n" },
     { { "password: |2-", "    indented", "  normal" }, "  indented\nnormal" },
     { { "    - password: value" }, "value" },
+    -- The apostrophe is data and the trailing comment is a comment, so the bytes
+    -- real Ansible encrypted must be the password alone.
+    { { "password: don't # deployment password" }, "don't" },
   }
   for index, case in ipairs(cases) do
     local buf = vim.api.nvim_create_buf(true, false)
