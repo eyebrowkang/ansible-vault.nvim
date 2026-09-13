@@ -153,6 +153,9 @@ def main():
     elif action == "encrypt":
         sys.stdout.buffer.write(envelope(data, selected[1], label))
     elif action == "encrypt_string":
+        if not data:
+            sys.stderr.write("stdin was empty, not encrypting\n")
+            return 1
         encrypted = envelope(data, selected[1], label).decode()
         sys.stdout.write(name + ": !vault |\n" + "".join("          " + line + "\n" for line in encrypted.splitlines()))
     elif action == "rekey":

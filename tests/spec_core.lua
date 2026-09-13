@@ -215,7 +215,6 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
   -- test: a round trip through the implementation's own parse/format pair would
   -- agree with itself no matter how wrong it was.
   local byte_values = {
-    { "empty", "" },
     { "no trailing newline", "single" },
     { "one trailing newline", "single\n" },
     { "three trailing newlines", "one\ntwo\n\n\n" },
@@ -251,6 +250,32 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
       eq(H.lines(buf)[1], "password: !vault |", "the key must come from the buffer, not from ansible-vault")
       eq(H.lines(buf)[#H.lines(buf)], "other: keep")
     end
+  end
+
+  tests["an empty inline value decrypts but cannot be re-encrypted"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = H.inline("")
+    table.insert(input, "other: keep")
+    local buf = H.new_buffer(input)
+    vim.cmd("1,3VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == 'password: ""'
+    end)
+    local before = H.lines(buf)
+    local modified = vim.bo[buf].modified
+    H.command_fails("1VaultEncrypt")
+    yes(H.notification_contains("Encryption failed"), H.notification_text())
+    eq(H.lines(buf), before, "empty inline encryption must leave the value and its neighbor unchanged")
+    eq(vim.bo[buf].modified, modified)
+    eq(H.calls(fake, "encrypt_string"), 1)
+
+    -- The failure must finish the operation, not leave the buffer locked.
+    vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "password: retry" })
+    vim.cmd("1VaultEncrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "password: !vault |"
+    end)
   end
 
   tests["a value ending in a newline survives at end of file without a final EOL"] = function()
@@ -351,7 +376,6 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
     { "nested-list-key", { "    - password: value" }, "value", "    - password: !vault |" },
     { "bare-list", { "    - value" }, "value", "    - !vault |" },
     { "scalar", { "plain-value" }, "plain-value", nil },
-    { "empty", { 'password: ""' }, "", "password: !vault |" },
     { "literal-strip", { "password: |-", "  first", "  second" }, "first\nsecond", "password: !vault |" },
     { "literal-clip", { "password: |", "  first", "  second" }, "first\nsecond\n", "password: !vault |" },
     { "literal-keep", { "password: |+", "  first", "", "" }, "first\n\n\n", "password: !vault |" },
@@ -423,13 +447,13 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
 
   --- Edit -----------------------------------------------------------------
 
-  tests["whole Edit saves ciphertext repeatedly and does not close scratch"] = function()
+  tests["whole Edit saves repeatedly then reopens the latest plaintext from disk"] = function()
     local fake, source, path = fixture()
     local scratch = H.open_scratch("VaultEdit", source)
     H.assert_hardened(scratch)
     eq(vim.bo[scratch].buftype, "acwrite")
     for _, value in ipairs({ "plain: first", "plain: second" }) do
-      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { value })
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { value, "extra: line" })
       vim.cmd("silent write")
       yes(vim.api.nvim_buf_is_valid(scratch))
       eq(vim.api.nvim_get_current_buf(), scratch)
@@ -437,22 +461,15 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
       yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
     end
     eq(H.calls(fake, "encrypt"), 2)
-  end
-
-  tests["whole Edit round-trips the edited plaintext through the real file"] = function()
-    local fake, source, path = fixture()
-    local scratch = H.open_scratch("VaultEdit", source)
-    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: edited", "extra: line" })
-    vim.cmd("silent write")
-    pcall(vim.api.nvim_buf_delete, scratch, { force = true })
+    vim.api.nvim_buf_delete(scratch, { force = true })
+    vim.api.nvim_buf_delete(source, { force = true })
     local reopened = H.open_file(path)
     yes(H.encrypted(reopened))
     vim.cmd("VaultDecrypt")
     H.wait_until(function()
-      return H.lines(reopened)[1] == "plain: edited"
+      return H.lines(reopened)[1] == "plain: second"
     end)
-    eq(H.lines(reopened), { "plain: edited", "extra: line" })
-    eq(H.calls(fake, "encrypt"), 1)
+    eq(H.lines(reopened), { "plain: second", "extra: line" })
   end
 
   tests["inline Edit allows preexisting dirty source and only splices its block"] = function()

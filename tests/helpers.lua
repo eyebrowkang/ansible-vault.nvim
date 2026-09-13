@@ -8,52 +8,15 @@
 ---"the command succeeded" here means the credential plumbing worked. It is not a
 ---cryptographic or precedence oracle: actual Ansible behaviour is checked against
 ---the real binary in `real_smoke.lua`.
-local H = { root = vim.fn.getcwd() }
+local H = dofile(vim.fn.getcwd() .. "/tests/support.lua")
+H.root = vim.fn.getcwd()
 local notifications, patches, sabotages = {}, {}, {}
 local vault = require("ansible-vault")
-
-function H.assert_eq(actual, expected, message)
-  if not vim.deep_equal(actual, expected) then
-    error(
-      (message or "values differ") .. "\nexpected: " .. vim.inspect(expected) .. "\nactual: " .. vim.inspect(actual),
-      2
-    )
-  end
-end
-
-function H.assert_true(value, message)
-  if not value then
-    error(message or "expected truthy value", 2)
-  end
-end
-
-function H.assert_false(value, message)
-  H.assert_true(not value, message or "expected false value")
-end
 
 function H.wait_until(predicate, message, timeout)
   if not vim.wait(timeout or 5000, predicate, 10) then
     error((message or "timed out") .. "\nnotifications: " .. vim.inspect(notifications), 2)
   end
-end
-
-function H.write_file(path, contents)
-  local file = assert(io.open(path, "wb"))
-  assert(file:write(contents))
-  assert(file:close())
-end
-
-function H.read_file(path)
-  local file = assert(io.open(path, "rb"))
-  local contents = file:read("*a")
-  assert(file:close())
-  return contents
-end
-
-function H.temp_dir()
-  local dir = vim.fn.tempname()
-  vim.fn.mkdir(dir, "p")
-  return dir
 end
 
 ---Every file under `dir`, so a test can prove nothing new appeared.
@@ -141,19 +104,10 @@ function H.new_buffer(lines)
   return buf
 end
 
-function H.open_file(path)
-  vim.cmd("silent edit " .. vim.fn.fnameescape(path))
-  return vim.api.nvim_get_current_buf()
-end
-
 function H.new_file_buffer(dir, name, lines)
   local path = dir .. "/" .. name
   H.write_file(path, table.concat(lines, "\n") .. "\n")
   return H.open_file(path), path
-end
-
-function H.lines(buf)
-  return vim.api.nvim_buf_get_lines(buf or 0, 0, -1, false)
 end
 
 function H.text(buf)

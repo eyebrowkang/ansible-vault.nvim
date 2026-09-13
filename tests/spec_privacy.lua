@@ -333,6 +333,41 @@ return function(H, tests)
     assert_no_persisted_copy(dirs)
   end
 
+  tests["inline Decrypt does not insert plaintext when protection fails"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = { "before: keep" }
+    vim.list_extend(input, H.inline(SECRET, "api_key:"))
+    table.insert(input, "after: keep")
+    local buf, path = H.new_file_buffer(fake.dir, "inline.yml", input)
+    local disk = H.read_file(path)
+    local plaintext_seen = false
+    vim.api.nvim_buf_attach(buf, false, {
+      on_lines = function()
+        plaintext_seen = plaintext_seen or H.text(buf):find(SECRET, 1, true) ~= nil
+      end,
+    })
+    local secure = require("ansible-vault.secure")
+    local protect = secure.protect
+    H.patch(secure, "protect", function()
+      return false
+    end)
+    H.command_fails("2,4VaultDecrypt")
+    no(plaintext_seen, "not even a transient change may expose plaintext after protect returns false")
+    eq(H.lines(buf), input)
+    eq(H.read_file(path), disk)
+    no(vim.bo[buf].modified)
+
+    secure.protect = protect
+    vim.cmd("2,4VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[2] == "api_key: " .. SECRET
+    end)
+    eq(H.lines(buf), { "before: keep", "api_key: " .. SECRET, "after: keep" })
+    H.assert_hardened(buf)
+    eq(H.read_file(path), disk, "a successful retry still leaves saving to the user")
+  end
+
   tests["a buffer that cannot be secured is not left half managed"] = function()
     local dirs = persistence_dirs()
     local fake = H.create_fake_vault()
@@ -355,11 +390,7 @@ return function(H, tests)
     yes(H.notification_contains("could not be secured"), H.notification_text())
     yes(H.text(buf):find(SECRET, 1, true) ~= nil, "precondition: the plaintext did land in the buffer")
 
-    -- Neither managed nor still hooked: a half-installed session would leave a
-    -- `BufWriteCmd` behind with nothing to service it.
-    eq(require("ansible-vault.plaintext").get(buf), nil, "no session may be registered")
-    eq(#vim.api.nvim_get_autocmds({ event = "BufWriteCmd", buffer = buf }), 0, "no write hook may be left behind")
-    eq(#vim.api.nvim_get_autocmds({ event = "FileWriteCmd", buffer = buf }), 0)
+    eq(vim.bo[buf].buftype, "", "a failed setup must not leave an unusable managed buffer")
 
     -- The part that matters: failing to secure a buffer is no reason to unsecure
     -- it. Putting 'swapfile' back here would persist the secret immediately.
@@ -369,6 +400,21 @@ return function(H, tests)
     vim.cmd("silent! preserve")
     assert_no_persisted_copy(dirs)
     eq(H.read_file(path), before)
+
+    -- A stale write handler would swallow or refuse this intentional save.
+    vim.cmd("silent write")
+    eq(H.read_file(path), "api_key: " .. SECRET .. "\n")
+    no(vim.bo[buf].modified)
+    assert_no_persisted_copy(dirs)
+
+    -- Nor may a failed setup strand the buffer for later operations/writers.
+    vim.cmd("VaultEncrypt")
+    H.wait_until(function()
+      return H.encrypted(buf)
+    end)
+    local partial = dirs.base .. "/ciphertext-header"
+    vim.cmd("silent 1write " .. vim.fn.fnameescape(partial))
+    yes(H.read_file(partial):match("^%$ANSIBLE_VAULT;"))
   end
 
   for _, command in ipairs({ "VaultCreate", "VaultEdit" }) do
@@ -528,10 +574,6 @@ return function(H, tests)
     if kind == "Edit scratch" then
       local source = H.new_file_buffer(dir, "vault.yml", H.envelope("a: " .. SECRET .. "\nb: two\nc: three\n"))
       return H.open_scratch("VaultEdit", source)
-    end
-    if kind == "View float" then
-      local source = H.new_file_buffer(dir, "vault.yml", H.envelope("a: " .. SECRET .. "\nb: two\n"))
-      return H.open_scratch("VaultView", source)
     end
     vim.cmd("VaultCreate " .. vim.fn.fnameescape(dir .. "/created.yml"))
     local buf = vim.api.nvim_get_current_buf()

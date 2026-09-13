@@ -6,7 +6,7 @@ local root = vim.fn.getcwd() .. "/tests/"
 local H = dofile(root .. "helpers.lua")
 
 local tests = {}
-for _, spec in ipairs({ "spec_core", "spec_privacy", "spec_credentials", "spec_async" }) do
+for _, spec in ipairs({ "spec_core", "spec_privacy", "spec_credentials", "spec_yaml", "spec_health", "spec_async" }) do
   dofile(root .. spec .. ".lua")(H, tests)
 end
 

@@ -1,0 +1,124 @@
+---YAML parsing and formatting used by the inline lifecycle.
+---@param H table
+---@param tests table
+return function(H, tests)
+  local eq, yes, no = H.assert_eq, H.assert_true, H.assert_false
+  local yaml = require("ansible-vault.yaml")
+
+  --- YAML shapes --------------------------------------------------------
+
+  tests["every inline block shape ansible accepts is parsed"] = function()
+    local body = "          $ANSIBLE_VAULT;1.2;AES256;prod\n          6162636465"
+    local cases = {
+      { "canonical", "password: !vault |\n" .. body, "password" },
+      { "chomping indicator", "password: !vault |-\n" .. body, "password" },
+      { "indent indicator", "password: !vault |2-\n" .. body, "password" },
+      -- Ansible writes `|`, but a hand-written `>` block holds the same payload
+      -- and refusing to read it would strand the value.
+      { "folded scalar", "password: !vault >\n" .. body, "password" },
+      { "trailing comment", "password: !vault | # note\n" .. body, "password" },
+      { "double quoted key", '"password": !vault |\n' .. body, "password" },
+      { "single quoted key", "'password': !vault |\n" .. body, "password" },
+      { "colon inside a quoted key", "'a: b': !vault |\n" .. body, "a: b" },
+      { "list item", "- password: !vault |\n" .. body, "password" },
+      { "nested key", "    password: !vault |\n" .. body, "password" },
+      { "bare list item", "- !vault |\n" .. body, nil },
+    }
+    for _, case in ipairs(cases) do
+      local parsed = yaml.parse_block(case[2])
+      yes(parsed ~= nil, case[1] .. ": failed to parse")
+      eq(parsed.var_name, case[3], case[1] .. ": wrong key")
+      eq(parsed.vault_content, "$ANSIBLE_VAULT;1.2;AES256;prod\n6162636465\n", case[1] .. ": unclean ciphertext")
+      eq(parsed.header.label, "prod", case[1] .. ": vault id label was not read")
+    end
+
+    eq(yaml.parse_block("password: hunter2"), nil, "a plain value is not a vault block")
+    eq(yaml.parse_block("password: !vault |"), nil, "a header with no ciphertext is not a block")
+    eq(yaml.parse_block("password: !vault |\n          $ANSIBLE_VAULT;1.1;AES256"), nil, "no payload")
+    eq(
+      yaml.parse_block("password: !vault |\n          $ANSIBLE_VAULT;1.1;AES256\n            6162"),
+      nil,
+      "an unevenly indented payload is not one block"
+    )
+    eq(
+      yaml.parse_block("password: !vault |\n          $ANSIBLE_VAULT;1.1;AES256\n          61z2"),
+      nil,
+      "a payload must be hex"
+    )
+  end
+
+  tests["a folded plaintext scalar is refused rather than guessed at"] = function()
+    -- Reading a `>` envelope is safe; turning a folded *plaintext* scalar into
+    -- one is not, because folding rewrites the value's newlines.
+    local parsed, err = yaml.parse_plaintext({ "password: >", "  first", "  second" }, true)
+    eq(parsed, nil)
+    yes(err ~= nil and err:find("folded", 1, true) ~= nil, tostring(err))
+  end
+
+  tests["carriage returns never reach ansible-vault"] = function()
+    local parsed = yaml.parse_block("password: !vault |\r\n          $ANSIBLE_VAULT;1.1;AES256\r\n          6162\r")
+    yes(parsed ~= nil, "a CRLF block should parse")
+    eq(parsed.vault_content, "$ANSIBLE_VAULT;1.1;AES256\n6162\n")
+  end
+
+  tests["header parsing reads version and label and rejects non-headers"] = function()
+    eq(yaml.parse_header("$ANSIBLE_VAULT;1.2;AES256;prod"), { version = "1.2", cipher = "AES256", label = "prod" })
+    eq(yaml.parse_header("$ANSIBLE_VAULT;1.1;AES256"), { version = "1.1", cipher = "AES256" })
+    eq(yaml.parse_header("          $ANSIBLE_VAULT;1.2;AES256;dev").label, "dev")
+    eq(yaml.parse_header("not a header"), nil)
+    eq(yaml.parse_header("$ANSIBLE_VAULT;x;AES256"), nil)
+    eq(yaml.parse_header("$ANSIBLE_VAULT;1.1"), nil)
+  end
+
+  tests["an envelope is validated before it can replace anything"] = function()
+    eq(yaml.vault_lines("$ANSIBLE_VAULT;1.1;AES256\n6162\n"), { "$ANSIBLE_VAULT;1.1;AES256", "6162" })
+    eq(yaml.vault_lines("$ANSIBLE_VAULT;1.1;AES256\n"), nil, "a header alone is not an envelope")
+    eq(yaml.vault_lines(""), nil)
+    eq(yaml.vault_lines("not a vault file\n6162\n"), nil)
+    eq(yaml.vault_lines("$ANSIBLE_VAULT;1.1;AES256\n616\n"), nil, "an odd number of hex digits is not a payload")
+    eq(yaml.vault_lines("$ANSIBLE_VAULT;1.1;AES256\nnothex\n"), nil)
+  end
+
+  tests["only the ciphertext is taken from encrypt_string output"] = function()
+    -- The key ansible-vault echoes back is its own re-rendering of --stdin-name,
+    -- which is not always the YAML the user wrote.
+    local output = "renamed_key: !vault |\n          $ANSIBLE_VAULT;1.1;AES256\n          6162\n"
+    eq(yaml.extract_envelope(output), { "$ANSIBLE_VAULT;1.1;AES256", "6162" })
+    eq(yaml.extract_envelope("no envelope here"), nil)
+    eq(yaml.format_vault(output, { indent = "  ", dash = "- ", key_raw = "'a: b'" }), {
+      "  - 'a: b': !vault |",
+      "      $ANSIBLE_VAULT;1.1;AES256",
+      "      6162",
+    })
+    local lines, err = yaml.format_vault("garbage", {})
+    eq(lines, nil)
+    yes(err ~= nil)
+  end
+
+  tests["a block is only found when the cursor is inside it"] = function()
+    local lines = {
+      "before: x",
+      "password: !vault |",
+      "          $ANSIBLE_VAULT;1.1;AES256",
+      "          6162",
+      "after: y",
+    }
+    eq({ yaml.find_block(lines, 2) }, { 2, 4 })
+    eq({ yaml.find_block(lines, 4) }, { 2, 4 })
+    eq({ yaml.find_block(lines, 5) }, {}, "a line below the payload is not inside the block")
+    eq({ yaml.find_block(lines, 1) }, {}, "nor is a line above it")
+  end
+
+  tests["values that would be ambiguous as bare YAML are quoted"] = function()
+    local ambiguous = { "", "true", "no", "null", " leading", "trailing ", "a: b", "#comment", "- item", "1.5" }
+    for _, value in ipairs(ambiguous) do
+      yes(yaml.needs_quoting(value), string.format("%q must be quoted", value))
+      local quoted = yaml.quote_value(value)
+      eq(yaml.unquote(quoted), value, string.format("%q must survive quoting", value))
+    end
+    for _, value in ipairs({ "plain", "some value", "a-b_c" }) do
+      no(yaml.needs_quoting(value), string.format("%q needs no quoting", value))
+      eq(yaml.quote_value(value), value)
+    end
+  end
+end

@@ -85,11 +85,11 @@ expect_absent() {
 }
 
 # Run one scenario: build a fresh state tree, run the given Lua until it prints
-# READY, then either SIGKILL it (crash) or let it exit (clean).
+# READY, then SIGKILL it and look for the secret on disk.
 #
-# $1 scenario name, $2 "crash"|"clean", $3 Lua body
+# $1 scenario name, $2 Lua body
 run_scenario() {
-  local name="$1" mode="$2" body="$3"
+  local name="$1" body="$2"
   # WORK stays global on purpose: the caller checks the scenario's own files
   # afterwards, and recomputing the path is how a check ends up grepping
   # something that was never there.
@@ -165,13 +165,7 @@ LUA
     return
   fi
 
-  if [ "$mode" = "crash" ]; then
-    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
-  else
-    [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null
-    sleep 0.3
-    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
-  fi
+  [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
   wait "$runner" 2>/dev/null
 
   scan "swap files" "$SECRET" "$STATE/swap"
@@ -189,7 +183,7 @@ echo "Plaintext residue after SIGKILL:"
 
 # 1. The plaintext is in the buffer and was never saved. Nothing on disk may
 #    hold it, including the vault file itself.
-run_scenario "decrypted buffer, never saved" crash '
+run_scenario "decrypted buffer, never saved" '
 vim.cmd("silent edit " .. WORK .. "/vault.yml")
 local buf = vim.api.nvim_get_current_buf()
 vim.cmd("VaultDecrypt")
@@ -200,7 +194,7 @@ expect_absent "the vault file on disk is still ciphertext" "$SECRET" "$WORK/vaul
 
 # 2. A read-only View float. Nothing it shows may reach the disk, and it must not
 #    stage the plaintext in a temporary file to get it there.
-run_scenario "View float open" crash '
+run_scenario "View float open" '
 vim.cmd("silent edit " .. WORK .. "/vault.yml")
 vim.cmd("VaultView")
 assert(wait_for(function()
@@ -210,7 +204,7 @@ end), "view never opened")
 expect_absent "View left the vault file alone" "$SECRET" "$WORK/vault.yml"
 
 # 3. An Edit scratch with unsaved plaintext in it.
-run_scenario "Edit scratch with unsaved changes" crash '
+run_scenario "Edit scratch with unsaved changes" '
 vim.cmd("silent edit " .. WORK .. "/vault.yml")
 local source = vim.api.nvim_get_current_buf()
 vim.cmd("VaultEdit")
@@ -222,14 +216,14 @@ vim.api.nvim_buf_set_lines(scratch, -1, -1, false, { "more: " .. SECRET })
 expect_absent "Edit left the vault file alone" "$SECRET" "$WORK/vault.yml"
 
 # 4. A Create buffer that was never written.
-run_scenario "Create buffer never written" crash '
+run_scenario "Create buffer never written" '
 vim.cmd("VaultCreate " .. WORK .. "/created.yml")
 vim.api.nvim_buf_set_lines(0, 0, -1, false, { "api_key: " .. SECRET })
 '
 
 # 5. The explicit decrypt-and-save path. The target file is SUPPOSED to hold the
 #    plaintext afterwards; everything else still must not.
-run_scenario "explicit Decrypt then save" crash '
+run_scenario "explicit Decrypt then save" '
 vim.cmd("silent edit " .. WORK .. "/vault.yml")
 local buf = vim.api.nvim_get_current_buf()
 vim.cmd("VaultDecrypt")
@@ -240,7 +234,7 @@ expect_present "the file the user explicitly saved holds the plaintext, as asked
 
 # 6. Decrypt, re-encrypt, then save. Only ciphertext was ever asked for, so no
 #    copy of the plaintext may be left anywhere.
-run_scenario "Decrypt then Encrypt then save" crash '
+run_scenario "Decrypt then Encrypt then save" '
 vim.cmd("silent edit " .. WORK .. "/vault.yml")
 local buf = vim.api.nvim_get_current_buf()
 vim.cmd("VaultDecrypt")
@@ -254,7 +248,7 @@ expect_absent "the re-encrypted file holds no plaintext" "$SECRET" "$WORK/vault.
 # 7. Abandoning a decrypt by reloading the file. The only thing ever asked for
 #    was ciphertext, so no copy of the plaintext may survive — including in the
 #    undo state the reload leaves behind.
-run_scenario "Decrypt then reload then save" crash '
+run_scenario "Decrypt then reload then save" '
 vim.cmd("silent edit " .. WORK .. "/vault.yml")
 local buf = vim.api.nvim_get_current_buf()
 vim.cmd("VaultDecrypt")
