@@ -1,4 +1,4 @@
-.PHONY: all check test test-env test-real test-leak lint format
+.PHONY: all check test test-env test-real test-leak lint format changelog
 
 all: lint test
 
@@ -28,3 +28,8 @@ lint:
 format:
 	stylua .
 
+# Review and commit this file before creating the release tag.
+changelog:
+	@printf '%s\n' "$(VERSION)" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$$' || { printf '%s\n' 'Usage: make changelog VERSION=vX.Y.Z' >&2; exit 1; }
+	@if grep -Fq '## [$(VERSION:v%=%)]' CHANGELOG.md; then printf '%s\n' 'This version is already in CHANGELOG.md; review its existing entry.' >&2; exit 1; fi
+	git-cliff --config cliff.toml --unreleased --tag "$(VERSION)" --prepend CHANGELOG.md
