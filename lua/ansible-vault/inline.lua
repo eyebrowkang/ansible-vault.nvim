@@ -17,14 +17,11 @@ local M = {}
 
 local buffer = require("ansible-vault.buffer")
 local cli = require("ansible-vault.cli")
-local config = require("ansible-vault.config")
 local op = require("ansible-vault.op")
 local plaintext = require("ansible-vault.plaintext")
 local secure = require("ansible-vault.secure")
 local ui = require("ansible-vault.ui")
 local yaml = require("ansible-vault.yaml")
-
-local notify = config.notify
 
 ---@class AnsibleVaultRegion
 ---@field start_row integer 1-based, inclusive
@@ -273,7 +270,7 @@ function M.encrypt_region(buf, region, opts)
         return
       end
 
-      notify("Value encrypted successfully", vim.log.levels.INFO)
+      vim.notify("Value encrypted successfully", vim.log.levels.INFO)
     end, opts, creds)
   end, opts, context)
 end
@@ -324,17 +321,14 @@ function M.decrypt_region(buf, region, opts)
       -- file this buffer would otherwise keep. Clearing the undo history is part
       -- of the same rule: an undone decrypt must not leave the value recoverable
       -- from an undo file.
-      secure.protect(buf)
-      local ok, err = secure.with_cleared_undo(buf, function()
-        vim.api.nvim_buf_set_lines(buf, region.start_row - 1, region.end_row, false, replacement)
-      end)
+      local ok, err = secure.set_plaintext_lines(buf, replacement, region.start_row - 1, region.end_row)
       if not ok then
         vim.notify("Failed to update the selection: " .. tostring(err), vim.log.levels.ERROR)
         return
       end
 
       plaintext.enter(buf)
-      notify(string.format("%s decrypted in place", parsed.var_name or "Value"), vim.log.levels.INFO)
+      vim.notify(string.format("%s decrypted in place", parsed.var_name or "Value"), vim.log.levels.INFO)
     end, opts, creds)
   end, opts, context)
 end
@@ -453,7 +447,7 @@ function M.rekey_region(buf, region, opts)
           return
         end
 
-        notify(value_name .. " rekeyed successfully", vim.log.levels.INFO)
+        vim.notify(value_name .. " rekeyed successfully", vim.log.levels.INFO)
       end, opts, new_creds)
     end, opts, creds)
   end, opts, context)

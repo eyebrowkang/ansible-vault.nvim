@@ -13,7 +13,6 @@
 ---this is named for what it does rather than looking like a plain getter.
 local M = {}
 
-local config = require("ansible-vault.config")
 local secure = require("ansible-vault.secure")
 local yaml = require("ansible-vault.yaml")
 
@@ -248,7 +247,7 @@ function M.replace_lines(buf, expected_changedtick, output, success_message)
   end)
 
   M.remember_header(buf, lines)
-  config.notify(success_message, vim.log.levels.INFO)
+  vim.notify(success_message, vim.log.levels.INFO)
   return true
 end
 

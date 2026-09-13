@@ -13,8 +13,16 @@
 ---plaintext on disk asks for it.
 local M = {}
 
-local cli = require("ansible-vault.cli")
 local secure = require("ansible-vault.secure")
+
+---@param output string
+---@return string[]
+local function display_lines(output)
+  if output == "" then
+    return { "" }
+  end
+  return vim.split(output, "\n", { plain = true })
+end
 
 ---@param output string
 ---@param title string
@@ -46,7 +54,7 @@ function M.open_float(output, title, filetype)
     return
   end
 
-  local lines = cli.output_to_lines(output)
+  local lines = display_lines(output)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].filetype = filetype or ""
   vim.bo[buf].modifiable = false

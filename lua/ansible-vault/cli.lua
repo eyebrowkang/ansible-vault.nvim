@@ -86,15 +86,6 @@ function M.build_argv(action, args, target, opts)
   return argv
 end
 
----@param output string
----@return string[]
-function M.output_to_lines(output)
-  if output == "" then
-    return { "" }
-  end
-  return vim.split(output, "\n", { plain = true })
-end
-
 ---@param text string
 ---@param needle string
 ---@param replacement string

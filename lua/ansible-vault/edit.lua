@@ -32,7 +32,24 @@ local plaintext = require("ansible-vault.plaintext")
 local secure = require("ansible-vault.secure")
 local yaml = require("ansible-vault.yaml")
 
-local notify = config.notify
+---@class AnsibleVaultEditSession: AnsibleVaultSession
+---@field action "encrypt"|"encrypt_string"
+---@field publish fun(session: AnsibleVaultEditSession, output: string, bang: boolean): boolean, string|nil
+---@field write_name string Fixed buffer name accepted by the writer
+---@field opts? table Per-command options, without resolved credentials
+---@field context { file_path?: string, header_label?: string }
+---@field stdin_name? string Name echoed by encrypt_string
+---@field source_buf? integer Buffer the ciphertext came from
+---@field source_name? string Original source buffer name
+---@field source_file? string Source path, if file-backed
+---@field source_label? string Human-readable source name
+---@field source_signature? table Source file conflict baseline
+---@field source_tick? integer Source buffer conflict baseline
+---@field start_row? integer 1-based, inclusive
+---@field end_row? integer 1-based, inclusive
+---@field block_lines? string[] Original encrypted block
+---@field parsed? table YAML prefix and vault metadata
+---@field value_name? string Human-readable inline value name
 
 local SCHEME = "ansible-vault://"
 
@@ -58,7 +75,7 @@ end
 
 --- Delivering the ciphertext ------------------------------------------------
 
----@param session AnsibleVaultSession
+---@param session AnsibleVaultEditSession
 ---@param output string
 ---@param bang boolean
 ---@return boolean ok
@@ -105,7 +122,7 @@ local function publish_file(session, output, bang)
     buffer.remember_header(source)
   end
 
-  notify("Encrypted and saved: " .. session.target, vim.log.levels.INFO)
+  vim.notify("Encrypted and saved: " .. session.target, vim.log.levels.INFO)
   return true, nil
 end
 
@@ -114,7 +131,7 @@ end
 ---Deliberately snapshot-guarded rather than extmark-tracked: if anything about
 ---the source buffer moved, the block is not replaced at all. Getting the position
 ---wrong here would overwrite a value the user never opened.
----@param session AnsibleVaultSession
+---@param session AnsibleVaultEditSession
 ---@param output string
 ---@param bang boolean
 ---@return boolean ok
@@ -169,7 +186,7 @@ local function publish_inline(session, output, bang)
     vim.bo[session.buf].modified = false
   end
 
-  notify(
+  vim.notify(
     string.format("Encrypted %s back into %s; save that buffer to keep it", session.value_name, session.source_label),
     vim.log.levels.INFO
   )
@@ -186,7 +203,7 @@ end
 ---callback is gated on the session's epoch, which the write bumps on entry and
 ---again on exit — a result that arrives after the wait gave up belongs to nobody
 ---and must not write, clear 'modified' or release a lock.
----@param session AnsibleVaultSession
+---@param session AnsibleVaultEditSession
 ---@param path string
 ---@param bang boolean
 ---@return boolean ok
@@ -211,20 +228,25 @@ local function write_session(session, path, bang)
     end
   end
 
-  local epoch = session.epoch + 1
-  session.epoch = epoch
+  local epoch = plaintext.start_write(session)
+  if not epoch then
+    if session.kind == "inline" then
+      buffer.finish_operation(session.source_buf, "edit_inline")
+    end
+    return false, "this vault session is no longer active; nothing was written"
+  end
   local content = buffer.bytes(buf)
   local done, ok, err = false, false, nil
 
+  local function current()
+    return plaintext.current(session, epoch)
+  end
+
   local function settle(success, message)
-    if session.epoch ~= epoch then
+    if not current() then
       return
     end
     done, ok, err = true, success, message
-  end
-
-  local function current()
-    return session.epoch == epoch and plaintext.get(buf) == session
   end
 
   local handle
@@ -261,7 +283,7 @@ local function write_session(session, path, bang)
 
   -- Past this point nothing from this write may take effect, including a child
   -- that is still running and about to report.
-  session.epoch = session.epoch + 1
+  plaintext.invalidate(session, epoch)
 
   if session.kind == "inline" then
     buffer.finish_operation(session.source_buf, "edit_inline")
@@ -291,11 +313,7 @@ end
 ---@return boolean ok
 local function fill_plaintext(buf, content)
   local lines, eol, dos = buffer.content_to_lines(content)
-  -- The buffer was hardened when it was created, before this call: swap and undo
-  -- files must be off *before* the plaintext exists, not after.
-  local ok = secure.with_cleared_undo(buf, function()
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  end)
+  local ok = secure.set_plaintext_lines(buf, lines)
   if not ok then
     return false
   end
@@ -324,6 +342,45 @@ local function show_buffer(buf, preferred_win, split)
     return false
   end
   return pcall(vim.api.nvim_win_set_buf, 0, buf)
+end
+
+---@param buf integer
+local function discard_buffer(buf)
+  plaintext.release(buf, "never")
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+end
+
+---Create and name a protected buffer without leaving failed attempts behind.
+---@param name string
+---@return integer|nil buf
+---@return any err
+local function named_buffer(name)
+  local buf = secure.create_buffer(true, false)
+  local named, err = pcall(vim.api.nvim_buf_set_name, buf, name)
+  if not named then
+    discard_buffer(buf)
+    return nil, err
+  end
+  return buf, nil
+end
+
+---Register the shared writer before exposing a prepared buffer to the user.
+---@param session AnsibleVaultEditSession
+---@param win integer
+---@param split boolean
+---@return boolean opened
+---@return "secure"|"show"|nil failure
+local function open_session(session, win, split)
+  session.write = write_session
+  if not plaintext.manage(session) then
+    discard_buffer(session.buf)
+    return false, "secure"
+  end
+  if not show_buffer(session.buf, win, split) then
+    discard_buffer(session.buf)
+    return false, "show"
+  end
+  return true, nil
 end
 
 ---Create a new vault file.
@@ -358,10 +415,8 @@ function M.create(opts)
     return
   end
 
-  local buf = secure.create_buffer(true, false)
-  local named, name_err = pcall(vim.api.nvim_buf_set_name, buf, path)
-  if not named then
-    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  local buf, name_err = named_buffer(path)
+  if not buf then
     vim.notify("VaultCreate: " .. tostring(name_err), vim.log.levels.ERROR)
     return
   end
@@ -369,33 +424,28 @@ function M.create(opts)
   vim.bo[buf].filetype = vim.filetype.match({ filename = path }) or ""
   vim.bo[buf].modified = false
 
-  local managed = plaintext.manage({
+  local opened, failure = open_session({
     buf = buf,
     kind = "create",
     action = "encrypt",
-    write = write_session,
     publish = publish_file,
     write_name = path,
     target = path,
     signature = fs.signature(path),
     opts = opts,
     context = { file_path = path },
-  })
+  }, vim.api.nvim_get_current_win(), false)
 
-  if not managed then
-    pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    vim.notify("VaultCreate: the new buffer could not be secured; nothing was opened", vim.log.levels.ERROR)
+  if not opened then
+    if failure == "secure" then
+      vim.notify("VaultCreate: the new buffer could not be secured; nothing was opened", vim.log.levels.ERROR)
+    else
+      vim.notify("Failed to open a buffer for " .. path, vim.log.levels.ERROR)
+    end
     return
   end
 
-  if not show_buffer(buf, vim.api.nvim_get_current_win(), false) then
-    plaintext.release(buf, "never")
-    pcall(vim.api.nvim_buf_delete, buf, { force = true })
-    vim.notify("Failed to open a buffer for " .. path, vim.log.levels.ERROR)
-    return
-  end
-
-  notify("New vault buffer. :w encrypts and creates " .. path, vim.log.levels.INFO)
+  vim.notify("New vault buffer. :w encrypts and creates " .. path, vim.log.levels.INFO)
 end
 
 ---Edit a whole encrypted file in a protected scratch buffer.
@@ -452,28 +502,25 @@ function M.edit_file(source, opts)
         return
       end
 
-      -- Hardened before the decrypted lines land, not after.
-      local buf = secure.create_buffer(true, false)
-      secure.protect(buf)
-      local named = pcall(vim.api.nvim_buf_set_name, buf, scratch_name)
-      if not named then
-        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      local buf = named_buffer(scratch_name)
+      if not buf then
         vim.notify("VaultEdit: buffer name conflict for " .. scratch_name, vim.log.levels.ERROR)
         return
       end
 
+      -- Hardened before the decrypted lines land, not after: `fill_plaintext`
+      -- refuses to write them into a buffer it could not secure.
       if not fill_plaintext(buf, output) then
-        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+        discard_buffer(buf)
         vim.notify("VaultEdit: the decrypted content could not be put in a buffer", vim.log.levels.ERROR)
         return
       end
       vim.bo[buf].filetype = filetype
 
-      local managed = plaintext.manage({
+      local opened, failure = open_session({
         buf = buf,
         kind = "file",
         action = "encrypt",
-        write = write_session,
         publish = publish_file,
         write_name = scratch_name,
         target = file,
@@ -481,22 +528,18 @@ function M.edit_file(source, opts)
         source_buf = source,
         opts = opts,
         context = context,
-      })
+      }, win, false)
 
-      if not managed then
-        pcall(vim.api.nvim_buf_delete, buf, { force = true })
-        vim.notify("VaultEdit: the scratch buffer could not be secured; nothing was opened", vim.log.levels.ERROR)
+      if not opened then
+        if failure == "secure" then
+          vim.notify("VaultEdit: the scratch buffer could not be secured; nothing was opened", vim.log.levels.ERROR)
+        else
+          vim.notify("Failed to open the VaultEdit buffer", vim.log.levels.ERROR)
+        end
         return
       end
 
-      if not show_buffer(buf, win, false) then
-        plaintext.release(buf, "never")
-        pcall(vim.api.nvim_buf_delete, buf, { force = true })
-        vim.notify("Failed to open the VaultEdit buffer", vim.log.levels.ERROR)
-        return
-      end
-
-      notify("Editing decrypted content. :w encrypts and saves " .. file, vim.log.levels.INFO)
+      vim.notify("Editing decrypted content. :w encrypts and saves " .. file, vim.log.levels.INFO)
     end, opts, creds)
   end, opts, context)
 end
@@ -559,11 +602,8 @@ function M.edit_inline(source, block, opts)
         return
       end
 
-      local buf = secure.create_buffer(true, false)
-      secure.protect(buf)
-      local named = pcall(vim.api.nvim_buf_set_name, buf, scratch_name)
-      if not named then
-        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      local buf = named_buffer(scratch_name)
+      if not buf then
         vim.notify("VaultEdit: buffer name conflict for " .. scratch_name, vim.log.levels.ERROR)
         return
       end
@@ -571,17 +611,16 @@ function M.edit_inline(source, block, opts)
       -- The decrypted bytes are the value, trailing newline and all: 'endofline'
       -- carries whether there was one, so saving reproduces it exactly.
       if not fill_plaintext(buf, output) then
-        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+        discard_buffer(buf)
         vim.notify("VaultEdit: the decrypted value could not be put in a buffer", vim.log.levels.ERROR)
         return
       end
 
-      local managed = plaintext.manage({
+      local opened, failure = open_session({
         buf = buf,
         kind = "inline",
         action = "encrypt_string",
         stdin_name = value_name,
-        write = write_session,
         publish = publish_inline,
         write_name = scratch_name,
         source_buf = source,
@@ -597,22 +636,18 @@ function M.edit_inline(source, block, opts)
         value_name = value_name,
         opts = opts,
         context = context,
-      })
+      }, win, true)
 
-      if not managed then
-        pcall(vim.api.nvim_buf_delete, buf, { force = true })
-        vim.notify("VaultEdit: the scratch buffer could not be secured; nothing was opened", vim.log.levels.ERROR)
+      if not opened then
+        if failure == "secure" then
+          vim.notify("VaultEdit: the scratch buffer could not be secured; nothing was opened", vim.log.levels.ERROR)
+        else
+          vim.notify("Failed to open the VaultEdit buffer", vim.log.levels.ERROR)
+        end
         return
       end
 
-      if not show_buffer(buf, win, true) then
-        plaintext.release(buf, "never")
-        pcall(vim.api.nvim_buf_delete, buf, { force = true })
-        vim.notify("Failed to open the VaultEdit buffer", vim.log.levels.ERROR)
-        return
-      end
-
-      notify(
+      vim.notify(
         string.format("Editing %s. :w encrypts it back into %s, which you then save.", value_name, source_label),
         vim.log.levels.INFO
       )
