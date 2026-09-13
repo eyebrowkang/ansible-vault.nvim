@@ -214,6 +214,24 @@ function M.parse_block_scalar(rest)
   return type(rest) == "string" and literal(rest, true) or nil
 end
 
+---How many columns a list dash adds to the scalar that follows it.
+---
+---A literal block is indented relative to the node that owns it. For `- key: |`
+---that node is the mapping past the dash, but for a keyless `- |` it is the
+---sequence entry itself, so the dash counts for nothing: `- |2-` holds a body at
+---column 2, and one written at column 4 is a value with two extra spaces on
+---every line.
+local function dash_width(parsed)
+  return parsed.key_raw and #(parsed.dash or "") or 0
+end
+
+---The column a scalar's own body is indented from.
+---@param parsed table
+---@return integer
+local function scalar_base(parsed)
+  return #(parsed.indent or "") + dash_width(parsed)
+end
+
 local function shape(line)
   local key = M.parse_key_line(line)
   if key then
@@ -275,7 +293,7 @@ function M.parse_block(content)
   if not M.parse_block_scalar(parsed.rest) or #lines < 3 then
     return nil
   end
-  local base = #parsed.indent + #parsed.dash
+  local base = scalar_base(parsed)
   local width = M.indent_width(lines[2])
   if width <= base or not M.is_vault_header(lines[2]) then
     return nil
@@ -368,13 +386,13 @@ function M.parse_plaintext(lines, last_eol)
     -- Anything below this line indented past the key belongs to this value:
     -- a nested mapping, a list, or a plain scalar continued on the next line.
     -- `vars:` with children under it is *not* an empty value to encrypt.
-    parsed.continues_at = #parsed.indent + #parsed.dash + 1
+    parsed.continues_at = scalar_base(parsed) + 1
     return parsed
   end
   if block.style ~= "|" then
     return nil, "folded YAML scalars are ambiguous; use a literal | scalar"
   end
-  local base = #parsed.indent + #parsed.dash
+  local base = scalar_base(parsed)
   local width = block.indent and base + block.indent or nil
   if not width then
     for i = 2, #lines do
@@ -463,7 +481,7 @@ function M.format_plaintext(value, parsed, last_eol)
     table.remove(body)
   end
   local lines = { prefix(parsed) .. (trailing and "|2+" or "|2-") }
-  local indent = (parsed.indent or "") .. string.rep(" ", #(parsed.dash or "") + 2)
+  local indent = (parsed.indent or "") .. string.rep(" ", dash_width(parsed) + 2)
   for _, line in ipairs(body) do
     lines[#lines + 1] = indent .. line
   end

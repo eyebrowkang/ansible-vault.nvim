@@ -32,6 +32,13 @@ return function(H, tests)
       eq(parsed.header.label, "prod", case[1] .. ": vault id label was not read")
     end
 
+    -- A keyless list item's block body is indented from the sequence, not from
+    -- past the dash, so two spaces is already a complete payload.
+    yes(
+      yaml.parse_block("- !vault |\n  $ANSIBLE_VAULT;1.2;AES256;prod\n  6162636465") ~= nil,
+      "a keyless list payload indented two spaces is a block"
+    )
+
     eq(yaml.parse_block("password: hunter2"), nil, "a plain value is not a vault block")
     eq(yaml.parse_block("password: !vault |"), nil, "a header with no ciphertext is not a block")
     eq(yaml.parse_block("password: !vault |\n          $ANSIBLE_VAULT;1.1;AES256"), nil, "no payload")
@@ -45,6 +52,44 @@ return function(H, tests)
       nil,
       "a payload must be hex"
     )
+  end
+
+  ---A literal block is indented relative to the node that owns it. For `- value`
+  ---that node is the sequence entry itself, so the dash is not part of the body's
+  ---indentation: `- |2-` with a four-space body is a value whose every line
+  ---starts with two spaces, which is not what was decrypted. A keyed list item
+  ---(`- key: |`) does own a mapping past the dash, and keeps its deeper body.
+  tests["a literal block under a list dash is indented the way YAML reads it"] = function()
+    local cases = {
+      { "keyless list item", { indent = "", dash = "- " }, { "- |2-", "  first", "  second" } },
+      { "nested keyless list item", { indent = "  ", dash = "- " }, { "  - |2-", "    first", "    second" } },
+      {
+        "keyed list item",
+        { indent = "", dash = "- ", key_raw = "password" },
+        {
+          "- password: |2-",
+          "    first",
+          "    second",
+        },
+      },
+      { "mapping key", { indent = "", dash = "", key_raw = "password" }, { "password: |2-", "  first", "  second" } },
+    }
+    for _, case in ipairs(cases) do
+      eq(yaml.format_plaintext("first\nsecond", case[2], true), case[3], case[1] .. ": wrong body indentation")
+      local parsed, err = yaml.parse_plaintext(case[3], true)
+      yes(parsed ~= nil, case[1] .. ": " .. tostring(err))
+      eq(parsed.content, "first\nsecond", case[1] .. ": the body must read back as it was written")
+    end
+  end
+
+  tests["a keyless list value keeps its leading spaces and trailing newline"] = function()
+    local written = yaml.format_plaintext("  indented\nnext\n", { indent = "", dash = "- " }, true)
+    eq(written, { "- |2+", "    indented", "  next" })
+    eq(yaml.parse_plaintext(written, true).content, "  indented\nnext\n")
+
+    -- A plain keyless value continues on any line indented past the sequence, so
+    -- a selection that stopped short of one is a half-selected value.
+    eq(yaml.parse_plaintext({ "- plain" }, true).continues_at, 1)
   end
 
   tests["a folded plaintext scalar is refused rather than guessed at"] = function()

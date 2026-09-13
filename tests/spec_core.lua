@@ -660,6 +660,54 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
     eq(H.read_file(stdin), "rotated")
   end
 
+  ---A keyless list item owns no mapping past its dash, so the literal block it
+  ---decrypts into is indented from the sequence. Two extra spaces there are not
+  ---cosmetic: YAML reads them as part of every line of the value.
+  tests["a keyless list item round-trips a multiline value"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = { "- !vault |" }
+    for _, line in ipairs(H.envelope("first\nsecond\n")) do
+      table.insert(input, "    " .. line)
+    end
+    table.insert(input, "- other")
+    local buf = H.new_buffer(input)
+
+    vim.cmd("1," .. (#input - 1) .. "VaultDecrypt")
+    H.wait_until(function()
+      return H.text(buf):find("!vault", 1, true) == nil
+    end)
+    eq(
+      H.lines(buf),
+      { "- |2+", "  first", "  second", "- other" },
+      "the body belongs under the sequence, not past the dash"
+    )
+
+    local stdin = fake.dir .. "/stdin"
+    vim.env.FAKE_VAULT_STDIN_LOG = stdin
+    vim.cmd("1,3VaultEncrypt")
+    H.wait_until(function()
+      return H.text(buf):find("!vault", 1, true) ~= nil
+    end)
+    eq(H.read_file(stdin), "first\nsecond\n", "the value must survive decrypt -> encrypt byte for byte")
+    eq(H.lines(buf)[1], "- !vault |", "the list dash must come from the buffer")
+    eq(H.lines(buf)[#H.lines(buf)], "- other")
+  end
+
+  tests["a hand-written keyless envelope indented two spaces decrypts"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = { "- !vault |" }
+    for _, line in ipairs(H.envelope("listed")) do
+      table.insert(input, "  " .. line)
+    end
+    local buf = H.new_buffer(input)
+    vim.cmd("1," .. #input .. "VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "- listed"
+    end, "a two-space payload under a keyless list item is a valid block")
+  end
+
   --- Rekey ----------------------------------------------------------------
 
   for _, label in ipairs({ "", "prod" }) do
