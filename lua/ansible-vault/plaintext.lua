@@ -38,6 +38,7 @@ local secure = require("ansible-vault.secure")
 ---@field writing? boolean Whether the BufWriteCmd handler is running
 ---@field autocmds? integer[] Installed by manage
 ---@field on_release? fun(session: AnsibleVaultSession) Called after invalidation
+---@field on_write_success? fun(session: AnsibleVaultSession, win: integer|nil) Queues post-write cleanup
 
 ---@type table<integer, AnsibleVaultSession>
 local sessions = {}
@@ -181,6 +182,11 @@ local function run_write(session, event)
     error("cannot write a vault buffer with no file name", 0)
   end
 
+  local win = vim.api.nvim_get_current_win()
+  if not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf then
+    win = nil
+  end
+
   session.writing = true
   local called, ok, err = pcall(session.write, session, path, vim.v.cmdbang == 1)
   session.writing = false
@@ -190,6 +196,16 @@ local function run_write(session, event)
   end
   if not ok then
     error(err or "vault write failed", 0)
+  end
+
+  if session.on_write_success then
+    local finalized, finalize_err = pcall(session.on_write_success, session, win)
+    if not finalized then
+      vim.notify(
+        "Vault content was saved, but the protected buffer could not be closed: " .. tostring(finalize_err),
+        vim.log.levels.WARN
+      )
+    end
   end
 end
 

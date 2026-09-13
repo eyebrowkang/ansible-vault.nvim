@@ -29,14 +29,19 @@ Range encryption provides Ansible's `encrypt_string` capability.
 Choose the command by what you want to save:
 
     Decrypt       :write saves PLAINTEXT from the current buffer.
-    Create/Edit   :write encrypts to the fixed file target.
+    Create/Edit   :write encrypts to the fixed target and ends that scratch.
     Inline Edit   :write encrypts into the source BUFFER, not its file.
     View          Read-only; all writes are refused.
 
+A successful Create/Edit write disposes its plaintext scratch. A normal
+`:write` shows the created ciphertext file, refreshed whole-file source, or
+inline source respectively; run |:VaultEdit| again for another plaintext edit.
+
 Quick start: open a vault file and run |:VaultEdit|. Enter the password if
 prompted, make changes in the separate buffer, then use `:write` to encrypt
-and save. Passwords are not cached, so saving may prompt again. Use `:wq` to
-save and close. No password file or `setup()` call is required.
+and save. Passwords are not cached, so saving may prompt again. `:wq` and `:x`
+wait for the real result and close only after success. No password file or
+`setup()` call is required.
 
 For an intentional plaintext file, use |:VaultDecrypt| followed by `:write`.
 For protection boundaries, see |ansible-vault-security|.
@@ -153,8 +158,9 @@ and Rekey. Other YAML entries are left unchanged.
 :VaultCreate[!] {file} [args]
     Open an empty protected buffer for a new encrypted file. This command
     is file-only; it does not create inline values. The file is not created
-    until the first successful `:write`. Every save writes ciphertext to
-    the same fixed target.
+    until the first successful `:write`, which writes ciphertext to the fixed
+    target, disposes the scratch, and on a normal `:write` shows the new
+    ciphertext file.
 
     An existing file requires `:VaultCreate!`; it is not overwritten before
     saving. A path already open in another buffer is refused even with `!`.
@@ -162,7 +168,8 @@ and Rekey. Other YAML entries are left unchanged.
 
     `:write {other-file}` and `:saveas` cannot redirect this buffer's output.
     `:wq` and `:x` wait for encryption and saving; failure leaves the buffer
-    open with your changes. Credentials are obtained for each save.
+    open with your changes for retry. Credentials are obtained for each
+    attempted write.
 
                                                  *:VaultView*
 :[range]VaultView [args]
@@ -177,20 +184,22 @@ and Rekey. Other YAML entries are left unchanged.
                                                  *:VaultEdit*
 :[range]VaultEdit [args]
     Open decrypted content in a separate protected editing buffer. Opening
-    it and each subsequent save obtain credentials separately; interactive
-    passwords are not cached, so both can prompt.
+    it and each attempted write obtain credentials separately; interactive
+    passwords are not cached, so both can prompt. A successful write ends
+    this protected editing session; run |:VaultEdit| again for another
+    plaintext edit.
 
     Whole file:
         Requires an encrypted, file-backed buffer with no unsaved changes.
-        `:write` encrypts and saves to the original file. The editing
-        buffer remains open for further changes and repeated saves.
+        `:write` encrypts and saves to the original file, disposes the
+        editing buffer, and returns to the refreshed ciphertext source.
 
     Inline value:
-        `:write` encrypts the value back into the source BUFFER only.
-        Return to the source buffer and use `:write` to save the YAML file.
-        Unsaved source changes already present when Edit opened are kept.
-        After a successful write-back, you can edit and save the value
-        again. Keyless blocks and list items are supported.
+        The value opens in a split. `:write` encrypts it back into the
+        source BUFFER only, disposes the editing buffer, closes that split
+        and returns to the source. Use a second normal `:write` there to
+        save the YAML file. Unsaved source changes already present when
+        Edit opened are kept. Keyless blocks and list items are supported.
 
         Any source buffer change after opening blocks write-back, even
         outside the selected block. Renaming or deleting the source also
@@ -362,8 +371,9 @@ encrypt_vault_id ~
 
 Use interactive input, existing files/IDs in `setup()`, or your existing
 Ansible configuration. Passwords are obtained for each operation and are not
-cached. Opening Edit and each Edit/Create save can prompt separately.
-A write after Decrypt saves plaintext and needs no password.
+cached. Opening an Edit session and each attempted Edit/Create write can prompt
+separately; a successful Create/Edit write ends that session. A write after
+Decrypt saves plaintext and needs no password.
 
 Normal credential selection, highest priority first:
 
@@ -552,8 +562,9 @@ Create or whole-file Edit/Rekey refused ~
 Write refused ~
     Check which buffer you are in: View never writes, Edit/Create have
     fixed targets, and protected buffers refuse partial/append writes.
-    Use a plain `:write` for Edit/Create. Inline Edit requires a second
-    `:write` in the source buffer to save the YAML file.
+    Use a plain `:write` for Edit/Create. A successful inline Edit closes
+    its protected buffer and returns to the changed source buffer; only then
+    use a second ordinary `:write` there to save the YAML file.
 
     If the target FILE changed, keep the editing buffer open and inspect
     the new file contents separately, using View/Edit for encrypted content.

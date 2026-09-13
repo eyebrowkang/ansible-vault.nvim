@@ -37,8 +37,9 @@ use { "eyebrowkang/ansible-vault.nvim" }
 ```
 
 没有配置凭据时，按提示输入 vault 密码。在独立 buffer 中编辑，再用 `:w` 加密保存
-到原文件。如再次提示，请重新输入密码；密码不会被缓存。用 `:wq` 保存并关闭，或在
-保存后用 `:q` 关闭。
+到原文件。成功写入会结束受保护的编辑会话，并返回刷新后的密文 buffer；如需再次编辑
+明文，请重新执行 `:VaultEdit`。如再次提示，请重新输入密码；密码不会被缓存。`:wq`
+和 `:x` 会等待实际保存结果，并且只在成功后关闭。
 
 **想把明文保存到磁盘？** 使用 `:VaultDecrypt`，再 `:w`。
 这次写入保存的就是**明文**，不会重新加密、再次询问密码或额外要求确认。
@@ -47,19 +48,21 @@ use { "eyebrowkang/ansible-vault.nvim" }
 
 | 命令 | 整个文件 | inline YAML 值 |
 |------|----------|----------------|
-| `:VaultCreate[!] {file}` | 打开空 buffer；`:w` 加密写入指定文件 | 不适用 |
+| `:VaultCreate[!] {file}` | 打开空的受保护 buffer；成功 `:w` 加密写入指定文件、销毁该 buffer 并显示密文 | 不适用 |
 | `:VaultEncrypt` | 加密整个 buffer，再用 `:w` 保存 | 带 `[range]` 时加密一个值，然后保存源 YAML |
 | `:VaultDecrypt` | 把密文替换成明文；`:w` 保存明文 | 把一个 `!vault` block 替换成明文；`:w` 按当前所见保存 YAML |
 | `:VaultView` | 只读浮窗，禁止写入 | 单个值的只读浮窗，禁止写入 |
-| `:VaultEdit` | 独立编辑 buffer；`:w` 加密写回原文件 | 独立编辑 buffer；`:w` **只**加密回填到源 buffer |
+| `:VaultEdit` | 独立受保护 buffer；成功 `:w` 加密写回原文件、销毁该 buffer 并返回刷新后的密文 | 独立受保护 buffer；成功 `:w` **只**加密回填到源 buffer、销毁该 buffer 并返回源 buffer |
 | `:VaultRekey` | 更换凭据，并把新密文保存到文件 | 更换一个 block 的凭据，然后保存源 YAML |
 
 Create 和整文件 Edit 的保存目标**固定**，不能用 `:w other-file` 或 `:saveas`
-改写到其他文件。inline Edit 不保存源文件：请回到源 buffer 自行 `:w`。
-View 拒绝所有写入；按 `q` 或 `<Esc>` 关闭。
+改写到其他文件。inline Edit 在分屏窗口中打开该值，且不保存源文件：其受保护写入成功后
+会关闭该分屏并返回源 buffer，再由你执行普通 `:w`。View 拒绝所有写入；按 `q` 或
+`<Esc>` 关闭。
 
-整文件 Edit 和 Rekey 要求文件已加密，且 buffer 没有未保存修改。保存失败时，编辑
-buffer 保持打开并保留修改；`:wq` 和 `:x` 会等待保存完成。
+Create 或 Edit 成功保存会结束受保护的编辑会话；失败时 buffer 保持打开并保留修改，
+可供重试。整文件 Edit 和 Rekey 要求文件已加密，且 buffer 没有未保存修改；`:wq` 和
+`:x` 会等待保存完成。
 
 ### 选择作用目标
 
@@ -76,8 +79,8 @@ buffer 保持打开并保留修改；`:wq` 和 `:x` 会等待保存完成。
 :VaultCreate group_vars/prod/vault.yml
 ```
 
-第一次成功 `:w` 之前不会创建文件。`:VaultCreate!` 允许替换已有文件，但不能使用
-已在其他 buffer 中打开的路径。
+第一次成功 `:w` 之前不会创建文件；这次写入会关闭 Create scratch，并打开新的密文
+文件。`:VaultCreate!` 允许替换已有文件，但不能使用已在其他 buffer 中打开的路径。
 
 ### inline YAML
 
@@ -146,8 +149,8 @@ inline Rekey 只修改源 buffer，由你自行保存。
 :VaultDecrypt --ask-vault-password
 ```
 
-密码按操作重新获取，不会缓存。打开 Edit 和每次 Edit/Create 保存都可能分别提示
-输入。Decrypt 之后的保存不需要密码。
+密码按操作重新获取，不会缓存。打开 Edit 会话和每次尝试 Edit/Create 写入都可能分别
+提示输入；成功的 Create/Edit 写入会结束该会话。Decrypt 之后的保存不需要密码。
 
 ### 2. 使用现有密码文件或 vault ID
 

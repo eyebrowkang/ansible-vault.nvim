@@ -349,7 +349,11 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
       vim.env.FAKE_VAULT_STDIN_LOG = stdin
       -- Saving without editing anything at all must be a byte-for-byte identity.
       vim.cmd("silent write")
-      no(vim.bo[scratch].modified)
+      H.wait_until(function()
+        return not vim.api.nvim_buf_is_valid(scratch)
+      end, "an unedited whole-file Edit save should still consume the plaintext scratch")
+      eq(vim.api.nvim_get_current_buf(), source)
+      no(vim.bo[source].modified)
       eq(H.read_file(stdin), case[2], "an unedited Edit must re-encrypt exactly what it decrypted")
     end
 
@@ -360,10 +364,15 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
       table.insert(input, "other: keep")
       local source = H.new_buffer(input)
       vim.api.nvim_win_set_cursor(0, { 1, 0 })
-      H.open_scratch("VaultEdit", source)
+      local scratch = H.open_scratch("VaultEdit", source)
       local stdin = fake.dir .. "/stdin"
       vim.env.FAKE_VAULT_STDIN_LOG = stdin
       vim.cmd("silent write")
+      H.wait_until(function()
+        return not vim.api.nvim_buf_is_valid(scratch)
+      end, "an unedited inline Edit save should still consume the plaintext scratch")
+      eq(vim.api.nvim_get_current_buf(), source)
+      yes(vim.bo[source].modified, "the re-encrypted inline block still needs a normal source write")
       eq(H.read_file(stdin), case[2], "an unedited inline Edit must re-encrypt exactly what it decrypted")
     end
   end
@@ -450,32 +459,40 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
 
   --- Edit -----------------------------------------------------------------
 
-  tests["whole Edit saves repeatedly then reopens the latest plaintext from disk"] = function()
+  tests["whole Edit saves then returns to its refreshed ciphertext source"] = function()
     local fake, source, path = fixture()
     local scratch = H.open_scratch("VaultEdit", source)
     H.assert_hardened(scratch)
     eq(vim.bo[scratch].buftype, "acwrite")
-    for _, value in ipairs({ "plain: first", "plain: second" }) do
-      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { value, "extra: line" })
-      vim.cmd("silent write")
-      yes(vim.api.nvim_buf_is_valid(scratch))
-      eq(vim.api.nvim_get_current_buf(), scratch)
-      no(vim.bo[scratch].modified)
-      yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
-    end
+    yes(vim.api.nvim_buf_get_name(scratch):find("ansible-vault://", 1, true) == 1)
+
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "plain: first", "extra: line" })
+    vim.cmd("silent write")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end, "a successful Edit save should dispose its plaintext scratch")
+    eq(vim.api.nvim_get_current_buf(), source)
+    no(vim.bo[source].modified)
+    yes(H.encrypted(source))
+    yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
+
+    -- A further edit opens a fresh protected session from the returned source.
+    local second = H.open_scratch("VaultEdit", source)
+    vim.api.nvim_buf_set_lines(second, 0, -1, false, { "plain: second", "extra: line" })
+    vim.cmd("silent write")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(second)
+    end)
     eq(H.calls(fake, "encrypt"), 2)
-    vim.api.nvim_buf_delete(scratch, { force = true })
-    vim.api.nvim_buf_delete(source, { force = true })
-    local reopened = H.open_file(path)
-    yes(H.encrypted(reopened))
+
     vim.cmd("VaultDecrypt")
     H.wait_until(function()
-      return H.lines(reopened)[1] == "plain: second"
+      return H.lines(source)[1] == "plain: second"
     end)
-    eq(H.lines(reopened), { "plain: second", "extra: line" })
+    eq(H.lines(source), { "plain: second", "extra: line" })
   end
 
-  tests["inline Edit allows preexisting dirty source and only splices its block"] = function()
+  tests["inline Edit returns to a preexisting dirty source and only splices its block"] = function()
     local fake = H.create_fake_vault()
     H.reset_config(fake)
     local input = { "before: original" }
@@ -485,23 +502,57 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
     local disk = H.read_file(path)
     vim.api.nvim_buf_set_lines(source, 0, 1, false, { "before: user-dirty" })
     vim.api.nvim_win_set_cursor(0, { 3, 10 })
+    local source_win = vim.api.nvim_get_current_win()
+    local windows = #vim.api.nvim_list_wins()
     local scratch = H.open_scratch("VaultEdit", source)
+    eq(#vim.api.nvim_list_wins(), windows + 1, "inline Edit opens a window of its own for the value")
     eq(H.lines(scratch), { "old" })
     H.assert_hardened(scratch)
-    for _, value in ipairs({ "new", "again" }) do
-      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { value })
-      vim.cmd("silent write")
-      no(vim.bo[scratch].modified)
-      eq(H.lines(source)[1], "before: user-dirty", "edits made before opening must be kept as they were")
-      eq(H.lines(source)[#H.lines(source)], "after: original")
-      yes(H.text(source):find("password: !vault |", 1, true))
-      yes(vim.bo[source].modified, "the source is left for the user to save")
-      eq(H.read_file(path), disk, "inline Edit must never save source YAML")
-    end
-    vim.api.nvim_set_current_buf(source)
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "new" })
+    vim.cmd("silent write")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end, "a successful inline save should dispose its plaintext scratch")
+
+    eq(#vim.api.nvim_list_wins(), windows, "the window it opened must go with the session it ended")
+    eq(vim.api.nvim_get_current_win(), source_win, "the cursor belongs back where the value came from")
+    eq(vim.api.nvim_get_current_buf(), source)
+    eq(H.lines(source)[1], "before: user-dirty", "edits made before opening must be kept as they were")
+    eq(H.lines(source)[#H.lines(source)], "after: original")
+    yes(H.text(source):find("password: !vault |", 1, true))
+    yes(vim.bo[source].modified, "the source is left for the user to save")
+    eq(H.read_file(path), disk, "inline Edit must never save source YAML")
+
     vim.cmd("silent write")
     no(vim.bo[source].modified)
     no(H.read_file(path) == disk)
+  end
+
+  ---Closing the window an inline session opened beats leaving a duplicate of the
+  ---window below it. Being the *last* window turns the same act into a way of
+  ---quitting Neovim, which no save asked for.
+  tests["an inline Edit alone in the last window keeps that window"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local input = { "before: keep" }
+    vim.list_extend(input, H.inline("old"))
+    local source = H.new_buffer(input)
+    vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    local scratch = H.open_scratch("VaultEdit", source)
+
+    vim.cmd("only")
+    eq(#vim.api.nvim_list_wins(), 1)
+    eq(vim.api.nvim_get_current_buf(), scratch, "precondition: the scratch is alone on screen")
+
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "new" })
+    vim.cmd("silent write")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end, "a successful inline save should dispose its plaintext scratch")
+
+    eq(#vim.api.nvim_list_wins(), 1, "the only window must survive the save that ended the session")
+    eq(vim.api.nvim_get_current_buf(), source, "and must show the source the value went back into")
+    yes(H.text(source):find("password: !vault |", 1, true) ~= nil)
   end
 
   tests["inline Edit writes back the exact bytes it was given"] = function()
@@ -517,12 +568,16 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
     local stdin = fake.dir .. "/stdin"
     vim.env.FAKE_VAULT_STDIN_LOG = stdin
     vim.cmd("silent write")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end, "a successful inline byte-fidelity save should consume the plaintext scratch")
+    eq(vim.api.nvim_get_current_buf(), source)
     eq(H.read_file(stdin), "one\ntwo\n", "an unedited value must be re-encrypted unchanged")
   end
 
   --- Create ---------------------------------------------------------------
 
-  tests["Create first write is ciphertext and mode 0600"] = function()
+  tests["Create first write opens ciphertext and mode 0600"] = function()
     local fake = H.create_fake_vault()
     H.reset_config(fake)
     local path = fake.dir .. "/new vault.yml"
@@ -530,12 +585,40 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
     local scratch = vim.api.nvim_get_current_buf()
     H.assert_hardened(scratch)
     eq(vim.bo[scratch].buftype, "acwrite")
+    eq(vim.api.nvim_buf_get_name(scratch), "ansible-vault://" .. path)
     eq(vim.fn.filereadable(path), 0)
     vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "secret: created" })
     vim.cmd("silent write")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end, "a successful Create save should dispose its plaintext scratch")
+    eq(vim.api.nvim_buf_get_name(0), path)
+    eq(vim.bo[0].buftype, "")
     yes(H.read_file(path):match("^%$ANSIBLE_VAULT;"))
     eq(vim.fn.getfperm(path), "rw-------")
-    no(vim.bo[scratch].modified)
+  end
+
+  tests["a relative VaultCreate keeps its target across :cd"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local original_dir = H.temp_dir()
+    local target = original_dir .. "/vault.yml"
+    vim.cmd("cd " .. vim.fn.fnameescape(original_dir))
+    vim.cmd("VaultCreate vault.yml")
+    local scratch = vim.api.nvim_get_current_buf()
+    eq(vim.api.nvim_buf_get_name(scratch), "ansible-vault://" .. target)
+    vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "secret: created" })
+
+    local other_dir = H.temp_dir()
+    vim.cmd("cd " .. vim.fn.fnameescape(other_dir))
+    vim.cmd("silent write")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end, "a successful relative Create should dispose its scratch")
+
+    yes(H.read_file(target):match("^%$ANSIBLE_VAULT;"))
+    eq(vim.fn.filereadable(other_dir .. "/vault.yml"), 0, ":cd must not retarget a Create write")
+    eq(vim.api.nvim_buf_get_name(0), target)
   end
 
   tests["Create never clears an existing unsaved buffer at the target name"] = function()
@@ -566,6 +649,9 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
     eq(H.read_file(new), "other writer\n")
     yes(vim.bo[scratch].modified)
     vim.cmd("silent write!")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end)
     yes(H.read_file(new):match("^%$ANSIBLE_VAULT;"), ":w! is how the user overrides that refusal")
   end
 
@@ -591,6 +677,46 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
       yes(vim.bo[scratch].modified)
       H.write_fails("silent write! " .. vim.fn.fnameescape(target))
       eq(vim.fn.filereadable(target), 0, ":w! must not turn a redirected write into a plaintext copy")
+    end
+  end
+
+  tests["fixed-target Create and Edit sessions recover from refused :saveas"] = function()
+    for _, mode in ipairs({ "whole", "inline", "create" }) do
+      local fake, source, path = fixture()
+      if mode == "inline" then
+        vim.api.nvim_buf_set_lines(source, 0, -1, false, H.inline("old"))
+        vim.api.nvim_win_set_cursor(0, { 1, 0 })
+      end
+
+      local target = path
+      local scratch
+      if mode == "create" then
+        target = fake.dir .. "/created.yml"
+        vim.cmd("VaultCreate " .. vim.fn.fnameescape(target))
+        scratch = vim.api.nvim_get_current_buf()
+      else
+        scratch = H.open_scratch("VaultEdit", source)
+      end
+      local scratch_name = vim.api.nvim_buf_get_name(scratch)
+      vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "modified" })
+
+      local redirect = fake.dir .. "/redirect.yml"
+      for _, command in ipairs({ "saveas", "saveas!" }) do
+        H.write_fails("silent " .. command .. " " .. vim.fn.fnameescape(redirect))
+        eq(vim.api.nvim_buf_get_name(scratch), scratch_name, mode .. " must restore its protected scratch identity")
+        yes(vim.bo[scratch].modified, mode .. " must retain plaintext edits for a normal retry")
+        eq(vim.fn.filereadable(redirect), 0, mode .. " must not export plaintext through :" .. command)
+      end
+
+      vim.cmd("silent write")
+      H.wait_until(function()
+        return not vim.api.nvim_buf_is_valid(scratch)
+      end, mode .. " should still be saveable after :saveas is refused")
+      if mode == "inline" then
+        yes(H.text(source):find("!vault", 1, true) ~= nil)
+      else
+        yes(H.read_file(target):match("^%$ANSIBLE_VAULT;"))
+      end
     end
   end
 
@@ -652,14 +778,16 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
     local scratch = H.open_scratch("VaultEdit", source)
     eq(H.lines(scratch), { "listed" }, "the scratch holds just the value")
     vim.api.nvim_buf_set_lines(scratch, 0, -1, false, { "rotated" })
-    vim.cmd("silent write")
-
-    eq(H.lines(source)[1], "  - !vault |", "the list dash and indentation must come back unchanged")
-    eq(H.lines(source)[#H.lines(source)], "  - other")
     local stdin = fake.dir .. "/stdin"
     vim.env.FAKE_VAULT_STDIN_LOG = stdin
-    vim.api.nvim_set_current_buf(scratch)
     vim.cmd("silent write")
+    H.wait_until(function()
+      return not vim.api.nvim_buf_is_valid(scratch)
+    end)
+
+    eq(vim.api.nvim_get_current_buf(), source)
+    eq(H.lines(source)[1], "  - !vault |", "the list dash and indentation must come back unchanged")
+    eq(H.lines(source)[#H.lines(source)], "  - other")
     eq(H.read_file(stdin), "rotated")
   end
 

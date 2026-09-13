@@ -45,6 +45,9 @@ local yaml = require("ansible-vault.yaml")
 ---@field source_label? string Human-readable source name
 ---@field source_signature? table Source file conflict baseline
 ---@field source_tick? integer Source buffer conflict baseline
+---@field return_buf? integer Safe buffer to show after a successful write
+---@field opened_win? integer Window this session split open for itself
+---@field origin_win? integer Window `opened_win` was split from
 ---@field start_row? integer 1-based, inclusive
 ---@field end_row? integer 1-based, inclusive
 ---@field block_lines? string[] Original encrypted block
@@ -75,6 +78,34 @@ end
 
 --- Delivering the ciphertext ------------------------------------------------
 
+---The whole-file source is where a successful session returns after publishing.
+---Checking it before starting a child avoids needless encryption when that return
+---is already unsafe; checking it again in `publish_file` closes the race while the
+---child was running.
+---@param session AnsibleVaultEditSession
+---@return boolean ok
+---@return string|nil err
+local function check_file_source(session)
+  if session.kind ~= "file" then
+    return true, nil
+  end
+
+  local source = session.source_buf
+  if not buffer.is_valid(source) then
+    return false, "the buffer this file came from no longer exists; nothing was written"
+  end
+  if vim.api.nvim_buf_get_name(source) ~= session.source_name then
+    return false, "the buffer this file came from was renamed; nothing was written"
+  end
+  if buffer.changedtick(source) ~= session.source_tick or vim.bo[source].modified then
+    return false,
+      "the buffer this file came from changed while it was open; nothing was written. "
+        .. "Reopen it with :VaultEdit — this buffer's text is not lost"
+  end
+
+  return true, nil
+end
+
 ---@param session AnsibleVaultEditSession
 ---@param output string
 ---@param bang boolean
@@ -85,6 +116,12 @@ local function publish_file(session, output, bang)
   -- whatever it said over the only copy of the ciphertext would be data loss.
   if not yaml.vault_lines(output) then
     return false, "ansible-vault produced no valid encrypted content; nothing was written"
+  end
+
+  local source = session.source_buf
+  local source_ok, source_err = check_file_source(session)
+  if not source_ok then
+    return false, source_err
   end
 
   local current = fs.signature(session.target)
@@ -106,20 +143,24 @@ local function publish_file(session, output, bang)
     vim.bo[session.buf].modified = false
   end
 
-  -- The buffer this was decrypted from still shows the old ciphertext. Reload it
-  -- only when that cannot discard anything: an edit of its own outranks keeping
-  -- it in step with the file.
-  local source = session.source_buf
-  if
-    source
-    and buffer.is_valid(source)
-    and not vim.bo[source].modified
-    and vim.api.nvim_buf_get_name(source) == session.target
-  then
-    pcall(vim.api.nvim_buf_call, source, function()
-      vim.cmd("silent! edit!")
+  if session.kind == "file" then
+    -- The source was snapshot-guarded above, so it can now be refreshed without
+    -- discarding a second set of edits. The write already landed if a hostile
+    -- autocmd makes this reload fail; report that honestly and let teardown remove
+    -- the plaintext scratch rather than offering a misleading retry.
+    session.return_buf = source
+    local refreshed = pcall(vim.api.nvim_buf_call, source, function()
+      vim.cmd("edit!")
     end)
-    buffer.remember_header(source)
+    if refreshed then
+      session.source_tick = buffer.changedtick(source)
+      buffer.remember_header(source)
+    else
+      vim.notify(
+        "Encrypted and saved: " .. session.target .. "; the source buffer could not be refreshed",
+        vim.log.levels.WARN
+      )
+    end
   end
 
   vim.notify("Encrypted and saved: " .. session.target, vim.log.levels.INFO)
@@ -181,6 +222,7 @@ local function publish_inline(session, output, bang)
   session.end_row = session.start_row + #lines - 1
   session.source_tick = buffer.changedtick(source)
   session.source_signature = session.source_file and fs.signature(session.source_file) or nil
+  session.return_buf = source
 
   if buffer.is_valid(session.buf) then
     vim.bo[session.buf].modified = false
@@ -212,11 +254,26 @@ local function write_session(session, path, bang)
   local buf = session.buf
 
   if path ~= session.write_name then
+    -- `:saveas` adopts its argument as the buffer name before BufWriteCmd runs.
+    -- This session still has one fixed encrypted target, so put the protected
+    -- scratch identity back before refusing the redirected write. Otherwise one
+    -- failed :saveas would strand the scratch under a name that can never save.
+    if buffer.is_valid(buf) and vim.api.nvim_buf_get_name(buf) ~= session.write_name then
+      local restored, restore_err = pcall(vim.api.nvim_buf_set_name, buf, session.write_name)
+      if not restored then
+        return false, "could not restore the protected buffer name: " .. tostring(restore_err)
+      end
+    end
     return false,
       string.format(
         "this buffer only writes to %s; :w {file} would write plaintext, so it is refused",
         session.write_name
       )
+  end
+
+  local source_ok, source_err = check_file_source(session)
+  if not source_ok then
+    return false, source_err
   end
 
   if session.kind == "inline" then
@@ -236,6 +293,7 @@ local function write_session(session, path, bang)
     return false, "this vault session is no longer active; nothing was written"
   end
   local content = buffer.bytes(buf)
+  local content_tick = buffer.changedtick(buf)
   local done, ok, err = false, false, nil
 
   local function current()
@@ -271,6 +329,10 @@ local function write_session(session, path, bang)
       end
       if not success then
         settle(false, "encryption failed, nothing was written: " .. output)
+        return
+      end
+      if buffer.changedtick(buf) ~= content_tick then
+        settle(false, "the protected buffer changed while it was being encrypted; nothing was written")
         return
       end
       settle(session.publish(session, output, bang))
@@ -326,22 +388,34 @@ local function fill_plaintext(buf, content)
   return true
 end
 
+---Put a prepared buffer in front of the user, reporting whether that needed a
+---window of its own. A window this plugin opened is one it also closes when the
+---session ends, so which it was has to be remembered rather than guessed at from
+---the layout later.
 ---@param buf integer
 ---@param preferred_win integer
 ---@param split boolean
----@return boolean
+---@return boolean shown
+---@return integer|nil opened Window this call created, if it had to create one
 local function show_buffer(buf, preferred_win, split)
   if not split and vim.api.nvim_win_is_valid(preferred_win) then
     if pcall(vim.api.nvim_win_set_buf, preferred_win, buf) then
       pcall(vim.api.nvim_set_current_win, preferred_win)
-      return true
+      return true, nil
     end
   end
 
   if not pcall(vim.cmd, "botright split") then
-    return false
+    return false, nil
   end
-  return pcall(vim.api.nvim_win_set_buf, 0, buf)
+
+  local opened = vim.api.nvim_get_current_win()
+  if not pcall(vim.api.nvim_win_set_buf, opened, buf) then
+    -- Nothing was shown, so nothing may be left of the attempt either.
+    pcall(vim.api.nvim_win_close, opened, true)
+    return false, nil
+  end
+  return true, opened
 end
 
 ---@param buf integer
@@ -364,6 +438,175 @@ local function named_buffer(name)
   return buf, nil
 end
 
+---@param path string
+---@return integer|nil buf
+---@return string|nil err
+local function load_target_buffer(path)
+  local existing = vim.fn.bufnr(path)
+  if existing > 0 and buffer.is_valid(existing) and vim.bo[existing].modified then
+    return nil, path .. " is open with unsaved changes"
+  end
+
+  local added, buf = pcall(vim.fn.bufadd, path)
+  if not added or type(buf) ~= "number" or buf <= 0 then
+    return nil, "could not open " .. path
+  end
+  if not vim.api.nvim_buf_is_loaded(buf) then
+    local loaded, load_err = pcall(vim.fn.bufload, buf)
+    if not loaded then
+      return nil, "could not read " .. path .. ": " .. tostring(load_err)
+    end
+  elseif existing > 0 then
+    local refreshed, refresh_err = pcall(vim.api.nvim_buf_call, buf, function()
+      vim.cmd("edit!")
+    end)
+    if not refreshed then
+      return nil, "could not refresh " .. path .. ": " .. tostring(refresh_err)
+    end
+  end
+  if not buffer.is_valid(buf) then
+    return nil, "could not open " .. path
+  end
+
+  return buf, nil
+end
+
+---@param session AnsibleVaultEditSession
+---@return integer|nil buf
+---@return string|nil err
+local function return_buffer(session)
+  if session.return_buf and buffer.is_valid(session.return_buf) then
+    return session.return_buf, nil
+  end
+  if session.kind == "inline" then
+    return nil, "the source buffer is no longer available; the protected buffer remains available for recovery"
+  end
+  return load_target_buffer(session.target)
+end
+
+---@param buf integer
+---@return integer[] wins
+local function windows_showing(buf)
+  local wins = {}
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+    if vim.api.nvim_win_is_valid(win) then
+      table.insert(wins, win)
+    end
+  end
+  return wins
+end
+
+---Queue the privacy-sensitive teardown only after BufWriteCmd has returned.
+---
+---`:wq` and `:x` may close their window before scheduled work runs, so cleanup
+---must not revive that window or navigate another one. A normal `:w` still has
+---its writing window, which is the safe signal to replace the scratch visibly.
+---@param session AnsibleVaultEditSession
+---@param write_win integer|nil
+local function finish_successful_write(session, write_win)
+  local scratch = session.buf
+  local tick = buffer.changedtick(scratch)
+  local epoch = session.epoch
+  local original_bufhidden = vim.bo[scratch].bufhidden
+
+  -- A successful :wq/:x must get through its quit phase before the scheduled
+  -- cleanup runs. With 'hidden' off, its normal close would unload the scratch
+  -- in between, losing the chance to preserve it if (notably for inline Edit)
+  -- the only ciphertext destination disappears in that same gap. Hide it just
+  -- long enough for the deferred finalizer; all retained recovery buffers put
+  -- their original close behaviour back.
+  vim.bo[scratch].bufhidden = "hide"
+
+  local function retain_scratch(message)
+    if buffer.is_valid(scratch) and plaintext.current(session, epoch) then
+      vim.bo[scratch].bufhidden = original_bufhidden
+    end
+    vim.notify(message, vim.log.levels.WARN)
+  end
+
+  vim.schedule(function()
+    if not buffer.is_valid(scratch) then
+      return
+    end
+
+    if not plaintext.current(session, epoch) then
+      -- An explicit unload can still beat this callback. An unloaded buffer with
+      -- its original URI cannot contain newer edits or have been repurposed, so
+      -- wipe it. A loaded or renamed buffer may have been re-read or reused; do
+      -- not touch it or a newer session.
+      if not vim.api.nvim_buf_is_loaded(scratch) and vim.api.nvim_buf_get_name(scratch) == session.write_name then
+        discard_buffer(scratch)
+      end
+      return
+    end
+
+    if buffer.changedtick(scratch) ~= tick or vim.bo[scratch].modified then
+      retain_scratch(
+        "Vault content was saved, but the protected buffer changed before it could be closed; it remains open"
+      )
+      return
+    end
+
+    local write_win_shows_scratch = write_win
+      and vim.api.nvim_win_is_valid(write_win)
+      and vim.api.nvim_win_get_buf(write_win) == scratch
+    local wins = windows_showing(scratch)
+
+    -- A normal :w leaves at least the writing window visible. :wq/:x normally
+    -- leaves none, but another split may still show the same plaintext scratch.
+    -- A successful protected save ends that session in every case, so route every
+    -- surviving view to the safe destination before wiping it.
+    if #wins == 0 then
+      -- Inline publishing exists only in the source buffer. If an autocmd
+      -- deletes that buffer after publication but before this deferred cleanup,
+      -- there is no durable ciphertext destination to recover from. Retain the
+      -- hardened scratch rather than turn that narrow race into data loss.
+      if session.kind == "inline" then
+        local destination, destination_err = return_buffer(session)
+        if not destination then
+          retain_scratch("Vault content was saved, but " .. tostring(destination_err))
+          return
+        end
+      end
+      discard_buffer(scratch)
+      return
+    end
+
+    local destination, destination_err = return_buffer(session)
+    if not destination then
+      retain_scratch("Vault content was saved, but " .. tostring(destination_err))
+      return
+    end
+
+    -- A window this session split open for itself goes away with the session.
+    -- Leaving it behind showing the destination is the leftover an inline edit
+    -- is most often confused by: a split that now duplicates the window it was
+    -- split from. Windows the *user* opened on the same plaintext are theirs, so
+    -- those are routed to the destination instead of closed — and so is the
+    -- session's own window when it is the last one, because saving a value is no
+    -- reason to quit Neovim.
+    local closed_own = false
+    for _, win in ipairs(wins) do
+      if win == session.opened_win and #vim.api.nvim_list_wins() > 1 then
+        closed_own = pcall(vim.api.nvim_win_close, win, false) or closed_own
+      end
+      if vim.api.nvim_win_is_valid(win) then
+        pcall(vim.api.nvim_win_set_buf, win, destination)
+      end
+    end
+
+    -- The window that wrote is where the user is, so it keeps the cursor when it
+    -- survives. When it was this session's own window, the window it was split
+    -- from is where the user was before, and where the re-encrypted value now is.
+    if write_win_shows_scratch and vim.api.nvim_win_is_valid(write_win) then
+      pcall(vim.api.nvim_set_current_win, write_win)
+    elseif closed_own and session.origin_win and vim.api.nvim_win_is_valid(session.origin_win) then
+      pcall(vim.api.nvim_set_current_win, session.origin_win)
+    end
+    discard_buffer(scratch)
+  end)
+end
+
 ---Register the shared writer before exposing a prepared buffer to the user.
 ---@param session AnsibleVaultEditSession
 ---@param win integer
@@ -372,14 +615,18 @@ end
 ---@return "secure"|"show"|nil failure
 local function open_session(session, win, split)
   session.write = write_session
+  session.on_write_success = finish_successful_write
   if not plaintext.manage(session) then
     discard_buffer(session.buf)
     return false, "secure"
   end
-  if not show_buffer(session.buf, win, split) then
+  local shown, opened = show_buffer(session.buf, win, split)
+  if not shown then
     discard_buffer(session.buf)
     return false, "show"
   end
+  session.opened_win = opened
+  session.origin_win = opened and vim.api.nvim_win_is_valid(win) and win or nil
   return true, nil
 end
 
@@ -415,7 +662,13 @@ function M.create(opts)
     return
   end
 
-  local buf, name_err = named_buffer(path)
+  local scratch_name = SCHEME .. path
+  if buffer_exists(scratch_name) then
+    vim.notify(path .. " is already open in a VaultCreate buffer", vim.log.levels.ERROR)
+    return
+  end
+
+  local buf, name_err = named_buffer(scratch_name)
   if not buf then
     vim.notify("VaultCreate: " .. tostring(name_err), vim.log.levels.ERROR)
     return
@@ -429,7 +682,7 @@ function M.create(opts)
     kind = "create",
     action = "encrypt",
     publish = publish_file,
-    write_name = path,
+    write_name = scratch_name,
     target = path,
     signature = fs.signature(path),
     opts = opts,
@@ -493,7 +746,11 @@ function M.edit_file(source, opts)
         vim.notify("Target buffer no longer exists", vim.log.levels.WARN)
         return
       end
-      if buffer.changedtick(source) ~= tick then
+      if vim.api.nvim_buf_get_name(source) ~= file then
+        vim.notify("The buffer was renamed before VaultEdit opened; the edit was cancelled", vim.log.levels.ERROR)
+        return
+      end
+      if buffer.changedtick(source) ~= tick or vim.bo[source].modified then
         vim.notify("The buffer changed before VaultEdit opened; the edit was cancelled", vim.log.levels.ERROR)
         return
       end
@@ -526,6 +783,8 @@ function M.edit_file(source, opts)
         target = file,
         signature = signature,
         source_buf = source,
+        source_name = file,
+        source_tick = tick,
         opts = opts,
         context = context,
       }, win, false)
