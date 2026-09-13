@@ -1,7 +1,6 @@
 # Changelog generation for git-cliff. https://git-cliff.org
 #
-# Release notes come from the commit history, so commits have to follow
-# Conventional Commits. See CONTRIBUTING.md.
+# Release notes describe user-facing changes from Conventional Commits.
 
 [changelog]
 header = """
@@ -41,23 +40,21 @@ commit_preprocessors = [
 ]
 
 commit_parsers = [
-  # Skips first: parsers are evaluated in order and the first match wins.
+  # Keep breaking changes even when the commit otherwise describes internal work.
+  { message = "^[a-z]+(\\([^)]+\\))?!:", group = "<!-- 0 -->Breaking Changes" },
+  { body = "(?m)^BREAKING[ -]CHANGE:", group = "<!-- 0 -->Breaking Changes" },
   { message = "^chore\\(release\\)", skip = true },
   { message = "(?i)^docs.*changelog", skip = true },
-  { message = "^style", skip = true },
+  { message = "^(style|refactor|test|ci|build|chore)(\\(|:)", skip = true },
 
-  { message = "^feat", group = "<!-- 0 -->Features" },
-  { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
-  { message = "^perf", group = "<!-- 2 -->Performance" },
-  { message = "^refactor", group = "<!-- 3 -->Refactor" },
+  { message = "^feat", group = "<!-- 1 -->Features" },
+  { message = "^fix|^revert", group = "<!-- 2 -->Bug Fixes" },
+  { message = "^perf", group = "<!-- 3 -->Performance" },
   { message = "^docs", group = "<!-- 4 -->Documentation" },
-  { message = "^test", group = "<!-- 5 -->Testing" },
-  { message = "^ci|^build", group = "<!-- 6 -->Build & CI" },
-  { message = "^chore", group = "<!-- 7 -->Miscellaneous" },
-  { body = ".*security", group = "<!-- 1 -->Bug Fixes" },
+  { body = "(?i).*security", group = "<!-- 2 -->Bug Fixes" },
 ]
 
-filter_commits = false
+filter_commits = true
 tag_pattern = "v[0-9]*"
 topo_order = false
 sort_commits = "oldest"
