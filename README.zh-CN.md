@@ -238,6 +238,9 @@ vim.keymap.set("x", "<leader>ve", ":VaultEncrypt<cr>", { silent = true })
   对有文件名的已解密 buffer，即使随后执行 `:cd`，不带参数的 `:w` 仍写回原目标；
   要在当前目录创建明文副本，请用 `:w ./copy.yml`，或用 `:saveas ./name` 采用新目标。
   Edit/Create 的目标固定，View 完全禁止写入。
+- Decrypt 之后的保存会触发 `BufWritePre`/`BufWritePost`，状态栏和保存钩子能像
+  对待普通写入一样看到它。Create 和 Edit 的保存不会触发：它们把密文写到另一个
+  路径，而这两个事件会把解密后的 buffer 交给所有监听它们的格式化器和 linter。
 - 寄存器、ShaDa、剪贴板、其他插件、shell 命令和终端录制不在保护范围内。
   全局 `'shada'`、`'backup'`、`'writebackup'` 不会被修改。进程内存、操作系统
   swap、core dump 和其他系统级副本也不受保护。

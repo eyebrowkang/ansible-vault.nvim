@@ -192,6 +192,44 @@ io.stdout:write('PUBLIC_OK\n'); io.stdout:flush()
     end
   end
 
+  ---A `BufWriteCmd` suppresses Neovim's own write events, so a buffer saved
+  ---through one looks unsaved to everything that listens for them — a statusline
+  ---keeps its `[+]` until some unrelated event redraws it. Decrypt saves the
+  ---buffer's own contents to its own file, so it says so.
+  tests["a save after Decrypt announces itself like any other write"] = function()
+    local fake = H.create_fake_vault()
+    H.reset_config(fake)
+    local buf, path = H.new_file_buffer(fake.dir, "vault.yml", H.envelope("plain: old\n"))
+    vim.cmd("VaultDecrypt")
+    H.wait_until(function()
+      return H.lines(buf)[1] == "plain: old"
+    end)
+
+    local seen = {}
+    for _, event in ipairs({ "BufWritePre", "BufWritePost" }) do
+      H.sabotage(event, {
+        buffer = buf,
+        callback = function()
+          table.insert(seen, event .. ":" .. tostring(vim.bo[buf].modified))
+        end,
+      })
+    end
+
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "plain: saved" })
+    vim.cmd("silent write")
+    eq(H.read_file(path), "plain: saved\n")
+    -- 'modified' is cleared between the two, as it is for an ordinary write, so
+    -- a statusline drawn from BufWritePost sees a saved buffer.
+    eq(seen, { "BufWritePre:true", "BufWritePost:false" })
+
+    -- A copy elsewhere is not this buffer being saved, and must not claim to be.
+    seen = {}
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "plain: copied" })
+    vim.cmd("silent write " .. vim.fn.fnameescape(fake.dir .. "/copy.yml"))
+    eq(seen, {}, "a :w {other} copy leaves this buffer unsaved and must not announce one")
+    yes(vim.bo[buf].modified)
+  end
+
   tests["a decrypted file reopened later is an ordinary plaintext file"] = function()
     local fake = H.create_fake_vault()
     H.reset_config(fake)

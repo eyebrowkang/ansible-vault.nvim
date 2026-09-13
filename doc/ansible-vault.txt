@@ -490,6 +490,19 @@ plaintext copy in the current directory, or `:saveas ./name` to adopt that new
 target. See |:VaultDecrypt| for the deliberate stale-short-name safety rule.
 Create/Edit cannot redirect their fixed write target; View cannot save at all.
 
+WRITE EVENTS
+
+Managed buffers write through a `BufWriteCmd`, for which Neovim fires none of
+its ordinary write events. A save of the buffer's own file after
+|:VaultDecrypt| therefore fires `BufWritePre` and `BufWritePost` itself, so
+statuslines and save hooks see it as the write it is.
+
+Create and Edit saves deliberately do not. They write ciphertext to another
+path, under a `ansible-vault://` buffer name nothing ever writes, and those
+events would offer the decrypted buffer to every formatter and linter
+listening for them. A `:write {other-file}` plaintext copy does not announce
+itself either, because it does not save the buffer.
+
 PERSISTENT UNDO
 
 Persistent undo is disabled in protected plaintext buffers. After range

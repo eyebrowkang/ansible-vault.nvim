@@ -322,6 +322,28 @@ local function plaintext_target(session, path)
   return path, session.target == nil or path == session.target
 end
 
+---Tell the rest of the editor that this buffer was written.
+---
+---Once a `BufWriteCmd` takes a write over, Neovim fires none of its ordinary
+---write events: no `BufWritePre`, no `BufWritePost`, and not even
+---`BufModifiedSet` when the handler clears 'modified'. Nothing then tells a
+---statusline, a bufferline or a linter that the buffer is saved, so it goes on
+---showing as modified until some unrelated event happens to redraw it.
+---
+---Only this writer says it, and only for a whole-buffer save of the buffer's own
+---file, because only then is it true. A Create or Edit scratch writes
+---*ciphertext to a different path* under a buffer name that is never written, so
+---announcing one as a file write would be a lie — and would hand a buffer full
+---of decrypted content to every formatter and linter hooked on these events.
+---@param buf integer
+---@param event "BufWritePre"|"BufWritePost"
+local function announce_write(buf, event)
+  if not buffer.is_valid(buf) then
+    return
+  end
+  pcall(vim.api.nvim_exec_autocmds, event, { buffer = buf, modeline = false })
+end
+
 ---Save the plaintext a `:VaultDecrypt`ed buffer is holding.
 ---
 ---This is the one writer that puts decrypted bytes on disk, and it does so
@@ -345,6 +367,15 @@ local function write_plaintext(session, path, bang)
     return false, path .. " already exists; use :w! to overwrite it"
   end
 
+  -- Before the bytes are read, so an autocmd that reformats on save still
+  -- decides what gets written, exactly as it would for an ordinary buffer.
+  if own then
+    announce_write(buf, "BufWritePre")
+    if not buffer.is_valid(buf) then
+      return false, "the buffer went away while it was being written"
+    end
+  end
+
   local ok, err = fs.atomic_write(path, buffer.bytes(buf))
   if not ok then
     return false, "failed to write " .. path .. ": " .. tostring(err)
@@ -361,6 +392,7 @@ local function write_plaintext(session, path, bang)
     if buffer.is_valid(buf) then
       vim.bo[buf].modified = false
     end
+    announce_write(buf, "BufWritePost")
   end
 
   vim.notify("Saved decrypted content: " .. path, vim.log.levels.INFO)

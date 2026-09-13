@@ -262,6 +262,10 @@ save you request with Decrypt.
   target across `:cd`; use `:w ./copy.yml` for an intentional plaintext copy in
   the current directory, or `:saveas ./name` to adopt a new target. Edit/Create
   have fixed targets and View refuses writing entirely.
+- A save after Decrypt fires `BufWritePre`/`BufWritePost`, so your statusline and
+  save hooks see it like any other write. A Create or Edit save does not: it
+  writes ciphertext to a different path, and those events would hand the
+  decrypted buffer to every formatter and linter listening for them.
 - Registers, ShaDa, the clipboard, other plugins, shell commands and terminal
   recording are outside this protection. Global `'shada'`, `'backup'` and
   `'writebackup'` settings are not changed. Neither process memory nor OS swap,
