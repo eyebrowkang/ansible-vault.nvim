@@ -154,6 +154,22 @@ return function(H, tests)
     eq({ yaml.find_block(lines, 1) }, {}, "nor is a line above it")
   end
 
+  ---A quote is only a quote where YAML lets one start a scalar. An apostrophe in
+  ---the middle of a plain value is data, so the `#` after it still opens a
+  ---comment; reading that apostrophe as an opening quote swallows the comment
+  ---into the value and encrypts a password nobody typed.
+  tests["a quote only opens a scalar at its start"] = function()
+    eq(yaml.unquote("don't # deployment password"), "don't", "an apostrophe in a plain scalar is data")
+    eq(yaml.unquote('he said "hi" # note'), 'he said "hi"', "an internal double quote is data too")
+    eq(yaml.unquote("plain#value # note"), "plain#value", "a # without leading space is not a comment")
+    eq(yaml.unquote("'quoted # here' # note"), "quoted # here", "a quoted # is part of the value")
+    eq(yaml.unquote([["sec#ret" # note]]), "sec#ret")
+    eq(yaml.unquote("'don''t' # note"), "don't", "a doubled single quote is still one apostrophe")
+    eq(yaml.unquote([["a \" b" # note]]), 'a " b', "an escaped double quote does not end the scalar")
+    eq(yaml.strip_comment("don't # deployment password"), "don't ")
+    eq(yaml.strip_comment("  'quoted # here' # note"), "  'quoted # here' ", "leading space still starts a scalar")
+  end
+
   tests["values that would be ambiguous as bare YAML are quoted"] = function()
     local ambiguous = { "", "true", "no", "null", " leading", "trailing ", "a: b", "#comment", "- item", "1.5" }
     for _, value in ipairs(ambiguous) do
